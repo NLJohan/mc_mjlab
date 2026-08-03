@@ -35,6 +35,15 @@ except ImportError:
   sva = None
   eigen = None
 
+# Separately optional: only needed by tasks that set IoLayout.has_ismpc_sine.
+# Unlike the group above, its absence must NOT break tasks that don't use it
+# (e.g. residual_balance) -- checked lazily in step_env instead of gating
+# ControllerHost construction.
+try:
+  import ismpc_walking_python
+except ImportError:
+  ismpc_walking_python = None
+
 
 @contextlib.contextmanager
 def suppress_mc_rtc_output() -> Iterator[None]:
@@ -126,6 +135,13 @@ class IoLayout:
     [imu_off, ...)  6 per IMU body sensor: gyro(3), accel(3)
     [wrench_off, ..) 6 per force sensor: force(3), torque(3) as MuJoCo reads them
 
+    [ismpc_sine_off, +4)  present only when ``has_ismpc_sine``: the RL-set
+                    CoM-height sine reference, written by the action term and
+                    consumed worker-side (via the mc_rtc datastore) right
+                    before ``controller.run()``: offset (m), amplitude (m,
+                    already ratio*offset so it can never drive the height
+                    trajectory negative), frequency (Hz), phase (rad).
+
   Output row: one T-wide block per entry of ``output_channels``, in order --
   e.g. the default ``("q", "alpha")`` gives q in ``[0, T)`` and alpha in
   ``[T, 2T)``, for the target joints -- followed by a single status column at
@@ -146,6 +162,10 @@ class IoLayout:
   # Controller outputs written per env, in output-block order. Keys of
   # MBC_ATTR_BY_CHANNEL; the action term's `output_channels` must match.
   output_channels: tuple[str, ...] = ("q", "alpha")
+  # Whether this layout carries the ISMPC CoM-height sine input columns.
+  # False (default) reproduces the pre-existing in_width exactly, so any task
+  # that does not use this channel (e.g. residual_balance) is unaffected.
+  has_ismpc_sine: bool = False
 
   @property
   def root_off(self) -> int:
@@ -160,8 +180,13 @@ class IoLayout:
     return self.imu_off + 6 * len(self.imu)
 
   @property
-  def in_width(self) -> int:
+  def ismpc_sine_off(self) -> int:
     return self.wrench_off + 6 * len(self.wrenches)
+
+  @property
+  def in_width(self) -> int:
+    base = self.ismpc_sine_off
+    return base + 4 if self.has_ismpc_sine else base
 
   @property
   def status_off(self) -> int:
@@ -185,8 +210,17 @@ class _ShmHandle:
 
 
 def attach_shm(name: str, shape: tuple[int, int]) -> _ShmHandle:
-  """Attach to an existing shared block, untracked: the trainer unlinks it."""
-  shm = SharedMemory(name=name, track=False)
+  """Attach to an existing shared block, untracked: the trainer unlinks it.
+
+  `track=False` requires Python 3.13+; on older interpreters we fall back
+  to the default (tracked) behavior, which just means this worker's own
+  resource tracker may also attempt cleanup on exit — harmless here since
+  the trainer is the one that actually unlinks the block.
+  """
+  if sys.version_info >= (3, 13):
+    shm = SharedMemory(name=name, track=False)
+  else:
+    shm = SharedMemory(name=name)
   arr = np.ndarray(shape, dtype=np.float64, buffer=shm.buf)
   return _ShmHandle(shm, arr)
 
@@ -484,6 +518,42 @@ class ControllerHost:
       controller.setWrenches(wrenches)
 
     controller.setJointTorques(self._expand(row[2 * T : 3 * T], self._zero_base))
+
+    if layout.has_ismpc_sine:
+      if ismpc_walking_python is None:
+        raise ImportError(
+          "IoLayout.has_ismpc_sine is set but the ismpc_walking_python "
+          "bridge module could not be imported; build it as part of "
+          "ismpc_walking's CMake (see ismpc_walking_python/CMakeLists "
+          "entry) and ensure it's on PYTHONPATH."
+        )
+      off = layout.ismpc_sine_off
+      com_height_offset = float(row[off])
+      amplitude_ratio = float(row[off + 1])
+      frequency = float(row[off + 2])
+      phase = float(row[off + 3])
+      # amplitude_ratio is already in (0, 1) and com_height_offset already
+      # clipped to a safe positive range on the mc_mjlab side (see the
+      # action term); deriving amplitude here as a product of the two
+      # guarantees com_height_offset - amplitude >= 0 by construction, so the
+      # CoM height trajectory ISMPC_Solver builds from these can never go
+      # negative, with no clamp needed on the C++ side.
+      #
+      # Routed through the ismpc_walking_python bridge module, NOT the mc_rtc
+      # datastore: the Python bindings for MCController/MCGlobalController do
+      # not expose datastore() at all (confirmed empirically -- see the
+      # session notes), so this small separate Cython extension (built as
+      # part of ismpc_walking's own CMake) is what actually reaches the live
+      # Walking_controller/ISMPC_Solver instance from Python. It safely
+      # no-ops (returns False) if the loaded controller isn't a
+      # Walking_controller, e.g. during any task that doesn't use this
+      # channel -- but has_ismpc_sine being True should only ever be paired
+      # with a Walking_controller config, so a False here would indicate a
+      # config/task mismatch worth investigating, not routine behavior.
+      amplitude = amplitude_ratio * com_height_offset
+      ismpc_walking_python.set_com_height_sine_params(
+        controller.controller(), com_height_offset, amplitude, frequency, phase
+      )
 
     # mc_mujoco stops the whole sim when run() reports failure. A trainer
     # cannot: the QP giving up is the normal end of a fall, and it must cost

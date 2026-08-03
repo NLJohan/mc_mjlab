@@ -97,6 +97,13 @@ class McRtcResidualActionBase(BaseAction):
   """Controller output channels consumed, in output-block order (must match what
   the host writes to ``out_np``). Set by the subclass."""
 
+  has_ismpc_sine: bool = False
+  """Whether this action's IoLayout carries the RL/scripted CoM-height sine
+  input columns (see ControllerIoBinding.write_ismpc_sine_params). False for
+  every existing action (residual_balance, zero_residual); set True only by
+  subclasses that actually write those columns (e.g. the ismpc_demo's
+  scripted action, or a future learned ISMPC-parameter action)."""
+
   def __init__(self, cfg: McRtcResidualActionCfg, env: ManagerBasedRlEnv):
     super().__init__(cfg=cfg, env=env)
 
@@ -132,6 +139,7 @@ class McRtcResidualActionBase(BaseAction):
       metadata,
       cfg.use_controller_reset,
       self.output_channels,
+      has_ismpc_sine=self.has_ismpc_sine,
     )
     # refJointOrder is only known now, so the gain override is applied here.
     if cfg.pd_gains_path is not None:

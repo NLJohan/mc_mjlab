@@ -28,7 +28,7 @@ register_mjlab_task(
   task_id=get_task_name(TASK_DIR, "position"),
   env_cfg=residual_balance_position_env_cfg(),
   play_env_cfg=residual_balance_position_env_cfg(play=True),
-  rl_cfg=residual_balance_ppo_cfg(),
+  rl_cfg=residual_balance_ppo_cfg(max_iterations=500),
 )
 
 register_mjlab_task(

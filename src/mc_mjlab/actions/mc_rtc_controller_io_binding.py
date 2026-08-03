@@ -111,6 +111,7 @@ class ControllerIoBinding:
     metadata: HostMetadata,
     use_controller_reset: bool,
     output_channels: Sequence[str],
+    has_ismpc_sine: bool = False,
   ):
     self._env = env
     self._entity = entity
@@ -212,6 +213,7 @@ class ControllerIoBinding:
       imu=tuple((n, g >= 0, a >= 0) for n, g, a in imu_sensors),
       wrenches=tuple(n for n, _, _ in wrench_sensors),
       output_channels=self._output_channels,
+      has_ismpc_sine=has_ismpc_sine,
     )
 
     # Gather columns for a single fancy-indexed sensordata copy per step;
@@ -299,6 +301,37 @@ class ControllerIoBinding:
     """Bool per env: did that controller's QP give up on the last step?"""
     failed = out_np[env_indices, self.layout.status_off] != 0.0
     return torch.tensor(failed, dtype=torch.bool, device=self._device)
+
+  def write_ismpc_sine_params(
+    self,
+    in_np: np.ndarray,
+    offset: torch.Tensor,
+    amplitude_ratio: torch.Tensor,
+    frequency: torch.Tensor,
+    phase: torch.Tensor,
+  ) -> None:
+    """Write the CoM-height sine reference for every env, this step.
+
+    ``amplitude_ratio`` is a fraction in (0, 1); the actual physical
+    amplitude (``amplitude_ratio * offset``) is derived worker-side
+    (``mc_rtc_controller_host.step_env``), not here -- this keeps the
+    "amplitude <= offset, so height never goes negative" guarantee
+    structural regardless of which caller (a scripted demo or a trained
+    policy) is writing these columns.
+
+    Requires ``self.layout.has_ismpc_sine``; callers that don't set that on
+    their action's ``IoLayout`` should never reach this method.
+    """
+    assert self.layout.has_ismpc_sine, (
+      "write_ismpc_sine_params called but this IoLayout was built with "
+      "has_ismpc_sine=False -- the input row has no columns reserved for "
+      "these values."
+    )
+    off = self.layout.ismpc_sine_off
+    in_np[:, off] = offset.cpu().numpy()
+    in_np[:, off + 1] = amplitude_ratio.cpu().numpy()
+    in_np[:, off + 2] = frequency.cpu().numpy()
+    in_np[:, off + 3] = phase.cpu().numpy()
 
   def _fill_joint_columns(self, in_np: np.ndarray) -> None:
     """Write encoder/velocity/torque columns of the input block (all envs)."""

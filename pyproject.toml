@@ -11,13 +11,14 @@ license = "Apache-2.0"
 authors = [{ name = "Martin Filliung" }]
 # mc_rtc's Python bindings are interpreter-specific: this pin must match the
 # interpreter the ROS workspace built them for (see README), and moves with it.
-requires-python = ">=3.14,<3.15"
+requires-python = ">=3.10,<3.11"
 dependencies = [
     # Where mjlab comes from (PyPI, local checkout, git) is a per-machine
     # choice: see "mjlab dependency" in the README.
     "mjlab",
     # Imported directly by this package; versions are constrained by mjlab.
     "mujoco",
+    "numpy<2",
     "torch",
 ]
 
