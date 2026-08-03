@@ -36,8 +36,20 @@ if TYPE_CHECKING:
 
 
 # --- Physical ranges, locked in earlier in this project. ---
-OFFSET_MIN, OFFSET_MAX = 0.4, 1.0  # m
+OFFSET_MIN, OFFSET_MAX = 0.4, 0.9  # m
 FREQUENCY_MIN, FREQUENCY_MAX = 0.1, 8.0  # Hz
+
+# Shifts the amplitude-ratio sigmoid so raw_action=0 -> amplitude_ratio~=0
+# (flat reference), not sigmoid(0)=0.5 (a large, constant-amplitude
+# oscillation from the very first step). This was the actual cause of the
+# "Control Horizon reached" / NaN-in-solver crash seen with --agent zero and
+# again at the start of training: sigmoid(0)=0.5 combined with the default
+# frequency_bias=4.05 Hz produced ~0.35m swings at ~4Hz immediately, which
+# is numerically violent enough to break ISMPC's feasibility QP on the
+# first few control periods, before the policy has had any chance to learn
+# otherwise. sigmoid(-4.0) ~= 0.018, close enough to zero to be safe as a
+# default while still leaving the policy free to push it up when useful.
+AMPLITUDE_RATIO_ZERO_BIAS = -4.0
 
 
 @dataclass(kw_only=True)
@@ -65,8 +77,24 @@ class IsmpcSineActionCfg(ActionTermCfg):
   """Name of the robot in mc_rtc."""
 
   frameskip: int = 1
-  """Physics substeps per controller step. FOO: pick to match m_delta=0.05s
-  against the task's physics timestep, e.g. timestep=0.001 -> frameskip=50."""
+  """Physics substeps between controller `run()` calls. Must match the
+  controller's own configured Timestep (e.g. mc_rtc.yaml Timestep=0.002s,
+  physics timestep=0.001s -> frameskip=2): the FSM, footstep planner, and
+  stabilizer inside mc_rtc are stateful and integrate every call, so
+  skipping calls starves them regardless of anything ISMPC-specific. This
+  is NOT the same cadence the sine parameters should update at -- see
+  sine_param_frequency_hz."""
+
+  sine_param_frequency_hz: float = 20.0
+  """How often (Hz) the RL-set sine params are pushed into the controller,
+  matching ISMPC_Solver's own MPC solve period (m_delta=0.05s -> 20Hz by
+  default). The controller itself still gets stepped every `frameskip`
+  physics substeps regardless -- only the sine-parameter *write* (and the
+  continuity-penalty bookkeeping tied to it) happens on this slower
+  cadence. Conflating the two (using one frameskip value for both) starves
+  the controller's own internal state if frameskip is set slow enough to
+  match the MPC period, which is what originally broke the pendulum
+  feasibility solver in this task."""
 
   num_workers: int | None = None
   """Worker process count; None = min(num_envs, cpu_count - 2)."""
@@ -85,8 +113,16 @@ class IsmpcSineActionCfg(ActionTermCfg):
   # actually needs to explore productively. ---
   offset_scale: float = 0.3
   offset_bias: float = 0.7
-  frequency_scale: float = 3.95
-  frequency_bias: float = 4.05
+  # FOO: lowered from an earlier draft's 4.05 Hz default. Even with
+  # amplitude_ratio now safely near-zero at raw_action=0 (see
+  # AMPLITUDE_RATIO_ZERO_BIAS), a frequency default in the middle of the
+  # range meant early PPO exploration (raw actions near zero but not
+  # exactly zero, sampled from the Gaussian policy) could still pair a
+  # small-but-nonzero amplitude with a high frequency -- large zc_ddot
+  # scales with frequency^2, so this is worth keeping conservative as a
+  # second layer of defense, not just relying on amplitude being small.
+  frequency_scale: float = 1.0
+  frequency_bias: float = 1.0
 
   def build(self, env: ManagerBasedRlEnv) -> "IsmpcSineAction":
     return IsmpcSineAction(self, env)
@@ -119,6 +155,41 @@ class IsmpcSineAction(ActionTerm):
 
     self._raw_actions = torch.zeros(self.num_envs, 4, device=self.device)
     self._processed_actions = torch.zeros_like(self._raw_actions)
+
+    # --- DEBUG: monotonic per-env dispatch counter + a record of what was
+    # sent on each dispatch, so a failure observed later at collect() time
+    # can be matched back to the exact params that caused it, even across
+    # the async dispatch/collect gap and even if a reset happens to this
+    # env in between. Remove once the root cause is found.
+    self._debug_dispatch_id = [0] * self.num_envs
+    self._debug_dispatch_log: dict[int, dict] = {}
+    self._debug_pending_dispatch_ids: list[list[int]] = [[] for _ in range(self.num_envs)]
+    # --- END DEBUG ---
+
+    # Sine-param update cadence, in units of controller-dispatch ticks (not
+    # physics substeps): e.g. frameskip=2 (500Hz controller) with
+    # sine_param_frequency_hz=20 means the controller dispatches every
+    # tick, but only every 25th dispatch actually carries new sine params.
+    # See IsmpcSineActionCfg.sine_param_frequency_hz for why this is kept
+    # separate from frameskip.
+    #
+    # UNVERIFIED: env.step_dt is confirmed elsewhere in this file/the
+    # scripted demo action to be the RL-decision-step dt (physics_timestep
+    # * decimation), not the raw physics timestep -- so dividing it by
+    # cfg.frameskip here is only correct if decimation == frameskip for
+    # this task (true in both ismpc_hybrid and ismpc_demo's cfgs as of this
+    # writing, but not something this action can see or enforce). If you
+    # ever decouple decimation from frameskip, this derivation breaks
+    # silently. Confirm against mjlab's actual SimulationCfg/env attributes
+    # (e.g. whether env.sim.mujoco.timestep or similar exists) before
+    # relying on this in a task where decimation != frameskip.
+    controller_hz = 1.0 / (self._env.step_dt / cfg.frameskip)
+    self._sine_param_period_ticks = max(
+      1, round(controller_hz / cfg.sine_param_frequency_hz)
+    )
+    self._dispatch_ticks_since_sine_update = torch.zeros(
+      self.num_envs, dtype=torch.long, device=self.device
+    )
 
     # Same transport/host machinery the residual actions use: one real
     # mc_rtc controller per env, worker processes, shared-memory I/O.
@@ -225,14 +296,18 @@ class IsmpcSineAction(ActionTerm):
       min=OFFSET_MIN,
       max=OFFSET_MAX,
     )
-    # Sigmoid, not a raw clamp: keeps the policy's own action distribution
-    # unconstrained (better-behaved for PPO's Gaussian) while guaranteeing
-    # amplitude_ratio in (0, 1) *by construction* -- combined with deriving
-    # amplitude = ratio * offset (not learned directly), this is what makes
-    # "the CoM height trajectory can never go negative" a structural
-    # property rather than a clamp bolted on after the fact (see the
-    # ismpc_solver_patch.md notes on this).
-    amplitude_ratio = torch.sigmoid(raw_ratio)
+    # Sigmoid, shifted by AMPLITUDE_RATIO_ZERO_BIAS so raw_ratio=0 maps to
+    # amplitude_ratio near 0 (flat), not sigmoid(0)=0.5 (a large constant
+    # oscillation) -- see the module-level comment on
+    # AMPLITUDE_RATIO_ZERO_BIAS for why this matters. The sigmoid itself
+    # (rather than a raw clamp) still keeps the policy's own action
+    # distribution unconstrained (better-behaved for PPO's Gaussian) while
+    # guaranteeing amplitude_ratio in (0, 1) *by construction* -- combined
+    # with deriving amplitude = ratio * offset (not learned directly), this
+    # is what makes "the CoM height trajectory can never go negative" a
+    # structural property rather than a clamp bolted on after the fact (see
+    # the ismpc_solver_patch.md notes on this).
+    amplitude_ratio = torch.sigmoid(raw_ratio + AMPLITUDE_RATIO_ZERO_BIAS)
     amplitude = amplitude_ratio * offset
 
     frequency = torch.clamp(
@@ -324,9 +399,25 @@ class IsmpcSineAction(ActionTerm):
     if env_ids is None:
       env_indices = list(range(self.num_envs))
 
+    # --- DEBUG: deliberately NOT clearing _debug_pending_dispatch_ids
+    # here. If a reset happens while env 0 still has an in-flight
+    # dispatch pending collection, that is itself diagnostic information
+    # (e.g. a worker respawn discarding a dispatch mid-flight rather than
+    # waiting for/cancelling it cleanly) -- clearing the FIFO on reset
+    # would hide exactly the race this debug pass is trying to catch.
+    # if 0 in env_indices and self._debug_pending_dispatch_ids[0]:
+      # print(
+      #   f"[DEBUG reset] env=0 reset() called with "
+      #   f"{len(self._debug_pending_dispatch_ids[0])} dispatch(es) still "
+      #   f"pending collection: {self._debug_pending_dispatch_ids[0]}",
+      #   flush=True,
+      # )
+    # --- END DEBUG ---
+
     self._io.reset_controller_input(self._in_np)
     self._pool.reset_envs(env_indices)
     self._steps_since_run[env_indices] = 0
+    self._dispatch_ticks_since_sine_update[env_indices] = 0
 
     env_indices_t = torch.tensor(env_indices, device=self.device, dtype=torch.long)
     stance = self._entity.data.joint_pos[:, self._target_ids]
@@ -365,9 +456,38 @@ class IsmpcSineAction(ActionTerm):
         for c in ("q", "alpha"):
           self._staged_control[c][env_indices_t] = new_output[c]
         self._has_staged_control[env_indices_t] = True
-        self.controller_failed[env_indices_t] |= self._io.read_controller_failed(
-          self._out_np, env_indices
-        )
+
+        newly_failed = self._io.read_controller_failed(self._out_np, env_indices)
+
+        # --- DEBUG: pop the oldest pending dispatch id for env 0 (FIFO --
+        # collect() results arrive in the same order they were dispatched,
+        # assuming the pool preserves per-env ordering, which every other
+        # part of this action already assumes via _steps_since_run/
+        # _has_staged_control's sequencing) and print its recorded params
+        # if this collect reports a failure. This is the corrected version
+        # of the earlier debug attempt: that one read self._physical_curr
+        # AFTER collect(), which a reset() interleaved between the failing
+        # dispatch and this collect() could have already zeroed out. This
+        # version logs at dispatch time instead, immune to that. Remove
+        # once the root cause is found.
+        if 0 in env_indices:
+          local_idx = env_indices.index(0)
+          pending = self._debug_pending_dispatch_ids[0]
+          popped_id = pending.pop(0) if pending else None
+          if bool(newly_failed[local_idx]):
+            record = (
+              self._debug_dispatch_log.get(popped_id)
+              if popped_id is not None
+              else None
+            )
+            print(
+              f"[DEBUG controller_failed] env=0 CONFIRMED failure for "
+              f"dispatch_id={popped_id} record={record}",
+              flush=True,
+            )
+        # --- END DEBUG ---
+
+        self.controller_failed[env_indices_t] |= newly_failed
 
       run_indices_t = torch.tensor(run_indices, device=self.device, dtype=torch.long)
       fresh = self._has_staged_control[run_indices_t]
@@ -383,29 +503,85 @@ class IsmpcSineAction(ActionTerm):
         self._has_staged_control[fresh_indices_t] = False
 
       # The policy's action for THIS period is what gets pushed to the
-      # controller for the step about to be dispatched -- written before
-      # fill_controller_input/dispatch, same ordering as the scripted demo.
-      physical = self._map_to_physical(self._processed_actions)
+      # controller for the step about to be dispatched -- but only
+      # *recomputed* on the slower sine-param cadence (sine_param_frequency_hz),
+      # not every dispatch tick. Envs not due for an update this tick simply
+      # keep riding on self._physical_curr's existing values (already
+      # written into self._in_np last time they were computed) -- the
+      # write below still happens every dispatch tick for every run_index,
+      # since ControllerIoBinding.write_ismpc_sine_params's signature only
+      # takes the full per-env arrays (no partial-env write verified to
+      # exist), but the *values* themselves only change on the slow clock.
+      due_for_sine_update = (
+        self._dispatch_ticks_since_sine_update[run_indices_t] == 0
+      )
+      sine_update_indices_t = run_indices_t[due_for_sine_update]
 
-      # Continuity bookkeeping: only meaningful for the envs actually
-      # starting a new period this call (run_indices) -- shift
-      # curr -> prev, record the new curr and the sim time it took effect.
-      run_indices_t = torch.tensor(run_indices, device=self.device, dtype=torch.long)
-      now = self._env.episode_length_buf[run_indices_t].to(
-        dtype=torch.get_default_dtype()
-      ) * self._env.step_dt
-      for k in self._physical_prev:
-        self._physical_prev[k][run_indices_t] = self._physical_curr[k][run_indices_t]
-        self._physical_curr[k][run_indices_t] = physical[k][run_indices_t]
-      self._period_t0[run_indices_t] = now
+      if sine_update_indices_t.numel() > 0:
+        physical = self._map_to_physical(self._processed_actions)
 
+        # Continuity bookkeeping: only meaningful for envs actually
+        # starting a new sine period this call -- shift curr -> prev,
+        # record the new curr and the sim time it took effect.
+        now = self._env.episode_length_buf[sine_update_indices_t].to(
+          dtype=torch.get_default_dtype()
+        ) * self._env.step_dt
+        for k in self._physical_prev:
+          self._physical_prev[k][sine_update_indices_t] = self._physical_curr[k][
+            sine_update_indices_t
+          ]
+          self._physical_curr[k][sine_update_indices_t] = physical[k][
+            sine_update_indices_t
+          ]
+        self._period_t0[sine_update_indices_t] = now
+
+      self._dispatch_ticks_since_sine_update[run_indices_t] = (
+        self._dispatch_ticks_since_sine_update[run_indices_t] + 1
+      ) % self._sine_param_period_ticks
+
+      # Written every dispatch tick (all run_indices_t), using
+      # self._physical_curr's current values -- unchanged since the last
+      # sine-param update for envs not due this tick, freshly updated above
+      # for envs that were due. This keeps the write call's signature
+      # exactly as it was (full per-env arrays), rather than assuming a
+      # partial-env write path exists.
       self._io.write_ismpc_sine_params(
         self._in_np,
-        physical["offset"],
-        physical["amplitude_ratio"],
-        physical["frequency"],
-        physical["phase"],
+        self._physical_curr["offset"],
+        self._physical_curr["amplitude_ratio"],
+        self._physical_curr["frequency"],
+        self._physical_curr["phase"],
       )
+
+      # --- DEBUG: record what's actually being dispatched for env 0 this
+      # tick, tagged with a monotonic id, BEFORE dispatch -- uncontaminated
+      # by any reset that might happen to this env before we later collect
+      # the result. Remove once the root cause is found.
+      if 0 in run_indices:
+        did = self._debug_dispatch_id[0]
+        self._debug_dispatch_id[0] += 1
+        t_now = float(self._env.episode_length_buf[0]) * float(self._env.step_dt)
+        record = {
+          "sim_t": t_now,
+          "offset": float(self._physical_curr["offset"][0]),
+          "amplitude_ratio": float(self._physical_curr["amplitude_ratio"][0]),
+          "amplitude": float(self._physical_curr["amplitude"][0]),
+          "frequency": float(self._physical_curr["frequency"][0]),
+          "phase": float(self._physical_curr["phase"][0]),
+          "period_t0": float(self._period_t0[0]),
+          "steps_since_run": int(self._steps_since_run[0]),
+          "dispatch_ticks_since_sine_update": int(
+            self._dispatch_ticks_since_sine_update[0]
+          ),
+        }
+        self._debug_dispatch_log[did] = record
+        self._debug_pending_dispatch_ids[0].append(did)
+        # Bound memory: keep only the last 200 dispatch records.
+        if len(self._debug_dispatch_log) > 200:
+          oldest = min(self._debug_dispatch_log)
+          del self._debug_dispatch_log[oldest]
+        # print(f"[DEBUG dispatch] env=0 dispatch_id={did} {record}", flush=True) 
+      # --- END DEBUG ---
 
       self._io.fill_controller_input(self._in_np)
       self._pool.dispatch_controller_step(run_indices)

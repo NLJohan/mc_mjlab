@@ -35,7 +35,7 @@ from mc_mjlab.robots.robots_registry import get_main_robot_spec, prepare_cfg_for
 from mc_mjlab.tasks.ismpc_hybrid.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp  # FOO module, see below
 
-NUM_ENVS = 128  # FOO: matches residual_balance's scale; untuned for this task.
+NUM_ENVS = 1  # FOO: matches residual_balance's scale; untuned for this task.
 PLAY_NUM_ENVS = 1
 
 # FOO: matches residual_balance's episode length; untuned for this task --
@@ -45,7 +45,7 @@ EPISODE_LENGTH_S = 16.0
 
 # FOO placeholder: m_delta=0.05s / timestep=0.001s. Confirm against your
 # actual mc_rtc.yaml's `ismpc.delta` before trusting this.
-FRAMESKIP = 50
+FRAMESKIP = 2
 
 
 def _make_env_cfg(
@@ -157,7 +157,7 @@ def _apply_play_overrides(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
 
 
 def ismpc_hybrid_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  cfg = _make_env_cfg(console_output="single" if play else "none")
+  cfg = _make_env_cfg(console_output="all" if play else "none")
   if play:
     _apply_play_overrides(cfg)
   return cfg
@@ -195,5 +195,5 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
     save_interval=50,
     num_steps_per_env=24,
     max_iterations=max_iterations,
-    logger="tensorboard",
+    logger="wandb",
   )
