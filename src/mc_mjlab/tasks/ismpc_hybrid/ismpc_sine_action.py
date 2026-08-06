@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 
 # --- Physical ranges, locked in earlier in this project. ---
-OFFSET_MIN, OFFSET_MAX = 0.4, 0.9  # m
+OFFSET_MIN, OFFSET_MAX = 0.7, 0.8  # m
 FREQUENCY_MIN, FREQUENCY_MAX = 0.1, 8.0  # Hz
 
 # Shifts the amplitude-ratio sigmoid so raw_action=0 -> amplitude_ratio~=0
@@ -212,6 +212,7 @@ class IsmpcSineAction(ActionTerm):
       cfg.use_controller_reset,
       output_channels=("q", "alpha"),
       has_ismpc_sine=True,
+      has_ismpc_velocity=True,
     )
     if cfg.pd_gains_path is not None:
       from mc_mjlab.actions.mc_rtc_controller_io_binding import (
@@ -551,6 +552,21 @@ class IsmpcSineAction(ActionTerm):
         self._physical_curr["amplitude_ratio"],
         self._physical_curr["frequency"],
         self._physical_curr["phase"],
+      )
+
+      # Push the per-env sampled twist command into the shared input row so
+      # ismpc_walking's reference velocity actually varies per-env (see the
+      # env cfg's "twist" UniformVelocityCommandCfg) instead of every
+      # worker following the static auto_start.speed in mc_rtc.yaml.
+      # Written every dispatch tick alongside the sine params, same
+      # all-run_indices_t pattern -- get_command returns the currently
+      # sampled value for every env regardless of whether it was just
+      # resampled this tick, so writing it every time is correct (matches
+      # write_ismpc_sine_params's own "write current value every tick"
+      # convention above, not just on change).
+      twist = self._env.command_manager.get_command("twist")
+      self._io.write_ismpc_velocity(
+        self._in_np, twist[:, 0], twist[:, 1], twist[:, 2]
       )
 
       # --- DEBUG: record what's actually being dispatched for env 0 this

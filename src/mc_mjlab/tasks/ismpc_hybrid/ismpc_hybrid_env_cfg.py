@@ -22,12 +22,15 @@ from pathlib import Path
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.managers.action_manager import ActionTermCfg
+from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.rl import RslRlModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 from mjlab.scene import SceneCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
+from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.terrains import TerrainEntityCfg
 
 from mc_mjlab import MC_RTC_YAML_PATH
@@ -124,6 +127,54 @@ def _make_env_cfg(
     ),
   }
 
+  # Domain randomization on reset. reset_scene_to_default must run first --
+  # it establishes the default posture mc_rtc's controller expects as its
+  # baseline (same ordering constraint as residual_balance_env_cfg.py's
+  # reset_base, which offsets from what this writes); reset_joints then
+  # offsets from that default rather than replacing it.
+  #
+  # Conservative starting ranges, not tuned: small enough that the initial
+  # joint config shouldn't push any joint near its limits or destabilize
+  # ismpc_walking's contact re-establishment right after reset, large enough
+  # to give real state diversity across envs/episodes. Widen once training
+  # is confirmed stable at these values.
+  events = {
+    "reset_scene_to_default": EventTermCfg(
+      func=envs_mdp.reset_scene_to_default, mode="reset"
+    ),
+    "reset_joints": EventTermCfg(
+      func=envs_mdp.reset_joints_by_offset,
+      mode="reset",
+      params={
+        "position_range": (-0.05, 0.05),  # rad
+        "velocity_range": (-0.05, 0.05),  # rad/s
+        "asset_cfg": SceneEntityCfg("robot"),
+      },
+    ),
+  }
+
+  # Per-episode target velocity, resampled on mjlab's own schedule (not
+  # ISMPC-specific yet -- nothing currently reads this command and pushes it
+  # into ismpc_walking's auto_start/reference_velocity; that needs a new
+  # bridge function + Walking_controller setter, deferred as a follow-up).
+  # init_velocity_prob left at 0.0 for now: giving the robot a literal
+  # nonzero starting root velocity in the physics sim, independent of
+  # whether ismpc_walking is actually being commanded to walk at that
+  # speed, could fight the controller's own footstep planning rather than
+  # help it -- revisit once the ISMPC-side wiring exists and the two can be
+  # made consistent with each other.
+  commands = {
+    "twist": UniformVelocityCommandCfg(
+      entity_name="robot",
+      resampling_time_range=(EPISODE_LENGTH_S, EPISODE_LENGTH_S),
+      ranges=UniformVelocityCommandCfg.Ranges(
+        lin_vel_x=(-0.4, 0.4),
+        lin_vel_y=(-0.1, 0.1),
+        ang_vel_z=(-0.5, 0.5),
+      ),
+    ),
+  }
+
   return ManagerBasedRlEnvCfg(
     scene=SceneCfg(
       num_envs=num_envs,
@@ -134,6 +185,8 @@ def _make_env_cfg(
     actions=actions,
     rewards=rewards,
     terminations=terminations,
+    events=events,
+    commands=commands,
     decimation=FRAMESKIP,
     episode_length_s=EPISODE_LENGTH_S,
     sim=SimulationCfg(

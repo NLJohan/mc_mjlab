@@ -142,6 +142,13 @@ class IoLayout:
                     already ratio*offset so it can never drive the height
                     trajectory negative), frequency (Hz), phase (rad).
 
+    [ismpc_velocity_off, +3)  present only when ``has_ismpc_velocity``: the
+                    sampled reference walking velocity (vx, vy, wz; m/s,
+                    m/s, rad/s), written by the action term from
+                    ``env.command_manager``'s sampled command and consumed
+                    worker-side right before ``controller.run()``, same
+                    timing as the sine reference above.
+
   Output row: one T-wide block per entry of ``output_channels``, in order --
   e.g. the default ``("q", "alpha")`` gives q in ``[0, T)`` and alpha in
   ``[T, 2T)``, for the target joints -- followed by a single status column at
@@ -166,6 +173,11 @@ class IoLayout:
   # False (default) reproduces the pre-existing in_width exactly, so any task
   # that does not use this channel (e.g. residual_balance) is unaffected.
   has_ismpc_sine: bool = False
+  # Whether this layout carries the ISMPC reference-velocity input columns.
+  # Independent of has_ismpc_sine (a task could in principle want one
+  # without the other), appended after it so has_ismpc_sine-only layouts'
+  # widths are completely unaffected by this field existing.
+  has_ismpc_velocity: bool = False
 
   @property
   def root_off(self) -> int:
@@ -184,9 +196,14 @@ class IoLayout:
     return self.wrench_off + 6 * len(self.wrenches)
 
   @property
-  def in_width(self) -> int:
+  def ismpc_velocity_off(self) -> int:
     base = self.ismpc_sine_off
     return base + 4 if self.has_ismpc_sine else base
+
+  @property
+  def in_width(self) -> int:
+    base = self.ismpc_velocity_off
+    return base + 3 if self.has_ismpc_velocity else base
 
   @property
   def status_off(self) -> int:
@@ -396,6 +413,46 @@ class ControllerHost:
           )
           controller.reset({self._robot_key: encoders}, {self._robot_key: pose})
         else:
+          # AttitudeObserver's EKF orientation state is correctly re-seeded from
+          # the control robot by Walking_controller::reset() (called internally
+          # by controller.init(), confirmed empirically -- this binding has no
+          # Python-visible reset() method at all, hasattr(MCGlobalController,
+          # 'reset') is False, so EVERY reset_envs() call takes this init()
+          # branch, not the controller.reset(...) branch above).
+          #
+          # FOUND: FloatingBase's position/orientation were never set here --
+          # only velocity/acceleration were zeroed. step_env()'s normal
+          # per-tick path always sets Position+Orientation+LinearVelocity+
+          # AngularVelocity+LinearAcceleration together (see the
+          # layout.named_routing branch above); leaving position/orientation
+          # untouched at reset meant FloatingBase's position/orientation
+          # sensor buffers still held the PREVIOUS episode's last-written
+          # pre-fall pose at the moment init() (and the observer pipeline it
+          # drives) ran, while everything else (encoders, init_attitude,
+          # velocity/acceleration) already reflected the fresh reset state.
+          # That position/velocity inconsistency is consistent with what was
+          # observed C++-side: realRobot().com() (position) came out sane
+          # post-reset, but realRobot().comVelocity() was garbage (tens of
+          # m/s) and decayed slowly rather than resetting cleanly -- the
+          # signature of an EKF/observer computing an innovation against a
+          # stale position. Setting Position+Orientation here too, from the
+          # same fresh pos/quat used for init_attitude below, closes that gap.
+          zero = eigen.Vector3d(0.0, 0.0, 0.0)
+          if layout.has_floating_base_sensor:
+            fb = b"FloatingBase"
+            fb_quat = eigen.Quaterniond(
+              float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
+            )
+            controller.setSensorPosition(
+              eigen.Vector3d(float(pos[0]), float(pos[1]), float(pos[2]))
+            )
+            controller.setSensorOrientation(fb_quat.inverse())
+            controller.setSensorLinearVelocity(zero)
+            controller.setSensorAngularVelocity(zero)
+            controller.setSensorLinearAcceleration(zero)
+          
+          controller.setSensorAngularVelocity(zero)
+          controller.setSensorLinearAcceleration(zero)
           controller.setEncoderValues(encoders)
           # init() attitude is [qw, qx, qy, qz, tx, ty, tz].
           init_attitude = [
@@ -554,6 +611,26 @@ class ControllerHost:
       ismpc_walking_python.set_com_height_sine_params(
         controller.controller(), com_height_offset, amplitude, frequency, phase
       )
+
+    if layout.has_ismpc_velocity:
+      if ismpc_walking_python is None:
+        raise ImportError(
+          "IoLayout.has_ismpc_velocity is set but the ismpc_walking_python "
+          "bridge module could not be imported; build it as part of "
+          "ismpc_walking's CMake (see ismpc_walking_python/CMakeLists "
+          "entry) and ensure it's on PYTHONPATH."
+        )
+      off = layout.ismpc_velocity_off
+      vx = float(row[off])
+      vy = float(row[off + 1])
+      wz = float(row[off + 2])
+      # Same routing rationale as the sine params above (no datastore
+      # access from Python; goes through the ismpc_walking_python bridge
+      # instead). Safe to call every step_env call regardless of whether
+      # this particular period actually changed the sampled command --
+      # Walking_controller::SetReferenceVelocity is a plain assignment, so
+      # writing the same value repeatedly is harmless.
+      ismpc_walking_python.set_reference_velocity(controller.controller(), vx, vy, wz)
 
     # mc_mujoco stops the whole sim when run() reports failure. A trainer
     # cannot: the QP giving up is the normal end of a fall, and it must cost

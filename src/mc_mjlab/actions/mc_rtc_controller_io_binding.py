@@ -112,6 +112,7 @@ class ControllerIoBinding:
     use_controller_reset: bool,
     output_channels: Sequence[str],
     has_ismpc_sine: bool = False,
+    has_ismpc_velocity: bool = False,
   ):
     self._env = env
     self._entity = entity
@@ -214,6 +215,7 @@ class ControllerIoBinding:
       wrenches=tuple(n for n, _, _ in wrench_sensors),
       output_channels=self._output_channels,
       has_ismpc_sine=has_ismpc_sine,
+      has_ismpc_velocity=has_ismpc_velocity,
     )
 
     # Gather columns for a single fancy-indexed sensordata copy per step;
@@ -332,6 +334,28 @@ class ControllerIoBinding:
     in_np[:, off + 1] = amplitude_ratio.cpu().numpy()
     in_np[:, off + 2] = frequency.cpu().numpy()
     in_np[:, off + 3] = phase.cpu().numpy()
+
+  def write_ismpc_velocity(
+    self,
+    in_np: np.ndarray,
+    vx: torch.Tensor,
+    vy: torch.Tensor,
+    wz: torch.Tensor,
+  ) -> None:
+    """Write the reference walking velocity for every env, this step.
+
+    Requires ``self.layout.has_ismpc_velocity``; callers that don't set
+    that on their action's ``IoLayout`` should never reach this method.
+    """
+    assert self.layout.has_ismpc_velocity, (
+      "write_ismpc_velocity called but this IoLayout was built with "
+      "has_ismpc_velocity=False -- the input row has no columns reserved "
+      "for these values."
+    )
+    off = self.layout.ismpc_velocity_off
+    in_np[:, off] = vx.cpu().numpy()
+    in_np[:, off + 1] = vy.cpu().numpy()
+    in_np[:, off + 2] = wz.cpu().numpy()
 
   def _fill_joint_columns(self, in_np: np.ndarray) -> None:
     """Write encoder/velocity/torque columns of the input block (all envs)."""
