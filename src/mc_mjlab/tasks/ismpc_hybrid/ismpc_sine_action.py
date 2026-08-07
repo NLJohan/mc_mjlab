@@ -153,7 +153,7 @@ class IsmpcSineAction(ActionTerm):
       self._target_ids, device=self.device, dtype=torch.long
     )
 
-    self._raw_actions = torch.zeros(self.num_envs, 4, device=self.device)
+    self._raw_actions = torch.zeros(self.num_envs, 5, device=self.device)
     self._processed_actions = torch.zeros_like(self._raw_actions)
 
     # --- DEBUG: monotonic per-env dispatch counter + a record of what was
@@ -213,6 +213,7 @@ class IsmpcSineAction(ActionTerm):
       output_channels=("q", "alpha"),
       has_ismpc_sine=True,
       has_ismpc_velocity=True,
+      has_ismpc_walk_gate=True,
     )
     if cfg.pd_gains_path is not None:
       from mc_mjlab.actions.mc_rtc_controller_io_binding import (
@@ -268,11 +269,27 @@ class IsmpcSineAction(ActionTerm):
     self._physical_curr = {k: v.clone() for k, v in self._physical_prev.items()}
     self._period_t0 = zeros.clone()
 
+    # --- Walk/stop gate. ---
+    # The policy's current walk decision (thresholded bool, see
+    # _map_walk_gate) and ISMPC's own advisory safety opinion from the most
+    # recent MPC solve, read back after each dispatch. Both kept as
+    # per-env tensors so the last_walk_action/ismpc_wants_stop observation
+    # terms (mdp.py) can read them without recomputing anything. Defaults
+    # to False (not walking) -- matches Walking_controller::reset()'s own
+    # policyWantsWalk default, so a freshly-constructed action and a
+    # freshly-reset controller start in agreement.
+    self._walk_enabled = torch.zeros(
+      self.num_envs, dtype=torch.bool, device=self.device
+    )
+    self._ismpc_wants_stop = torch.zeros(
+      self.num_envs, dtype=torch.bool, device=self.device
+    )
+
   # ---- Required ActionTerm properties/methods. ----
 
   @property
   def action_dim(self) -> int:
-    return 4
+    return 5
 
   @property
   def raw_action(self) -> torch.Tensor:
@@ -288,9 +305,10 @@ class IsmpcSineAction(ActionTerm):
   # ---- Raw action -> physical units. ----
 
   def _map_to_physical(self, raw: torch.Tensor) -> dict[str, torch.Tensor]:
-    """4-wide raw action -> {offset, amplitude, frequency, phase}, all
-    structurally within their safe/valid ranges."""
-    raw_offset, raw_ratio, raw_freq, raw_phase = raw.unbind(dim=-1)
+    """First 4 of the 5-wide raw action -> {offset, amplitude, frequency,
+    phase}, all structurally within their safe/valid ranges. The 5th
+    (walk-gate) dimension is handled separately by _map_walk_gate."""
+    raw_offset, raw_ratio, raw_freq, raw_phase = raw[..., :4].unbind(dim=-1)
 
     offset = torch.clamp(
       self.cfg.offset_scale * raw_offset + self.cfg.offset_bias,
@@ -330,6 +348,21 @@ class IsmpcSineAction(ActionTerm):
       "phase": phase,
     }
 
+  def _map_walk_gate(self, raw: torch.Tensor) -> torch.Tensor:
+    """5th raw action -> bool walk/stop decision.
+
+    Plain threshold at 0 on the raw (pre-squash) action: unlike the sine
+    params, there's no "safe near-zero default" concern here the way
+    AMPLITUDE_RATIO_ZERO_BIAS addresses for amplitude -- Walking_controller
+    already starts every episode with policyWantsWalk=False regardless of
+    what this action does on step 1 (see Walking_controller::reset()), and
+    the policy has full authority either way, so there is no failure mode
+    a bias here would protect against. raw > 0 -> walk; raw <= 0 -> stop,
+    matching a standard zero-centered Gaussian policy's natural symmetry
+    (no reason to bias the initial exploration toward either side).
+    """
+    return raw > 0.0
+
   # ---- Accessors for observation/reward terms. ----
 
   @property
@@ -349,6 +382,22 @@ class IsmpcSineAction(ActionTerm):
       ],
       dim=-1,
     )
+
+  @property
+  def last_walk_action(self) -> torch.Tensor:
+    """The policy's current walk/stop decision, as a (num_envs, 1) float
+    observation (1.0 = walk, 0.0 = stop) -- mirrors physical_params'
+    role for the sine params: lets the policy condition on its own last
+    decision directly, same rationale as last_sine_params in mdp.py."""
+    return self._walk_enabled.to(dtype=torch.get_default_dtype()).unsqueeze(-1)
+
+  @property
+  def ismpc_wants_stop_obs(self) -> torch.Tensor:
+    """ISMPC's own advisory safety opinion from the most recent MPC solve,
+    as a (num_envs, 1) float observation (1.0 = ISMPC would have stopped).
+    Independent of what the policy actually commanded -- see
+    ControllerIoBinding.read_ismpc_wants_stop for the full rationale."""
+    return self._ismpc_wants_stop.to(dtype=torch.get_default_dtype()).unsqueeze(-1)
 
   def continuity_penalty(self) -> torch.Tensor:
     """Squared discontinuity, per env, between the previous period's sine
@@ -442,6 +491,12 @@ class IsmpcSineAction(ActionTerm):
     self._physical_curr["offset"][env_indices_t] = OFFSET_MIN
     self._period_t0[env_indices_t] = 0.0
 
+    # Matches Walking_controller::reset()'s own policyWantsWalk default
+    # (False) -- see the constructor's comment on _walk_enabled. ISMPC has
+    # no opinion yet either (no solve has happened this episode).
+    self._walk_enabled[env_indices_t] = False
+    self._ismpc_wants_stop[env_indices_t] = False
+
   def apply_actions(self) -> None:
     substep_in_period = self._steps_since_run % self.cfg.frameskip
     run_envs = substep_in_period == 0
@@ -459,6 +514,15 @@ class IsmpcSineAction(ActionTerm):
         self._has_staged_control[env_indices_t] = True
 
         newly_failed = self._io.read_controller_failed(self._out_np, env_indices)
+        # Read alongside controller_failed: same collect() cycle, same
+        # "this reflects the dispatch that just completed" timing. Overwrite
+        # (not OR-accumulate like controller_failed) -- this is ISMPC's
+        # opinion as of the MOST RECENT solve, not a latched "ever true"
+        # flag, matching Walking_controller::ismpc_wants_stop's own
+        # per-solve-cleared semantics.
+        self._ismpc_wants_stop[env_indices_t] = self._io.read_ismpc_wants_stop(
+          self._out_np, env_indices
+        )
 
         # --- DEBUG: pop the oldest pending dispatch id for env 0 (FIFO --
         # collect() results arrive in the same order they were dispatched,
@@ -536,6 +600,15 @@ class IsmpcSineAction(ActionTerm):
           ]
         self._period_t0[sine_update_indices_t] = now
 
+        # Walk-gate decision updates on the SAME cadence as the sine params
+        # (sine_param_frequency_hz) -- "maintain the same inference
+        # frequency for our NN" (same rationale documented for the
+        # reference-velocity channel). Uses the 5th raw-action dim,
+        # unaffected by _map_to_physical only reading raw[..., :4].
+        self._walk_enabled[sine_update_indices_t] = self._map_walk_gate(
+          self._processed_actions[sine_update_indices_t, 4]
+        )
+
       self._dispatch_ticks_since_sine_update[run_indices_t] = (
         self._dispatch_ticks_since_sine_update[run_indices_t] + 1
       ) % self._sine_param_period_ticks
@@ -553,6 +626,11 @@ class IsmpcSineAction(ActionTerm):
         self._physical_curr["frequency"],
         self._physical_curr["phase"],
       )
+
+      # Same "write current value every dispatch tick, update only on the
+      # slow clock" convention as the sine params above.
+      self._io.write_ismpc_walk_gate(self._in_np, self._walk_enabled)
+
 
       # Push the per-env sampled twist command into the shared input row so
       # ismpc_walking's reference velocity actually varies per-env (see the

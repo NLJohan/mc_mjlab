@@ -113,6 +113,7 @@ class ControllerIoBinding:
     output_channels: Sequence[str],
     has_ismpc_sine: bool = False,
     has_ismpc_velocity: bool = False,
+    has_ismpc_walk_gate: bool = False,
   ):
     self._env = env
     self._entity = entity
@@ -216,6 +217,7 @@ class ControllerIoBinding:
       output_channels=self._output_channels,
       has_ismpc_sine=has_ismpc_sine,
       has_ismpc_velocity=has_ismpc_velocity,
+      has_ismpc_walk_gate=has_ismpc_walk_gate,
     )
 
     # Gather columns for a single fancy-indexed sensordata copy per step;
@@ -356,6 +358,52 @@ class ControllerIoBinding:
     in_np[:, off] = vx.cpu().numpy()
     in_np[:, off + 1] = vy.cpu().numpy()
     in_np[:, off + 2] = wz.cpu().numpy()
+
+  def write_ismpc_walk_gate(self, in_np: np.ndarray, walk_enabled: torch.Tensor) -> None:
+    """Write the RL policy's walk/stop decision for every env, this step.
+
+    ``walk_enabled`` is a bool tensor (num_envs,): True requests walking,
+    False requests stopping. Written as 1.0/0.0 -- ``step_env`` worker-side
+    (``mc_rtc_controller_host.py``) thresholds at 0.5. The policy has full,
+    unconditional authority: this overrides whatever ISMPC's own autonomous
+    safety-stop logic would otherwise have wanted (see
+    ``read_ismpc_wants_stop`` for that advisory, non-gating signal).
+
+    Requires ``self.layout.has_ismpc_walk_gate``; callers that don't set
+    that on their action's ``IoLayout`` should never reach this method.
+    """
+    assert self.layout.has_ismpc_walk_gate, (
+      "write_ismpc_walk_gate called but this IoLayout was built with "
+      "has_ismpc_walk_gate=False -- the input row has no column reserved "
+      "for this value."
+    )
+    off = self.layout.ismpc_walk_off
+    in_np[:, off] = walk_enabled.to(dtype=torch.float32).cpu().numpy()
+
+  def read_ismpc_wants_stop(
+    self, out_np: np.ndarray, env_indices: list[int]
+  ) -> torch.Tensor:
+    """Bool per env: did ISMPC's own safety logic want to stop walking on
+    the most recent MPC solve, independent of what the policy actually
+    commanded via ``write_ismpc_walk_gate``?
+
+    This is advisory/observational only -- it does NOT reflect the
+    controller's actual Stop state, which the policy has full authority
+    over (see ``Walking_controller::ismpc_wants_stop`` for the full
+    rationale). Intended as an observation term so the policy can learn to
+    react to -- or preemptively avoid -- situations where ISMPC disagrees
+    with its walk decision.
+
+    Requires ``self.layout.has_ismpc_walk_gate``; callers that don't set
+    that on their action's ``IoLayout`` should never reach this method.
+    """
+    assert self.layout.has_ismpc_walk_gate, (
+      "read_ismpc_wants_stop called but this IoLayout was built with "
+      "has_ismpc_walk_gate=False -- the output row has no column reserved "
+      "for this value."
+    )
+    wants_stop = out_np[env_indices, self.layout.ismpc_wants_stop_off] != 0.0
+    return torch.tensor(wants_stop, dtype=torch.bool, device=self._device)
 
   def _fill_joint_columns(self, in_np: np.ndarray) -> None:
     """Write encoder/velocity/torque columns of the input block (all envs)."""

@@ -149,11 +149,26 @@ class IoLayout:
                     worker-side right before ``controller.run()``, same
                     timing as the sine reference above.
 
+    [ismpc_walk_off, +1)  present only when ``has_ismpc_walk_gate``: the
+                    RL policy's walk/stop decision (1.0 = walk, else stop),
+                    written by the action term and consumed worker-side via
+                    the ismpc_walking_python bridge's set_policy_wants_walk
+                    right before ``controller.run()``, same timing as the
+                    sine/velocity channels above. The policy has full,
+                    unconditional authority over walking -- this overrides
+                    whatever ISMPC's own autonomous safety-stop logic would
+                    otherwise have wanted (see ismpc_wants_stop_off below,
+                    the observation the policy can react to instead).
+
   Output row: one T-wide block per entry of ``output_channels``, in order --
   e.g. the default ``("q", "alpha")`` gives q in ``[0, T)`` and alpha in
   ``[T, 2T)``, for the target joints -- followed by a single status column at
   ``status_off`` carrying 1.0 once the controller has failed (see
-  ``ControllerHost.step_env``).
+  ``ControllerHost.step_env``), followed by ``ismpc_wants_stop_off``
+  (present only when ``has_ismpc_walk_gate``): ISMPC's own advisory safety
+  opinion from the most recent MPC solve (1.0 = ISMPC would have stopped),
+  independent of what the policy actually commanded -- read back via the
+  bridge's get_ismpc_wants_stop so the policy can observe and learn from it.
   """
 
   num_targets: int
@@ -178,6 +193,13 @@ class IoLayout:
   # without the other), appended after it so has_ismpc_sine-only layouts'
   # widths are completely unaffected by this field existing.
   has_ismpc_velocity: bool = False
+  # Whether this layout carries the RL-policy walk/stop gate: one input
+  # column (the policy's decision) and one output column (ismpc_wants_stop,
+  # ISMPC's own advisory opinion). Independent of has_ismpc_sine/
+  # has_ismpc_velocity, appended after both so existing layouts' widths are
+  # unaffected by this field existing. See policyWantsWalk/ismpc_wants_stop
+  # in Walking_controller.h for the full design rationale.
+  has_ismpc_walk_gate: bool = False
 
   @property
   def root_off(self) -> int:
@@ -201,17 +223,27 @@ class IoLayout:
     return base + 4 if self.has_ismpc_sine else base
 
   @property
-  def in_width(self) -> int:
+  def ismpc_walk_off(self) -> int:
     base = self.ismpc_velocity_off
     return base + 3 if self.has_ismpc_velocity else base
+
+  @property
+  def in_width(self) -> int:
+    base = self.ismpc_walk_off
+    return base + 1 if self.has_ismpc_walk_gate else base
 
   @property
   def status_off(self) -> int:
     return len(self.output_channels) * self.num_targets
 
   @property
-  def out_width(self) -> int:
+  def ismpc_wants_stop_off(self) -> int:
     return self.status_off + 1
+
+  @property
+  def out_width(self) -> int:
+    base = self.status_off + 1  # +1 for the existing failure-status column
+    return base + 1 if self.has_ismpc_walk_gate else base
 
 
 @dataclass
@@ -632,6 +664,26 @@ class ControllerHost:
       # writing the same value repeatedly is harmless.
       ismpc_walking_python.set_reference_velocity(controller.controller(), vx, vy, wz)
 
+    if layout.has_ismpc_walk_gate:
+      if ismpc_walking_python is None:
+        raise ImportError(
+          "IoLayout.has_ismpc_walk_gate is set but the ismpc_walking_python "
+          "bridge module could not be imported; build it as part of "
+          "ismpc_walking's CMake (see ismpc_walking_python/CMakeLists "
+          "entry) and ensure it's on PYTHONPATH."
+        )
+      # Same routing rationale as the sine/velocity channels above. The
+      # policy has full, unconditional authority: this call directly sets
+      # the controller's Stop flag, overriding whatever ISMPC's own
+      # autonomous safety logic would otherwise have wanted this tick (see
+      # the ismpc_wants_stop readback below, and
+      # Walking_controller::SetPolicyWantsWalk for the C++ side). Threshold
+      # at 0.5 -- the action term is expected to write a clean 0.0/1.0
+      # (e.g. from a sigmoid squash thresholded on its own side), but this
+      # keeps step_env robust to any intermediate float value regardless.
+      walk_enabled = float(row[layout.ismpc_walk_off]) > 0.5
+      ismpc_walking_python.set_policy_wants_walk(controller.controller(), walk_enabled)
+
     # mc_mujoco stops the whole sim when run() reports failure. A trainer
     # cannot: the QP giving up is the normal end of a fall, and it must cost
     # one episode, not the run. Latch it and let the trainer terminate the env
@@ -642,6 +694,20 @@ class ControllerHost:
     mbc = controller.robot().mbc
     out_row = out_arr[env_id]
     out_row[layout.status_off] = 0.0 if ok else 1.0
+
+    if layout.has_ismpc_walk_gate:
+      # Read back AFTER run(): ismpc_wants_stop reflects the MPC solve that
+      # just happened (ComputeWalkingTrajectory() runs on a separate thread,
+      # triggered from run(), and clears/re-sets this flag each solve -- see
+      # Walking_controller.h). ismpc_walking_python is guaranteed non-None
+      # here since the has_ismpc_walk_gate branch above already raised if it
+      # weren't. get_ismpc_wants_stop returns None only if the loaded
+      # controller isn't a Walking_controller (config/task mismatch, not
+      # routine) -- fall back to 0.0 (i.e. "no opinion") rather than raise,
+      # since this is a read-only observation, not a required control input.
+      wants_stop = ismpc_walking_python.get_ismpc_wants_stop(controller.controller())
+      out_row[layout.ismpc_wants_stop_off] = 1.0 if wants_stop else 0.0
+
     for c, attr in enumerate(self._output_attrs):
       values = getattr(mbc, attr)
       base = c * T

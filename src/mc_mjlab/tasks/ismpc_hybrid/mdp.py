@@ -85,6 +85,31 @@ def last_sine_params(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   return action_term.physical_params
 
 
+def last_walk_action(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """The policy's current walk/stop decision (1.0 = walk, 0.0 = stop), as
+  an observation -- mirrors last_sine_params' role for the sine params, so
+  the policy can condition on its own last decision directly.
+  """
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.last_walk_action
+
+
+def ismpc_wants_stop(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """ISMPC's own advisory safety opinion from the most recent MPC solve
+  (1.0 = ISMPC would have stopped walking on its own), as an observation.
+
+  Independent of what the policy actually commanded via the walk-gate
+  action: the policy has full, unconditional authority over walking (see
+  Walking_controller::policyWantsWalk), so this does NOT reflect the
+  controller's actual Stop state. It exists so the policy can learn to
+  react to -- or preemptively avoid -- situations where ISMPC's own safety
+  logic disagrees with its walk decision, rather than only discovering
+  that disagreement's consequences after the fact (e.g. via a fall).
+  """
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.ismpc_wants_stop_obs
+
+
 def controller_failed(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   """True for envs whose mc_rtc controller's QP gave up last step.
 

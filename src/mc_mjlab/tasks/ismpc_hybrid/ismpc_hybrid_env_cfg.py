@@ -38,13 +38,10 @@ from mc_mjlab.robots.robots_registry import get_main_robot_spec, prepare_cfg_for
 from mc_mjlab.tasks.ismpc_hybrid.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp  # FOO module, see below
 
-NUM_ENVS = 1  # FOO: matches residual_balance's scale; untuned for this task.
-PLAY_NUM_ENVS = 1
+NUM_ENVS = 128
+PLAY_NUM_ENVS = 8
 
-# FOO: matches residual_balance's episode length; untuned for this task --
-# revisit once ISMPC-specific reward/termination exist and you know how long
-# a meaningful episode actually is for this controller/behavior.
-EPISODE_LENGTH_S = 16.0
+EPISODE_LENGTH_S = 32.0
 
 # FOO placeholder: m_delta=0.05s / timestep=0.001s. Confirm against your
 # actual mc_rtc.yaml's `ismpc.delta` before trusting this.
@@ -89,6 +86,20 @@ def _make_env_cfg(
     "joint_vel": ObservationTermCfg(func=envs_mdp.joint_vel_rel),
     "last_sine_params": ObservationTermCfg(
       func=ismpc_mdp.last_sine_params, params={"action_name": "ismpc_sine"}
+    ),
+    # Both new terms mirror last_sine_params' pattern exactly. last_walk_action
+    # is the policy's own last walk/stop decision (so it can condition on
+    # what it already committed to, same rationale as last_sine_params for
+    # phase continuity). ismpc_wants_stop is ISMPC's own advisory safety
+    # opinion, independent of the policy's decision -- the policy has full
+    # authority over walking (see Walking_controller::policyWantsWalk), but
+    # needs this signal to learn to react to (or preempt) situations where
+    # ISMPC's own logic disagrees. See mdp.py docstrings for full rationale.
+    "last_walk_action": ObservationTermCfg(
+      func=ismpc_mdp.last_walk_action, params={"action_name": "ismpc_sine"}
+    ),
+    "ismpc_wants_stop": ObservationTermCfg(
+      func=ismpc_mdp.ismpc_wants_stop, params={"action_name": "ismpc_sine"}
     ),
   }
   observations = {
