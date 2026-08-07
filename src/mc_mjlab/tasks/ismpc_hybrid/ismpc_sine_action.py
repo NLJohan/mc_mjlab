@@ -6,7 +6,7 @@ frequency, phase -- come from the RL policy's own output each period, mapped
 from raw (unconstrained) actions into physical units via the scale/clip/
 sigmoid rules worked out earlier in this project:
 
-  offset            = clip(offset_scale * raw[0] + offset_bias, 0.4, 1.0)   (m)
+  offset            = clip(offset_scale * raw[0] + offset_bias, OFFSET_MIN, OFFSET_MAX)   (m)
   amplitude_ratio    = sigmoid(raw[1])                                       (0, 1)
   amplitude          = amplitude_ratio * offset   -- derived, not learned directly;
                         guarantees offset - amplitude >= 0 structurally, no
@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 
 # --- Physical ranges, locked in earlier in this project. ---
-OFFSET_MIN, OFFSET_MAX = 0.7, 0.8  # m
+OFFSET_MIN, OFFSET_MAX = 0.4, 1.0  # m
 FREQUENCY_MIN, FREQUENCY_MAX = 0.1, 8.0  # Hz
 
 # Shifts the amplitude-ratio sigmoid so raw_action=0 -> amplitude_ratio~=0
@@ -108,21 +108,14 @@ class IsmpcSineActionCfg(ActionTermCfg):
 
   console_output: str = "none"
 
-  # --- Raw-action -> physical-units mapping. FOO: these scale/bias defaults
-  # are placeholders; tune once training reveals what range the policy
-  # actually needs to explore productively. ---
-  offset_scale: float = 0.3
-  offset_bias: float = 0.7
-  # FOO: lowered from an earlier draft's 4.05 Hz default. Even with
-  # amplitude_ratio now safely near-zero at raw_action=0 (see
-  # AMPLITUDE_RATIO_ZERO_BIAS), a frequency default in the middle of the
-  # range meant early PPO exploration (raw actions near zero but not
-  # exactly zero, sampled from the Gaussian policy) could still pair a
-  # small-but-nonzero amplitude with a high frequency -- large zc_ddot
-  # scales with frequency^2, so this is worth keeping conservative as a
-  # second layer of defense, not just relying on amplitude being small.
-  frequency_scale: float = 1.0
-  frequency_bias: float = 1.0
+  # Set to explore full OFFSET_MIN OFFSET_MAX range in natural range from 
+  # arithmetic mean
+  offset_scale: float = (OFFSET_MAX-OFFSET_MIN)/2
+  offset_bias: float = (OFFSET_MAX+OFFSET_MIN)/2
+  # Set to explore full FREQUENCY_MIN FREQUENCY_MAX in log range from 
+  # geometric mean 
+  frequency_scale: float = torch.log(torch.tensor(FREQUENCY_MAX / FREQUENCY_MIN)).item() / 2
+  frequency_bias: float = torch.log(torch.tensor(FREQUENCY_MIN * FREQUENCY_MAX)).item() / 2
 
   def build(self, env: ManagerBasedRlEnv) -> "IsmpcSineAction":
     return IsmpcSineAction(self, env)
@@ -330,7 +323,7 @@ class IsmpcSineAction(ActionTerm):
     amplitude = amplitude_ratio * offset
 
     frequency = torch.clamp(
-      self.cfg.frequency_scale * raw_freq + self.cfg.frequency_bias,
+      torch.exp(self.cfg.frequency_scale * raw_freq + self.cfg.frequency_bias),
       min=FREQUENCY_MIN,
       max=FREQUENCY_MAX,
     )
@@ -398,43 +391,6 @@ class IsmpcSineAction(ActionTerm):
     Independent of what the policy actually commanded -- see
     ControllerIoBinding.read_ismpc_wants_stop for the full rationale."""
     return self._ismpc_wants_stop.to(dtype=torch.get_default_dtype()).unsqueeze(-1)
-
-  def continuity_penalty(self) -> torch.Tensor:
-    """Squared discontinuity, per env, between the previous period's sine
-    and the current period's sine, evaluated at the instant the switch took
-    effect (self._period_t0) -- height and vertical velocity both included.
-
-    This is deliberately NOT a penalty on the raw or physical *parameters*
-    changing (e.g. ||params_t - params_{t-1}||^2): two different
-    (offset, amplitude, frequency, phase) tuples can still produce a
-    continuous trajectory at the splice point (e.g. a phase shift that
-    exactly compensates a frequency change), and conversely small parameter
-    changes can still produce a visible position/velocity jump depending on
-    where in the cycle the switch lands. Evaluating both sines at the same
-    instant and comparing their value (and slope) directly targets the
-    physically meaningful quantity: does the CoM height reference actually
-    jump, which is what would inject a spurious feedforward acceleration
-    kick into ISMPC_Solver's zc_ddot term (see ismpc_solver_patch.md).
-    """
-
-    def height_and_vel(p: dict[str, torch.Tensor], t: torch.Tensor) -> tuple[
-      torch.Tensor, torch.Tensor
-    ]:
-      omega = 2.0 * torch.pi * p["frequency"]
-      theta = omega * t + p["phase"]
-      height = p["offset"] + p["amplitude"] * torch.sin(theta)
-      vel = p["amplitude"] * omega * torch.cos(theta)
-      return height, vel
-
-    h_prev, v_prev = height_and_vel(self._physical_prev, self._period_t0)
-    h_curr, v_curr = height_and_vel(self._physical_curr, self._period_t0)
-    # Velocity term is scaled down relative to height: they are in
-    # different units (m vs m/s) and otherwise the faster-varying velocity
-    # term would dominate the loss almost arbitrarily depending on
-    # frequency. FOO: this 0.1 weighting is a placeholder, not derived from
-    # anything -- revisit once you can see how large each term's
-    # contribution actually is during training.
-    return (h_curr - h_prev) ** 2 + 0.1 * (v_curr - v_prev) ** 2
 
   # ---- ActionTerm API. ----
 

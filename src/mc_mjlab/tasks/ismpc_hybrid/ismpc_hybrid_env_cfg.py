@@ -1,17 +1,4 @@
 """ISMPC hybrid task: RL learns CoM-height sine parameters for ISMPC.
-
-SKELETON STAGE: observations, reward, and termination below are placeholders
-(FOO), copied from patterns proven elsewhere in this repo (zero_residual's
-observation set, residual_balance's termination conditions) just to make
-this a well-formed, trainable env. None of them are ISMPC-specific yet --
-that's the next design pass, once this skeleton is confirmed to construct
-and step (and ideally train for a handful of iterations without crashing).
-
-Rates: FOO placeholder. ISMPC's MPC period is m_delta=0.05s (20Hz); the
-action should update once per MPC period, i.e. frameskip should make
-`frameskip * sim.mujoco.timestep == 0.05`. Below assumes timestep=0.001,
-frameskip=50; revisit if the real controller's mc_rtc.yaml uses a
-different delta.
 """
 
 from __future__ import annotations
@@ -36,15 +23,13 @@ from mjlab.terrains import TerrainEntityCfg
 from mc_mjlab import MC_RTC_YAML_PATH
 from mc_mjlab.robots.robots_registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.tasks.ismpc_hybrid.ismpc_sine_action import IsmpcSineActionCfg
-from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp  # FOO module, see below
+from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
 NUM_ENVS = 128
 PLAY_NUM_ENVS = 8
 
 EPISODE_LENGTH_S = 32.0
 
-# FOO placeholder: m_delta=0.05s / timestep=0.001s. Confirm against your
-# actual mc_rtc.yaml's `ismpc.delta` before trusting this.
 FRAMESKIP = 2
 
 
@@ -87,54 +72,55 @@ def _make_env_cfg(
     "last_sine_params": ObservationTermCfg(
       func=ismpc_mdp.last_sine_params, params={"action_name": "ismpc_sine"}
     ),
-    # Both new terms mirror last_sine_params' pattern exactly. last_walk_action
-    # is the policy's own last walk/stop decision (so it can condition on
-    # what it already committed to, same rationale as last_sine_params for
-    # phase continuity). ismpc_wants_stop is ISMPC's own advisory safety
-    # opinion, independent of the policy's decision -- the policy has full
-    # authority over walking (see Walking_controller::policyWantsWalk), but
-    # needs this signal to learn to react to (or preempt) situations where
-    # ISMPC's own logic disagrees. See mdp.py docstrings for full rationale.
     "last_walk_action": ObservationTermCfg(
       func=ismpc_mdp.last_walk_action, params={"action_name": "ismpc_sine"}
     ),
     "ismpc_wants_stop": ObservationTermCfg(
       func=ismpc_mdp.ismpc_wants_stop, params={"action_name": "ismpc_sine"}
     ),
+    "target_twist": ObservationTermCfg(
+      func=ismpc_mdp.target_twist, params={"command_name": "twist"}
+    ),
   }
+
   observations = {
     "actor": ObservationGroupCfg(terms=dict(actor_terms), concatenate_terms=True),
     "critic": ObservationGroupCfg(terms=dict(actor_terms), concatenate_terms=True),
   }
 
-  # FOO: weights are placeholders, entirely untuned. `alive`/`upright` give
-  # the base survival/stability pressure (Hypothesis A from the design
-  # discussion: outcome-based, no explicit height/wrench/stability-margin
-  # term, so any height-modulation strategy has to be *discovered* rather
-  # than hinted at). `sine_continuity` and `joint_torque` are regularizers,
-  # not task-defining rewards -- see mdp.py for why each is shaped the way
-  # it is (continuity: value/slope match at the splice instant, not raw
-  # parameter distance; torque: ordinary control-cost shaping, decoupled
-  # from the disputed "humans do this to save energy" framing).
   rewards = {
-    "alive": RewardTermCfg(func=ismpc_mdp.is_alive, weight=1.0),
-    "upright": RewardTermCfg(func=ismpc_mdp.upright_penalty, weight=-1.0),
-    "sine_continuity": RewardTermCfg(
-      func=ismpc_mdp.sine_continuity_penalty,
-      weight=-1.0,
+    "is_alive": RewardTermCfg(
+      func=ismpc_mdp.is_alive, 
+      weight=10.0),
+    "is_walking": RewardTermCfg(
+      func=ismpc_mdp.is_walking, 
+      weight=-5.0, 
+      params={"action_name": "ismpc_sine"}
+    ),
+    "upright": RewardTermCfg(
+      func=ismpc_mdp.upright_reward, 
+      weight=1.0),
+    "sine_position_continuity": RewardTermCfg(
+      func=ismpc_mdp.sine_position_continuity,
+      weight=1.0,
       params={"action_name": "ismpc_sine"},
     ),
-    "joint_torque": RewardTermCfg(func=ismpc_mdp.joint_torque_penalty, weight=-1.0e-4),
+    "sine_velocity_continuity": RewardTermCfg(
+      func=ismpc_mdp.sine_velocity_continuity,
+      weight=1.0,
+      params={"action_name": "ismpc_sine"},
+    ),
+    "joint_torque": RewardTermCfg(
+      func=ismpc_mdp.joint_torque_reward, 
+      weight=1.0),
   }
 
-  # FOO: placeholder termination, copied from residual_balance's pattern
-  # (fell over / collapsed / controller failed). Thresholds untuned for
-  # this specific task/controller.
   terminations = {
     "fell_over": TerminationTermCfg(func=ismpc_mdp.fell_over),
     "collapsed": TerminationTermCfg(func=ismpc_mdp.collapsed),
     "controller_failed": TerminationTermCfg(
-      func=ismpc_mdp.controller_failed, params={"action_name": "ismpc_sine"}
+      func=ismpc_mdp.controller_failed, 
+      params={"action_name": "ismpc_sine"}
     ),
   }
 
@@ -151,7 +137,8 @@ def _make_env_cfg(
   # is confirmed stable at these values.
   events = {
     "reset_scene_to_default": EventTermCfg(
-      func=envs_mdp.reset_scene_to_default, mode="reset"
+      func=envs_mdp.reset_scene_to_default, 
+      mode="reset"
     ),
     "reset_joints": EventTermCfg(
       func=envs_mdp.reset_joints_by_offset,

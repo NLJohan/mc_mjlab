@@ -31,38 +31,78 @@ def is_alive(env: ManagerBasedRlEnv) -> torch.Tensor:
   return torch.ones(env.num_envs, device=env.device)
 
 
-def upright_penalty(env: ManagerBasedRlEnv) -> torch.Tensor:
-  """Penalize deviation from upright, via the entity's projected gravity
-  vector (parallels residual_balance's orientation shaping, simplified).
+def is_walking(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """Reward component for "is the robot actually walking right now" --
+  penalizes staying alive-but-stopped relative to alive-and-walking (see
+  the is_alive/is_walking split rationale: the policy has full authority
+  to stop walking for safety, per Walking_controller::policyWantsWalk, but
+  should pay a real (if smaller than falling) cost for choosing to, so
+  "stop and stand forever" doesn't become a dominant strategy).
 
-  FOO: entity name "robot" hardcoded; no configurable params dict yet.
+  TODO(bridge): this reads action_term.is_walking_obs, which does NOT YET
+  EXIST. It requires a new ground-truth readback of the controller's
+  ACTUAL current Robot_Walking/!Stop state (distinct from
+  ismpc_wants_stop_obs, which is only ISMPC's advisory opinion, and from
+  last_walk_action, which is only the policy's own commanded intent --
+  neither alone is safe to reward against, since the policy could report
+  "walking" without ISMPC actually walking, or vice versa). Needs, in
+  order:
+    1. Walking_controller: getter exposing Robot_Walking (or !Stop).
+    2. ismpc_walking_python bridge: new is_walking(ctl) -> bool | None,
+       mirroring get_com_height_ref/qp_succeeded's existing structure.
+    3. mc_rtc_controller_io_binding.py / mc_rtc_controller_host.py: new
+       output-row readback, alongside the existing ismpc_wants_stop one.
+    4. IsmpcSineAction: new self._is_walking buffer + is_walking_obs
+       property, populated the same way self._ismpc_wants_stop already is
+       (see ismpc_sine_action.py around read_ismpc_wants_stop).
+  Until then, this function will raise AttributeError if actually called --
+  intentionally not stubbed to return a fake value, so a broken/missing
+  bridge fails loudly instead of silently training against a placeholder.
+
+  Weights (set in ismpc_hybrid_env_cfg.py's rewards dict, not here): the
+  user's stated design is alive+walking=10, alive+not-walking=5, i.e. this
+  term's own weight should be NEGATIVE and equal to the *gap* (10-5=5,
+  so weight=-5) alongside is_alive's weight=10 -- NOT a second full-size
+  reward, since is_alive already fires every step regardless of walking
+  state; this term only needs to claw back the difference when not
+  walking. Placeholder magnitudes per the user, both explicitly FOO.
+  """
+  action_term = env.action_manager.get_term(action_name)
+  return (~action_term.is_walking_obs.bool()).to(dtype=torch.get_default_dtype())
+
+
+def upright_reward(env: ManagerBasedRlEnv, sigma: float = 0.1) -> torch.Tensor:
+  """Gaussian-kernel reward for staying upright, via the entity's projected
+  gravity vector (parallels residual_balance's orientation shaping,
+  simplified). Projected gravity is (0, 0, -1) when upright, so its
+  horizontal component's squared magnitude is 0 when upright and grows
+  toward 1 as the robot tips toward horizontal.
+
+  sigma=0.1 (applied to the already-squared, dimensionless quantity, so
+  effectively sigma^2=0.1 on the raw sum-of-squares): reward ~0.6 at a
+  ~8 degree tilt, decays to ~0 by gravity_xy_sq=0.2 -- well before
+  fell_over's termination boundary (gravity_xy_threshold=0.7, i.e.
+  gravity_xy_sq=0.49), so this term signals trouble well ahead of actual
+  termination rather than staying flat until the cliff. Tunable; revisit
+  once you can see logged tilt distributions during training.
   """
   entity = env.scene["robot"]
   gravity_b = entity.data.projected_gravity_b
-  # Projected gravity is (0, 0, -1) when upright; penalize the horizontal
-  # component's magnitude (any tilt shows up there).
-  return torch.sum(gravity_b[:, :2] ** 2, dim=-1)
+  gravity_xy_sq = torch.sum(gravity_b[:, :2] ** 2, dim=-1)
+  return torch.exp(-gravity_xy_sq / (2.0 * sigma**2))
 
 
 def fell_over(env: ManagerBasedRlEnv, gravity_xy_threshold: float = 0.7) -> torch.Tensor:
   """True once the entity's projected gravity's horizontal component
   exceeds a threshold -- i.e. the robot has tipped over substantially.
-
-  FOO: threshold untuned; copied in spirit from residual_balance's
-  fell_over term without seeing its exact numeric threshold.
   """
   entity = env.scene["robot"]
   gravity_b = entity.data.projected_gravity_b
   return torch.sum(gravity_b[:, :2] ** 2, dim=-1) > gravity_xy_threshold**2
 
 
-def collapsed(env: ManagerBasedRlEnv, min_root_height: float = 0.5) -> torch.Tensor:
+def collapsed(env: ManagerBasedRlEnv, min_root_height: float = 0.35) -> torch.Tensor:
   """True once the entity's root height drops below a threshold.
-
-  FOO: threshold untuned (JVRC1-specific standing height is ~0.8m per this
-  session's earlier smoke test baseline of 0.75-0.82m CoM height; 0.5m as a
-  collapse threshold is a rough guess, not derived from the robot's actual
-  geometry).
   """
   entity = env.scene["robot"]
   root_height = entity.data.root_link_pos_w[:, 2]
@@ -120,36 +160,113 @@ def controller_failed(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   return action_term.controller_failed
 
 
-def sine_continuity_penalty(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
-  """Penalize a discontinuous CoM-height reference at period boundaries.
+def _sine_height_at(p: dict[str, torch.Tensor], t: torch.Tensor) -> torch.Tensor:
+  """CoM-height reference of the sine defined by physical params p, at time t."""
+  omega = 2.0 * torch.pi * p["frequency"]
+  theta = omega * t + p["phase"]
+  return p["offset"] + p["amplitude"] * torch.sin(theta)
 
-  Delegates to IsmpcSineAction.continuity_penalty() -- see that method's
-  docstring for why this compares the two sines' value/slope at the splice
-  instant, rather than penalizing raw parameter change directly.
+
+def _sine_height_rate_at(p: dict[str, torch.Tensor], t: torch.Tensor) -> torch.Tensor:
+  """Time-derivative of _sine_height_at, at time t."""
+  omega = 2.0 * torch.pi * p["frequency"]
+  theta = omega * t + p["phase"]
+  return p["amplitude"] * omega * torch.cos(theta)
+
+
+def sine_position_continuity(
+  env: ManagerBasedRlEnv, action_name: str, sigma: float = 0.03
+) -> torch.Tensor:
+  """Gaussian-kernel reward for CoM-height reference continuity across the
+  period splice: exp(-(h_curr - h_prev)^2 / (2*sigma^2)), evaluated at the
+  instant the switch took effect (action_term._period_t0).
+
+  Deliberately NOT a penalty on the raw or physical *parameters* changing
+  (e.g. ||params_t - params_{t-1}||^2): two different (offset,
+  amplitude_ratio, frequency, phase) tuples can still produce a continuous
+  trajectory at the splice point (e.g. a phase shift that exactly
+  compensates a frequency change), and conversely small parameter changes
+  can still produce a visible position jump depending on where in the
+  cycle the switch lands. Evaluating both sines at the same instant and
+  comparing their value directly targets the physically meaningful
+  quantity: does the CoM height reference actually jump, which is what
+  would inject a spurious feedforward acceleration kick into
+  ISMPC_Solver's zc_ddot term (see ismpc_solver_patch.md).
+
+  sigma=0.03m: reward ~0.95 at a 1cm jump, ~0.25 at 5cm, ~0 by 10cm+ --
+  tunable, chosen to sit near the boundary between splice discontinuities
+  ISMPC's own tracking can likely absorb vs ones large enough to disrupt
+  it; revisit once you can see logged jump magnitudes during training.
   """
   action_term = env.action_manager.get_term(action_name)
-  return action_term.continuity_penalty()
+  h_prev = _sine_height_at(action_term._physical_prev, action_term._period_t0)
+  h_curr = _sine_height_at(action_term._physical_curr, action_term._period_t0)
+  return torch.exp(-(h_curr - h_prev) ** 2 / (2.0 * sigma**2))
 
 
-def joint_torque_penalty(env: ManagerBasedRlEnv) -> torch.Tensor:
-  """Sum of squared joint torques (actuator effort), summed over joints.
+def sine_velocity_continuity(
+  env: ManagerBasedRlEnv, action_name: str, sigma: float = 0.3
+) -> torch.Tensor:
+  """Gaussian-kernel reward for CoM-height reference SLOPE continuity
+  across the period splice: exp(-(v_curr - v_prev)^2 / (2*sigma^2)).
+
+  Companion to sine_position_continuity -- see that docstring for why this
+  compares the two sines' derivative at the splice instant directly,
+  rather than a raw-parameter distance. Kept as a separate reward term
+  (rather than combined into one with a blend weight, per an earlier
+  design) specifically because height (m) and vertical velocity (m/s) are
+  different units: a Gaussian kernel per term, each with its own
+  physically meaningful sigma, makes the two terms' weights directly
+  comparable to every other Gaussian-kernel reward in this task, instead
+  of requiring a hand-tuned blend constant inside a single mixed-units
+  squared-error term (that approach's actual problem: velocity carries an
+  extra factor of frequency*2*pi, up to ~50 rad/s at this task's frequency
+  ceiling, which dominated any small fixed blend weight regardless of its
+  value).
+
+  sigma=0.3 m/s: reward ~0.95 at 0.1 m/s, ~0.6 at 0.3 m/s, ~0 above ~1 m/s
+  -- tunable, same rationale as sine_position_continuity's sigma.
+  """
+  action_term = env.action_manager.get_term(action_name)
+  v_prev = _sine_height_rate_at(action_term._physical_prev, action_term._period_t0)
+  v_curr = _sine_height_rate_at(action_term._physical_curr, action_term._period_t0)
+  return torch.exp(-(v_curr - v_prev) ** 2 / (2.0 * sigma**2))
+
+
+def joint_torque_reward(env: ManagerBasedRlEnv, sigma: float = 100.0) -> torch.Tensor:
+  """Gaussian-kernel reward for low joint effort: exp(-sum(tau^2) / (2*sigma^2)),
+  summed over all DOFs (currently equivalent to "the target joint subset",
+  since IsmpcSineActionCfg.target_actuator_names=(".*",) already covers
+  every actuator in this task -- revisit the DOF scoping only if a future
+  task variant narrows the action term's target set).
 
   Legitimate on ordinary robotics/control grounds (reduces actuator heat,
-  peak torque demand, and is a standard RL shaping term) -- NOT included on
-  the basis of any specific human-biomechanics claim. A literature check
-  during this design pass (Gard et al., "Metabolic and Mechanical Energy
-  Costs of Reducing Vertical Center of Mass Movement During Gait") found
-  the opposite of the initially-proposed justification: deviating from the
-  natural range of CoM vertical displacement, in either direction,
-  *increases* metabolic cost in humans; it is not a strategy the body uses
-  to *reduce* energy expenditure. Kept here purely as a standard control
-  shaping term.
+  peak torque demand, standard RL shaping) -- NOT included on the basis of
+  any specific human-biomechanics claim; see the removed penalty version's
+  docstring for the literature check that ruled that framing out.
 
-  FOO: uses ALL dofs via sim.data.qfrc_actuator, not scoped to the specific
-  target joint subset the action drives; untuned weight. Confirmed source
-  (not guessed): ControllerIoBinding._fill_joint_columns already reads
-  env.sim.data.qfrc_actuator for this exact purpose (feeding mc_rtc's torque
-  input channel), so this is known to be the right attribute name -- only
-  the dof-subset scoping here is a placeholder.
+  sigma=100 (in sum-of-squared-Nm units, i.e. sigma^2=10000): a rough,
+  UNVALIDATED starting guess -- assumes something on the order of
+  ~30 Nm across ~12 actively-loaded joints during normal walking
+  (30^2 * 12 ~= 10800), giving reward ~0.6 at that rough "typical effort"
+  level and decaying by ~2x that. This is not measured against this
+  system's actual torques/PD gains/robot mass; set it properly once you
+  can see logged sum(qfrc_actuator**2) values from a real training run,
+  ideally picking sigma^2 near the middle of the observed range rather
+  than guessing.
   """
-  return torch.sum(env.sim.data.qfrc_actuator**2, dim=-1)
+  return torch.exp(-torch.sum(env.sim.data.qfrc_actuator**2, dim=-1) / (2.0 * sigma**2))
+
+
+def target_twist(env: ManagerBasedRlEnv, command_name: str = "twist") -> torch.Tensor:
+  """Currently sampled target walking velocity (vx, vy, wz), as an
+  observation. The policy has no direct authority over velocity tracking
+  itself (footstep planning/execution is entirely internal to ISMPC), but
+  needs this as context: it explains part of what shows up in
+  base_lin_vel, and more importantly, the target speed/turn-rate is
+  plausibly informative for what CoM-height sine strategy is safe or
+  appropriate (e.g. a fast commanded walk likely needs different height
+  modulation than near-stationary standing) -- which is squarely the
+  policy's actual job.
+  """
+  return env.command_manager.get_command(command_name)
