@@ -26,9 +26,9 @@ from mc_mjlab.tasks.ismpc_hybrid.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
 NUM_ENVS = 128
-PLAY_NUM_ENVS = 8
+PLAY_NUM_ENVS = 32
 
-EPISODE_LENGTH_S = 32.0
+EPISODE_LENGTH_S = 16.0
 
 FRAMESKIP = 2
 
@@ -57,12 +57,6 @@ def _make_env_cfg(
     )
   }
 
-  # FOO: base state matches zero_residual/residual_balance's set verbatim.
-  # last_sine_params is new (see mdp.py docstring): the physical, mapped
-  # params from the previous period, given as an observation specifically
-  # so the policy can reason about phase continuity across periods. No
-  # ISMPC-internal signal (tracking error, footstep/QP state) yet -- next
-  # design pass, once this skeleton runs.
   actor_terms = {
     "base_lin_vel": ObservationTermCfg(func=envs_mdp.base_lin_vel),
     "base_ang_vel": ObservationTermCfg(func=envs_mdp.base_ang_vel),
@@ -92,11 +86,11 @@ def _make_env_cfg(
     "is_alive": RewardTermCfg(
       func=ismpc_mdp.is_alive, 
       weight=10.0),
-    "is_walking": RewardTermCfg(
-      func=ismpc_mdp.is_walking, 
-      weight=-5.0, 
-      params={"action_name": "ismpc_sine"}
-    ),
+    # "is_walking": RewardTermCfg(
+    #   func=ismpc_mdp.is_walking, 
+    #   weight=-5.0, 
+    #   params={"action_name": "ismpc_sine"}
+    # ),
     "upright": RewardTermCfg(
       func=ismpc_mdp.upright_reward, 
       weight=1.0),

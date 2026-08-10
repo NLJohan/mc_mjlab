@@ -67,8 +67,9 @@ def is_walking(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   state; this term only needs to claw back the difference when not
   walking. Placeholder magnitudes per the user, both explicitly FOO.
   """
-  action_term = env.action_manager.get_term(action_name)
-  return (~action_term.is_walking_obs.bool()).to(dtype=torch.get_default_dtype())
+  # action_term = env.action_manager.get_term(action_name)
+  # return (~action_term.is_walking_obs.bool()).to(dtype=torch.get_default_dtype())
+  pass
 
 
 def upright_reward(env: ManagerBasedRlEnv, sigma: float = 0.1) -> torch.Tensor:
