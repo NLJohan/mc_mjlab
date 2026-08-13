@@ -286,6 +286,29 @@ class ControllerIoBinding:
       in_np[:, ro : ro + 3] = self._entity.data.root_link_pos_w.cpu().numpy()
       in_np[:, ro + 3 : ro + 7] = self._entity.data.root_link_quat_w.cpu().numpy()
     in_np[:, ro : ro + 3] -= self._env_origins_np
+    # Zero root velocity/acceleration on reset. This function only wrote
+    # position/orientation above; the velocity columns (ro+7:ro+16, and the
+    # full joint velocity block written elsewhere) are otherwise left
+    # untouched -- since in_np is a persistent, reused shared-memory buffer,
+    # NOT zeroing this leaves whatever fill_controller_input's
+    # _fill_root_and_sensor_columns last wrote there during the PREVIOUS
+    # episode's final live step (i.e. the robot's real velocity at the
+    # moment it fell), carried forward verbatim into the freshly-reset
+    # episode. Confirmed empirically: root_qvel read back nonzero on every
+    # reset even with reset_joints_by_offset disabled and
+    # default_root_state's velocity components confirmed zero at
+    # construction -- this write (or lack thereof) is the actual source.
+    in_np[:, ro + 7 : ro + 16] = 0.0
+    # Joint velocities (T:2T) have the identical staleness bug: this
+    # function writes joint POSITIONS (0:T, see above) but never touched
+    # joint VELOCITIES -- _fill_joint_columns is the only other writer of
+    # T:2T, and it only runs during live steps, so this block also carried
+    # over the previous episode's real, pre-reset joint velocities through
+    # the same reused-buffer mechanism. Confirmed by the same debug trace
+    # that found the root-velocity bug: joint_qvel_maxabs was consistently
+    # 0.7-2.3 rad/s at reset, far outside the declared
+    # reset_joints_by_offset velocity_range of +-0.001 rad/s.
+    in_np[:, T : 2 * T] = 0.0
 
   def read_controller_output(
     self, out_np: np.ndarray, env_indices: list[int]

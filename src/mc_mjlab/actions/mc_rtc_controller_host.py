@@ -311,6 +311,16 @@ class ControllerHost:
     # Set when run() reports failure (the QP gives up once the robot is far
     # enough gone). Latches until the env is reset; see step_env.
     self._failed = [False] * len(self._controllers)
+    # DIAGNOSTIC (temporary): consecutive-tick counter for "QP solve did not
+    # succeed this tick" (qp_succeeded()==False), independent of controller.run()
+    # itself returning True/False -- the pathological training stall observed
+    # (worker "went unresponsive for 60s") correlates with the controller
+    # logging many repeated "MPC result is too far from stability condition" /
+    # "QP Failed" lines for the SAME env while run() keeps returning True (the
+    # solver "ignores" the failure and carries on rather than hard-failing).
+    # Remove this whole block (and its use in step_env) once the stall's root
+    # cause is found and fixed -- this is not meant to be permanent.
+    self._consecutive_qp_failures = [0] * len(self._controllers)
 
     robot = self._controllers[0].robot()
     rn = robot.name()
@@ -433,6 +443,24 @@ class ControllerHost:
         encoders = self._expand(row[0:T], self._default_encoders)
         pos = row[ro : ro + 3]
         quat = row[ro + 3 : ro + 7]
+        # DEBUG: raw root qvel/qacc as handed to us by mjlab/MuJoCo, read
+        # BEFORE any mc_rtc call -- independent of the KinematicInertial
+        # observer's own (separately known-buggy) internal velocity
+        # estimate. If this is ever meaningfully nonzero at reset, the
+        # physical simulation itself is not fully at rest when reset_envs()
+        # runs, which would explain "robot falls again on respawn" as a
+        # genuine physics/ordering issue rather than (or in addition to)
+        # the observer-estimate bug.
+        root_qvel = row[ro + 7 : ro + 13]
+        root_qacc = row[ro + 13 : ro + 16]
+        joint_qvel = row[T : 2 * T]
+        print(
+          f"[reset_envs DEBUG] env={env_id} pos={pos.tolist()} "
+          f"root_qvel={root_qvel.tolist()} root_qacc={root_qacc.tolist()} "
+          f"joint_qvel_maxabs={float(np.max(np.abs(joint_qvel))):.4f} "
+          f"joint_qvel={joint_qvel.tolist()}",
+          flush=True,
+        )
 
         if layout.use_reset and self._initialized[local]:
           # reset() takes the inverse of the MuJoCo world<-body quaternion
@@ -690,6 +718,30 @@ class ControllerHost:
     # (the last good outputs stay in the block for the substeps still to come).
     ok = controller.run()
     self._failed[local] = not ok
+
+    # DIAGNOSTIC (temporary) -- see self._consecutive_qp_failures's comment
+    # in __init__. Checked regardless of `ok`, since the pathological state
+    # this is chasing is specifically ok==True with an unhealthy solver.
+    if ismpc_walking_python is not None:
+      qp_ok = ismpc_walking_python.qp_succeeded(controller.controller())
+      if qp_ok is False:
+        self._consecutive_qp_failures[local] += 1
+      elif qp_ok is True:
+        self._consecutive_qp_failures[local] = 0
+      # qp_ok is None (wrong controller type) -> leave counter untouched.
+
+      _STUCK_THRESHOLD = 9999
+      if self._consecutive_qp_failures[local] >= _STUCK_THRESHOLD:
+        print(
+          f"[STUCK-ON-PURPOSE] worker PID {os.getpid()}, env_id {env_id} "
+          f"(local index {local}) hit {self._consecutive_qp_failures[local]} "
+          "consecutive QP failures with run()==True -- freezing this process "
+          "now for inspection. Attach with: py-spy dump --pid "
+          f"{os.getpid()}. Ctrl+C this training run's main process when done.",
+          flush=True,
+        )
+        while True:
+          time.sleep(1)
 
     mbc = controller.robot().mbc
     out_row = out_arr[env_id]

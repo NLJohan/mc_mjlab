@@ -243,6 +243,31 @@ class IsmpcSineAction(ActionTerm):
       self.num_envs, dtype=torch.bool, device=self.device
     )
 
+    # --- Reset/dispatch race guard. ---
+    # A controller step can be dispatched to a worker, then that env gets
+    # reset (episode end) BEFORE the worker's result is collected. Without
+    # this guard, apply_actions()'s next collect() would stage/apply that
+    # stale, pre-reset result into joint_pos_target/joint_vel_target right
+    # after reset() had just set them correctly to the fresh stance -- a
+    # confirmed root cause of the post-reset "hop"/huge-qacc bug (stale
+    # target vs freshly-teleported pose -> huge PD error -> huge torque),
+    # and plausibly also of the mc-rtc-side "ZMP cannot be computed"
+    # spam (mc-rtc's own internal state mid-transition when asked for its
+    # first post-reset solve).
+    #
+    # _reset_generation increments every time reset() is called for an
+    # env. _dispatch_generation records, per env, which generation was
+    # current at the moment its most recent dispatch was SENT. At collect
+    # time, only envs whose dispatch generation still matches their
+    # CURRENT reset generation get their result staged/applied; anything
+    # older is a stale, pre-reset result and is discarded instead.
+    self._reset_generation = torch.zeros(
+      self.num_envs, dtype=torch.long, device=self.device
+    )
+    self._dispatch_generation = torch.zeros(
+      self.num_envs, dtype=torch.long, device=self.device
+    )
+
     # --- Continuity bookkeeping. ---
     # Physical params actually pushed to the controller last period vs this
     # period, kept as named tensors (not just the raw 4-vector) so both the
@@ -419,18 +444,35 @@ class IsmpcSineAction(ActionTerm):
       #   flush=True,
       # )
     # --- END DEBUG ---
-
     self._io.reset_controller_input(self._in_np)
     self._pool.reset_envs(env_indices)
     self._steps_since_run[env_indices] = 0
     self._dispatch_ticks_since_sine_update[env_indices] = 0
 
     env_indices_t = torch.tensor(env_indices, device=self.device, dtype=torch.long)
+
+    # Bump these envs' reset generation FIRST, before anything else below.
+    # Any dispatch still in flight for these envs was tagged with the OLD
+    # generation at send time (see the dispatch-time write near the bottom
+    # of apply_actions()), so it will now read as stale at collect time and
+    # get discarded there instead of clobbering the fresh state we're about
+    # to write. See the constructor's comment on _reset_generation for the
+    # full rationale.
+    self._reset_generation[env_indices_t] += 1
+
     stance = self._entity.data.joint_pos[:, self._target_ids]
     self._previous_control["q"][env_indices_t] = stance[env_indices_t]
     self._next_control["q"][env_indices_t] = stance[env_indices_t]
     self._previous_control["alpha"][env_indices_t] = 0.0
     self._next_control["alpha"][env_indices_t] = 0.0
+    # self._entity.set_joint_position_target(
+    #   stance[env_indices_t], joint_ids=self._target_ids, env_ids=env_indices_t
+    # )
+    # self._entity.set_joint_velocity_target(
+    #   torch.zeros_like(stance[env_indices_t]),
+    #   joint_ids=self._target_ids,
+    #   env_ids=env_indices_t,
+    # )
     self._has_staged_control[env_indices_t] = False
     self.controller_failed[env_indices_t] = False
     self._out_np[env_indices, self._io.layout.status_off] = 0.0
@@ -463,52 +505,76 @@ class IsmpcSineAction(ActionTerm):
     if run_indices:
       env_indices = self._pool.collect()
       if env_indices is not None:
-        new_output = self._io.read_controller_output(self._out_np, env_indices)
         env_indices_t = torch.tensor(env_indices, device=self.device, dtype=torch.long)
-        for c in ("q", "alpha"):
-          self._staged_control[c][env_indices_t] = new_output[c]
-        self._has_staged_control[env_indices_t] = True
 
-        newly_failed = self._io.read_controller_failed(self._out_np, env_indices)
-        # Read alongside controller_failed: same collect() cycle, same
-        # "this reflects the dispatch that just completed" timing. Overwrite
-        # (not OR-accumulate like controller_failed) -- this is ISMPC's
-        # opinion as of the MOST RECENT solve, not a latched "ever true"
-        # flag, matching Walking_controller::ismpc_wants_stop's own
-        # per-solve-cleared semantics.
-        self._ismpc_wants_stop[env_indices_t] = self._io.read_ismpc_wants_stop(
-          self._out_np, env_indices
-        )
+        # --- Reset/dispatch race guard (see constructor comment on
+        # _reset_generation). A collected result is only valid if it was
+        # dispatched under the env's CURRENT reset generation -- i.e. no
+        # reset() has happened for that env since the dispatch was sent.
+        # Stale results (dispatched pre-reset, collected post-reset) are
+        # dropped here rather than staged: applying them would clobber the
+        # fresh joint_pos_target/joint_vel_target reset() just wrote with a
+        # q/alpha output computed from the OLD episode's state.
+        stale = self._dispatch_generation[env_indices_t] != self._reset_generation[env_indices_t]
+        if bool(stale.any()):
+          stale_env_indices = env_indices_t[stale].tolist()
+          print(
+            f"[reset_race_guard] discarding {len(stale_env_indices)} stale "
+            f"collected result(s) for envs {stale_env_indices} "
+            "(dispatched before their most recent reset)",
+            flush=True,
+          )
+        fresh_mask = ~stale
+        env_indices_t = env_indices_t[fresh_mask]
+        env_indices = env_indices_t.tolist()
+        # --- END reset/dispatch race guard ---
 
-        # --- DEBUG: pop the oldest pending dispatch id for env 0 (FIFO --
-        # collect() results arrive in the same order they were dispatched,
-        # assuming the pool preserves per-env ordering, which every other
-        # part of this action already assumes via _steps_since_run/
-        # _has_staged_control's sequencing) and print its recorded params
-        # if this collect reports a failure. This is the corrected version
-        # of the earlier debug attempt: that one read self._physical_curr
-        # AFTER collect(), which a reset() interleaved between the failing
-        # dispatch and this collect() could have already zeroed out. This
-        # version logs at dispatch time instead, immune to that. Remove
-        # once the root cause is found.
-        if 0 in env_indices:
-          local_idx = env_indices.index(0)
-          pending = self._debug_pending_dispatch_ids[0]
-          popped_id = pending.pop(0) if pending else None
-          if bool(newly_failed[local_idx]):
-            record = (
-              self._debug_dispatch_log.get(popped_id)
-              if popped_id is not None
-              else None
-            )
-            print(
-              f"[DEBUG controller_failed] env=0 CONFIRMED failure for "
-              f"dispatch_id={popped_id} record={record}",
-              flush=True,
-            )
-        # --- END DEBUG ---
+        if env_indices:
+          new_output = self._io.read_controller_output(self._out_np, env_indices)
+          for c in ("q", "alpha"):
+            self._staged_control[c][env_indices_t] = new_output[c]
+          self._has_staged_control[env_indices_t] = True
 
-        self.controller_failed[env_indices_t] |= newly_failed
+          newly_failed = self._io.read_controller_failed(self._out_np, env_indices)
+          # Read alongside controller_failed: same collect() cycle, same
+          # "this reflects the dispatch that just completed" timing. Overwrite
+          # (not OR-accumulate like controller_failed) -- this is ISMPC's
+          # opinion as of the MOST RECENT solve, not a latched "ever true"
+          # flag, matching Walking_controller::ismpc_wants_stop's own
+          # per-solve-cleared semantics.
+          self._ismpc_wants_stop[env_indices_t] = self._io.read_ismpc_wants_stop(
+            self._out_np, env_indices
+          )
+
+          # --- DEBUG: pop the oldest pending dispatch id for env 0 (FIFO --
+          # collect() results arrive in the same order they were dispatched,
+          # assuming the pool preserves per-env ordering, which every other
+          # part of this action already assumes via _steps_since_run/
+          # _has_staged_control's sequencing) and print its recorded params
+          # if this collect reports a failure. This is the corrected version
+          # of the earlier debug attempt: that one read self._physical_curr
+          # AFTER collect(), which a reset() interleaved between the failing
+          # dispatch and this collect() could have already zeroed out. This
+          # version logs at dispatch time instead, immune to that. Remove
+          # once the root cause is found.
+          if 0 in env_indices:
+            local_idx = env_indices.index(0)
+            pending = self._debug_pending_dispatch_ids[0]
+            popped_id = pending.pop(0) if pending else None
+            if bool(newly_failed[local_idx]):
+              record = (
+                self._debug_dispatch_log.get(popped_id)
+                if popped_id is not None
+                else None
+              )
+              print(
+                f"[DEBUG controller_failed] env=0 CONFIRMED failure for "
+                f"dispatch_id={popped_id} record={record}",
+                flush=True,
+              )
+          # --- END DEBUG ---
+
+          self.controller_failed[env_indices_t] |= newly_failed
 
       run_indices_t = torch.tensor(run_indices, device=self.device, dtype=torch.long)
       fresh = self._has_staged_control[run_indices_t]
@@ -632,6 +698,14 @@ class IsmpcSineAction(ActionTerm):
           del self._debug_dispatch_log[oldest]
         # print(f"[DEBUG dispatch] env=0 dispatch_id={did} {record}", flush=True) 
       # --- END DEBUG ---
+
+      # Reset/dispatch race guard (see constructor comment on
+      # _reset_generation): stamp each dispatched env with the reset
+      # generation current RIGHT NOW, at send time. If reset() bumps the
+      # generation for this env before the result is collected, the
+      # mismatch at collect time marks the result stale and it gets
+      # discarded there instead of clobbering the fresh post-reset state.
+      self._dispatch_generation[run_indices_t] = self._reset_generation[run_indices_t]
 
       self._io.fill_controller_input(self._in_np)
       self._pool.dispatch_controller_step(run_indices)

@@ -26,7 +26,7 @@ from mc_mjlab.tasks.ismpc_hybrid.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
 NUM_ENVS = 128
-PLAY_NUM_ENVS = 32
+PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 16.0
 
@@ -88,7 +88,7 @@ def _make_env_cfg(
       weight=10.0),
     # "is_walking": RewardTermCfg(
     #   func=ismpc_mdp.is_walking, 
-    #   weight=-5.0, 
+    #   weight=-9.0, 
     #   params={"action_name": "ismpc_sine"}
     # ),
     "upright": RewardTermCfg(
@@ -134,15 +134,15 @@ def _make_env_cfg(
       func=envs_mdp.reset_scene_to_default, 
       mode="reset"
     ),
-    "reset_joints": EventTermCfg(
-      func=envs_mdp.reset_joints_by_offset,
-      mode="reset",
-      params={
-        "position_range": (-0.05, 0.05),  # rad
-        "velocity_range": (-0.05, 0.05),  # rad/s
-        "asset_cfg": SceneEntityCfg("robot"),
-      },
-    ),
+    # "reset_joints": EventTermCfg(
+    #   func=envs_mdp.reset_joints_by_offset,
+    #   mode="reset",
+    #   params={
+    #     "position_range": (-0.001, 0.001),  # rad
+    #     "velocity_range": (-0.001, 0.001),  # rad/s
+    #     "asset_cfg": SceneEntityCfg("robot"),
+    #   },
+    # ),
   }
 
   # Per-episode target velocity, resampled on mjlab's own schedule (not
