@@ -134,15 +134,15 @@ def _make_env_cfg(
       func=envs_mdp.reset_scene_to_default, 
       mode="reset"
     ),
-    # "reset_joints": EventTermCfg(
-    #   func=envs_mdp.reset_joints_by_offset,
-    #   mode="reset",
-    #   params={
-    #     "position_range": (-0.001, 0.001),  # rad
-    #     "velocity_range": (-0.001, 0.001),  # rad/s
-    #     "asset_cfg": SceneEntityCfg("robot"),
-    #   },
-    # ),
+    "reset_joints": EventTermCfg(
+      func=envs_mdp.reset_joints_by_offset,
+      mode="reset",
+      params={
+        "position_range": (-0.05, 0.05),  # rad
+        "velocity_range": (-0.05, 0.05),  # rad/s
+        "asset_cfg": SceneEntityCfg("robot"),
+      },
+    ),
   }
 
   # Per-episode target velocity, resampled on mjlab's own schedule (not

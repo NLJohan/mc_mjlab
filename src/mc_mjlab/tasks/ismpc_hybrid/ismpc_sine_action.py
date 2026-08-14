@@ -465,14 +465,14 @@ class IsmpcSineAction(ActionTerm):
     self._next_control["q"][env_indices_t] = stance[env_indices_t]
     self._previous_control["alpha"][env_indices_t] = 0.0
     self._next_control["alpha"][env_indices_t] = 0.0
-    # self._entity.set_joint_position_target(
-    #   stance[env_indices_t], joint_ids=self._target_ids, env_ids=env_indices_t
-    # )
-    # self._entity.set_joint_velocity_target(
-    #   torch.zeros_like(stance[env_indices_t]),
-    #   joint_ids=self._target_ids,
-    #   env_ids=env_indices_t,
-    # )
+    self._entity.set_joint_position_target(
+      stance[env_indices_t], joint_ids=self._target_ids, env_ids=env_indices_t
+    )
+    self._entity.set_joint_velocity_target(
+      torch.zeros_like(stance[env_indices_t]),
+      joint_ids=self._target_ids,
+      env_ids=env_indices_t,
+    )
     self._has_staged_control[env_indices_t] = False
     self.controller_failed[env_indices_t] = False
     self._out_np[env_indices, self._io.layout.status_off] = 0.0
@@ -524,6 +524,7 @@ class IsmpcSineAction(ActionTerm):
             "(dispatched before their most recent reset)",
             flush=True,
           )
+          breakpoint_variable = 0
         fresh_mask = ~stale
         env_indices_t = env_indices_t[fresh_mask]
         env_indices = env_indices_t.tolist()
