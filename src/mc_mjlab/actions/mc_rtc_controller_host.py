@@ -169,6 +169,13 @@ class IoLayout:
   opinion from the most recent MPC solve (1.0 = ISMPC would have stopped),
   independent of what the policy actually commanded -- read back via the
   bridge's get_ismpc_wants_stop so the policy can observe and learn from it.
+  Followed by ``is_walking_off`` (present only when ``has_ismpc_walk_gate``,
+  same gate as ismpc_wants_stop_off since both are read back together):
+  the controller's ACTUAL current walking state
+  (``Walking_controller::Robot_Walking``, 1.0 = walking), ground truth
+  distinct from both ismpc_wants_stop_off (ISMPC's advisory opinion) and
+  ismpc_walk_off (the policy's own commanded intent) -- read back via the
+  bridge's get_is_walking.
   """
 
   num_targets: int
@@ -241,9 +248,13 @@ class IoLayout:
     return self.status_off + 1
 
   @property
+  def is_walking_off(self) -> int:
+    return self.ismpc_wants_stop_off + 1
+
+  @property
   def out_width(self) -> int:
     base = self.status_off + 1  # +1 for the existing failure-status column
-    return base + 1 if self.has_ismpc_walk_gate else base
+    return base + 2 if self.has_ismpc_walk_gate else base
 
 
 @dataclass
@@ -646,16 +657,9 @@ class ControllerHost:
         )
       off = layout.ismpc_sine_off
       com_height_offset = float(row[off])
-      amplitude_ratio = float(row[off + 1])
-      frequency = float(row[off + 2])
-      phase = float(row[off + 3])
-      # amplitude_ratio is already in (0, 1) and com_height_offset already
-      # clipped to a safe positive range on the mc_mjlab side (see the
-      # action term); deriving amplitude here as a product of the two
-      # guarantees com_height_offset - amplitude >= 0 by construction, so the
-      # CoM height trajectory ISMPC_Solver builds from these can never go
-      # negative, with no clamp needed on the C++ side.
-      #
+      frequency = float(row[off + 1])
+      sin_amp = float(row[off + 2])
+      cos_amp = float(row[off + 3])
       # Routed through the ismpc_walking_python bridge module, NOT the mc_rtc
       # datastore: the Python bindings for MCController/MCGlobalController do
       # not expose datastore() at all (confirmed empirically -- see the
@@ -666,10 +670,10 @@ class ControllerHost:
       # Walking_controller, e.g. during any task that doesn't use this
       # channel -- but has_ismpc_sine being True should only ever be paired
       # with a Walking_controller config, so a False here would indicate a
-      # config/task mismatch worth investigating, not routine behavior.
-      amplitude = amplitude_ratio * com_height_offset
+      # config/task mismatch worth investigating, not routine behavior.\
+
       ismpc_walking_python.set_com_height_sine_params(
-        controller.controller(), com_height_offset, amplitude, frequency, phase
+        controller.controller(), com_height_offset, frequency, sin_amp, cos_amp
       )
 
     if layout.has_ismpc_velocity:
@@ -729,20 +733,6 @@ class ControllerHost:
       elif qp_ok is True:
         self._consecutive_qp_failures[local] = 0
       # qp_ok is None (wrong controller type) -> leave counter untouched.
-
-      _STUCK_THRESHOLD = 9999
-      if self._consecutive_qp_failures[local] >= _STUCK_THRESHOLD:
-        print(
-          f"[STUCK-ON-PURPOSE] worker PID {os.getpid()}, env_id {env_id} "
-          f"(local index {local}) hit {self._consecutive_qp_failures[local]} "
-          "consecutive QP failures with run()==True -- freezing this process "
-          "now for inspection. Attach with: py-spy dump --pid "
-          f"{os.getpid()}. Ctrl+C this training run's main process when done.",
-          flush=True,
-        )
-        while True:
-          time.sleep(1)
-
     mbc = controller.robot().mbc
     out_row = out_arr[env_id]
     out_row[layout.status_off] = 0.0 if ok else 1.0
@@ -759,6 +749,12 @@ class ControllerHost:
       # since this is a read-only observation, not a required control input.
       wants_stop = ismpc_walking_python.get_ismpc_wants_stop(controller.controller())
       out_row[layout.ismpc_wants_stop_off] = 1.0 if wants_stop else 0.0
+      # Same timing/fallback rationale as ismpc_wants_stop_off just above --
+      # ground truth (Robot_Walking) as of the solve that just happened, 0.0
+      # ("not walking") if the bridge call itself failed (wrong controller
+      # type), since this is a read-only observation, not a required input.
+      is_walking = ismpc_walking_python.get_is_walking(controller.controller())
+      out_row[layout.is_walking_off] = 1.0 if is_walking else 0.0
 
     for c, attr in enumerate(self._output_attrs):
       values = getattr(mbc, attr)

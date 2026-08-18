@@ -39,17 +39,7 @@ if TYPE_CHECKING:
 OFFSET_MIN, OFFSET_MAX = 0.4, 1.0  # m
 FREQUENCY_MIN, FREQUENCY_MAX = 0.1, 8.0  # Hz
 
-# Shifts the amplitude-ratio sigmoid so raw_action=0 -> amplitude_ratio~=0
-# (flat reference), not sigmoid(0)=0.5 (a large, constant-amplitude
-# oscillation from the very first step). This was the actual cause of the
-# "Control Horizon reached" / NaN-in-solver crash seen with --agent zero and
-# again at the start of training: sigmoid(0)=0.5 combined with the default
-# frequency_bias=4.05 Hz produced ~0.35m swings at ~4Hz immediately, which
-# is numerically violent enough to break ISMPC's feasibility QP on the
-# first few control periods, before the policy has had any chance to learn
-# otherwise. sigmoid(-4.0) ~= 0.018, close enough to zero to be safe as a
-# default while still leaving the policy free to push it up when useful.
-AMPLITUDE_RATIO_ZERO_BIAS = -4.0
+AMPLITUDE_SCALE = 0.05  # new constant, tune this: raw~O(1) -> physical amplitude ~O(0.05)
 
 
 @dataclass(kw_only=True)
@@ -279,10 +269,9 @@ class IsmpcSineAction(ActionTerm):
     zeros = torch.zeros(self.num_envs, device=self.device)
     self._physical_prev = {
       "offset": zeros.clone(),
-      "amplitude_ratio": zeros.clone(),
-      "amplitude": zeros.clone(),
       "frequency": zeros.clone(),
-      "phase": zeros.clone(),
+      "sin_amp": zeros.clone(),
+      "cos_amp": zeros.clone(),
     }
     self._physical_curr = {k: v.clone() for k, v in self._physical_prev.items()}
     self._period_t0 = zeros.clone()
@@ -300,6 +289,14 @@ class IsmpcSineAction(ActionTerm):
       self.num_envs, dtype=torch.bool, device=self.device
     )
     self._ismpc_wants_stop = torch.zeros(
+      self.num_envs, dtype=torch.bool, device=self.device
+    )
+    # Ground truth (Walking_controller::Robot_Walking) -- distinct from both
+    # _ismpc_wants_stop (ISMPC's advisory opinion) and _walk_enabled (the
+    # policy's own commanded intent): neither of those alone reflects what
+    # actually happened. Same default/reset rationale as _ismpc_wants_stop
+    # above -- False until the first post-reset solve has actually run.
+    self._is_walking = torch.zeros(
       self.num_envs, dtype=torch.bool, device=self.device
     )
 
@@ -323,47 +320,35 @@ class IsmpcSineAction(ActionTerm):
   # ---- Raw action -> physical units. ----
 
   def _map_to_physical(self, raw: torch.Tensor) -> dict[str, torch.Tensor]:
-    """First 4 of the 5-wide raw action -> {offset, amplitude, frequency,
-    phase}, all structurally within their safe/valid ranges. The 5th
+    """First 4 of the 5-wide raw action -> {offset, frequency, alpha,
+    beta}, all structurally within their safe/valid ranges. The 5th
     (walk-gate) dimension is handled separately by _map_walk_gate."""
-    raw_offset, raw_ratio, raw_freq, raw_phase = raw[..., :4].unbind(dim=-1)
+    raw_offset, raw_frequency, raw_sin_amp, raw_cos_amp = raw[..., :4].unbind(dim=-1)
 
     offset = torch.clamp(
       self.cfg.offset_scale * raw_offset + self.cfg.offset_bias,
       min=OFFSET_MIN,
       max=OFFSET_MAX,
     )
-    # Sigmoid, shifted by AMPLITUDE_RATIO_ZERO_BIAS so raw_ratio=0 maps to
-    # amplitude_ratio near 0 (flat), not sigmoid(0)=0.5 (a large constant
-    # oscillation) -- see the module-level comment on
-    # AMPLITUDE_RATIO_ZERO_BIAS for why this matters. The sigmoid itself
-    # (rather than a raw clamp) still keeps the policy's own action
-    # distribution unconstrained (better-behaved for PPO's Gaussian) while
-    # guaranteeing amplitude_ratio in (0, 1) *by construction* -- combined
-    # with deriving amplitude = ratio * offset (not learned directly), this
-    # is what makes "the CoM height trajectory can never go negative" a
-    # structural property rather than a clamp bolted on after the fact (see
-    # the ismpc_solver_patch.md notes on this).
-    amplitude_ratio = torch.sigmoid(raw_ratio + AMPLITUDE_RATIO_ZERO_BIAS)
-    amplitude = amplitude_ratio * offset
 
     frequency = torch.clamp(
-      torch.exp(self.cfg.frequency_scale * raw_freq + self.cfg.frequency_bias),
+      torch.exp(self.cfg.frequency_scale * raw_frequency + self.cfg.frequency_bias),
       min=FREQUENCY_MIN,
       max=FREQUENCY_MAX,
     )
 
-    # Wrap to [-pi, pi] via atan2(sin, cos) rather than a raw clamp/modulo:
-    # smooth and well-defined everywhere, no discontinuous jump at the
-    # wrap boundary the way a naive `% (2*pi)` would produce.
-    phase = torch.atan2(torch.sin(raw_phase), torch.cos(raw_phase))
+    sin_amp_raw = raw_sin_amp * AMPLITUDE_SCALE
+    cos_amp_raw = raw_cos_amp * AMPLITUDE_SCALE
+    radius = torch.sqrt(sin_amp_raw * sin_amp_raw + cos_amp_raw * cos_amp_raw)
+    amplitude_ratio = offset / torch.maximum(radius, offset)
+    sin_amp = sin_amp_raw * amplitude_ratio
+    cos_amp = cos_amp_raw * amplitude_ratio
 
     return {
       "offset": offset,
-      "amplitude_ratio": amplitude_ratio,
-      "amplitude": amplitude,
       "frequency": frequency,
-      "phase": phase,
+      "sin_amp": sin_amp,
+      "cos_amp": cos_amp,
     }
 
   def _map_walk_gate(self, raw: torch.Tensor) -> torch.Tensor:
@@ -394,9 +379,9 @@ class IsmpcSineAction(ActionTerm):
     return torch.stack(
       [
         self._physical_curr["offset"],
-        self._physical_curr["amplitude_ratio"],
         self._physical_curr["frequency"],
-        self._physical_curr["phase"],
+        self._physical_curr["sin_amp"],
+        self._physical_curr["cos_amp"],
       ],
       dim=-1,
     )
@@ -416,6 +401,18 @@ class IsmpcSineAction(ActionTerm):
     Independent of what the policy actually commanded -- see
     ControllerIoBinding.read_ismpc_wants_stop for the full rationale."""
     return self._ismpc_wants_stop.to(dtype=torch.get_default_dtype()).unsqueeze(-1)
+
+  @property
+  def is_walking_obs(self) -> torch.Tensor:
+    """The controller's ACTUAL current walking state
+    (Walking_controller::Robot_Walking), as a (num_envs, 1) float
+    observation (1.0 = walking). Ground truth, distinct from both
+    ismpc_wants_stop_obs (ISMPC's advisory opinion) and last_walk_action
+    (the policy's own commanded intent) -- see
+    ControllerIoBinding.read_is_walking for the full rationale. Intended
+    for reward terms (e.g. mdp.is_walking) that need to know what actually
+    happened, not what was requested or advised."""
+    return self._is_walking.to(dtype=torch.get_default_dtype()).unsqueeze(-1)
 
   # ---- ActionTerm API. ----
 
@@ -465,13 +462,17 @@ class IsmpcSineAction(ActionTerm):
     self._next_control["q"][env_indices_t] = stance[env_indices_t]
     self._previous_control["alpha"][env_indices_t] = 0.0
     self._next_control["alpha"][env_indices_t] = 0.0
+    # Pass env_indices_t with shape [N, 1] using unsqueeze(-1) or [:, None]
     self._entity.set_joint_position_target(
-      stance[env_indices_t], joint_ids=self._target_ids, env_ids=env_indices_t
+        stance[env_indices_t],
+        joint_ids=self._target_ids,
+        env_ids=env_indices_t.unsqueeze(-1),
     )
+
     self._entity.set_joint_velocity_target(
-      torch.zeros_like(stance[env_indices_t]),
-      joint_ids=self._target_ids,
-      env_ids=env_indices_t,
+        torch.zeros_like(stance[env_indices_t]),
+        joint_ids=self._target_ids,
+        env_ids=env_indices_t.unsqueeze(-1),
     )
     self._has_staged_control[env_indices_t] = False
     self.controller_failed[env_indices_t] = False
@@ -491,9 +492,13 @@ class IsmpcSineAction(ActionTerm):
 
     # Matches Walking_controller::reset()'s own policyWantsWalk default
     # (False) -- see the constructor's comment on _walk_enabled. ISMPC has
-    # no opinion yet either (no solve has happened this episode).
+    # no opinion yet either (no solve has happened this episode), and
+    # Robot_Walking genuinely is false at this point (Walking_controller::
+    # reset() explicitly sets it false -- see this project's reset
+    # investigation), so this matches ground truth, not just a placeholder.
     self._walk_enabled[env_indices_t] = False
     self._ismpc_wants_stop[env_indices_t] = False
+    self._is_walking[env_indices_t] = False
 
   def apply_actions(self) -> None:
     substep_in_period = self._steps_since_run % self.cfg.frameskip
@@ -544,6 +549,12 @@ class IsmpcSineAction(ActionTerm):
           # flag, matching Walking_controller::ismpc_wants_stop's own
           # per-solve-cleared semantics.
           self._ismpc_wants_stop[env_indices_t] = self._io.read_ismpc_wants_stop(
+            self._out_np, env_indices
+          )
+          # Same collect() cycle, same "reflects the solve that just
+          # completed" timing as ismpc_wants_stop above -- ground truth
+          # (Robot_Walking), not an opinion or a command.
+          self._is_walking[env_indices_t] = self._io.read_is_walking(
             self._out_np, env_indices
           )
 
@@ -645,9 +656,9 @@ class IsmpcSineAction(ActionTerm):
       self._io.write_ismpc_sine_params(
         self._in_np,
         self._physical_curr["offset"],
-        self._physical_curr["amplitude_ratio"],
         self._physical_curr["frequency"],
-        self._physical_curr["phase"],
+        self._physical_curr["sin_amp"],
+        self._physical_curr["cos_amp"],
       )
 
       # Same "write current value every dispatch tick, update only on the
@@ -681,10 +692,9 @@ class IsmpcSineAction(ActionTerm):
         record = {
           "sim_t": t_now,
           "offset": float(self._physical_curr["offset"][0]),
-          "amplitude_ratio": float(self._physical_curr["amplitude_ratio"][0]),
-          "amplitude": float(self._physical_curr["amplitude"][0]),
           "frequency": float(self._physical_curr["frequency"][0]),
-          "phase": float(self._physical_curr["phase"][0]),
+          "sin_amp": float(self._physical_curr["sin_amp"][0]),
+          "cos_amp": float(self._physical_curr["cos_amp"][0]),
           "period_t0": float(self._period_t0[0]),
           "steps_since_run": int(self._steps_since_run[0]),
           "dispatch_ticks_since_sine_update": int(

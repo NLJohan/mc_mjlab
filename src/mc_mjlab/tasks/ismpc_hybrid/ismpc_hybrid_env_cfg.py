@@ -25,7 +25,7 @@ from mc_mjlab.robots.robots_registry import get_main_robot_spec, prepare_cfg_for
 from mc_mjlab.tasks.ismpc_hybrid.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 128
+NUM_ENVS = 20
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 16.0
@@ -85,15 +85,15 @@ def _make_env_cfg(
   rewards = {
     "is_alive": RewardTermCfg(
       func=ismpc_mdp.is_alive, 
-      weight=10.0),
-    # "is_walking": RewardTermCfg(
-    #   func=ismpc_mdp.is_walking, 
-    #   weight=-9.0, 
-    #   params={"action_name": "ismpc_sine"}
-    # ),
-    "upright": RewardTermCfg(
-      func=ismpc_mdp.upright_reward, 
-      weight=1.0),
+      weight=6.0),
+    "is_walking": RewardTermCfg(
+      func=ismpc_mdp.is_walking, 
+      weight=-4.0, 
+      params={"action_name": "ismpc_sine"}
+    ),
+    # "upright": RewardTermCfg(
+    #   func=ismpc_mdp.upright_reward, 
+    #   weight=1.0),
     "sine_position_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_position_continuity,
       weight=1.0,
@@ -106,7 +106,7 @@ def _make_env_cfg(
     ),
     "joint_torque": RewardTermCfg(
       func=ismpc_mdp.joint_torque_reward, 
-      weight=1.0),
+      weight=0.5),
   }
 
   terminations = {
@@ -138,7 +138,7 @@ def _make_env_cfg(
       func=envs_mdp.reset_joints_by_offset,
       mode="reset",
       params={
-        "position_range": (-0.05, 0.05),  # rad
+        "position_range": (-0.02, 0.02),  # rad
         "velocity_range": (-0.05, 0.05),  # rad/s
         "asset_cfg": SceneEntityCfg("robot"),
       },

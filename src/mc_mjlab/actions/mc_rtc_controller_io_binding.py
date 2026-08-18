@@ -333,9 +333,9 @@ class ControllerIoBinding:
     self,
     in_np: np.ndarray,
     offset: torch.Tensor,
-    amplitude_ratio: torch.Tensor,
     frequency: torch.Tensor,
-    phase: torch.Tensor,
+    sin_amp: torch.Tensor,
+    cos_amp: torch.Tensor,
   ) -> None:
     """Write the CoM-height sine reference for every env, this step.
 
@@ -356,9 +356,9 @@ class ControllerIoBinding:
     )
     off = self.layout.ismpc_sine_off
     in_np[:, off] = offset.cpu().numpy()
-    in_np[:, off + 1] = amplitude_ratio.cpu().numpy()
-    in_np[:, off + 2] = frequency.cpu().numpy()
-    in_np[:, off + 3] = phase.cpu().numpy()
+    in_np[:, off + 1] = frequency.cpu().numpy()
+    in_np[:, off + 2] = sin_amp.cpu().numpy()
+    in_np[:, off + 3] = cos_amp.cpu().numpy()
 
   def write_ismpc_velocity(
     self,
@@ -427,6 +427,33 @@ class ControllerIoBinding:
     )
     wants_stop = out_np[env_indices, self.layout.ismpc_wants_stop_off] != 0.0
     return torch.tensor(wants_stop, dtype=torch.bool, device=self._device)
+
+  def read_is_walking(
+    self, out_np: np.ndarray, env_indices: list[int]
+  ) -> torch.Tensor:
+    """Bool per env: is the controller ACTUALLY walking right now
+    (``Walking_controller::Robot_Walking``)?
+
+    Ground truth, distinct from both ``read_ismpc_wants_stop`` (ISMPC's own
+    advisory opinion) and whatever the policy last commanded via
+    ``write_ismpc_walk_gate`` (the policy's own intent) -- neither alone is
+    safe to reward against, since the policy could report "walking" without
+    the controller actually walking, or vice versa. Intended for reward
+    terms (e.g. ``is_walking`` in mdp.py) that need to know what actually
+    happened, not what was requested or advised.
+
+    Requires ``self.layout.has_ismpc_walk_gate``; callers that don't set
+    that on their action's ``IoLayout`` should never reach this method --
+    same requirement as ``read_ismpc_wants_stop``, since both columns are
+    only reserved together (see ``IoLayout``/``mc_rtc_controller_host.py``).
+    """
+    assert self.layout.has_ismpc_walk_gate, (
+      "read_is_walking called but this IoLayout was built with "
+      "has_ismpc_walk_gate=False -- the output row has no column reserved "
+      "for this value."
+    )
+    is_walking = out_np[env_indices, self.layout.is_walking_off] != 0.0
+    return torch.tensor(is_walking, dtype=torch.bool, device=self._device)
 
   def _fill_joint_columns(self, in_np: np.ndarray) -> None:
     """Write encoder/velocity/torque columns of the input block (all envs)."""

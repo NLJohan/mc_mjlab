@@ -67,9 +67,8 @@ def is_walking(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   state; this term only needs to claw back the difference when not
   walking. Placeholder magnitudes per the user, both explicitly FOO.
   """
-  # action_term = env.action_manager.get_term(action_name)
-  # return (~action_term.is_walking_obs.bool()).to(dtype=torch.get_default_dtype())
-  pass
+  action_term = env.action_manager.get_term(action_name)
+  return (~action_term.is_walking_obs.bool()).squeeze(-1).to(dtype=torch.get_default_dtype())
 
 
 def upright_reward(env: ManagerBasedRlEnv, sigma: float = 0.1) -> torch.Tensor:
@@ -93,7 +92,7 @@ def upright_reward(env: ManagerBasedRlEnv, sigma: float = 0.1) -> torch.Tensor:
   return torch.exp(-gravity_xy_sq / (2.0 * sigma**2))
 
 
-def fell_over(env: ManagerBasedRlEnv, gravity_xy_threshold: float = 0.3) -> torch.Tensor:
+def fell_over(env: ManagerBasedRlEnv, gravity_xy_threshold: float = 0.5) -> torch.Tensor:
   """True once the entity's projected gravity's horizontal component
   exceeds a threshold -- i.e. the robot has tipped over substantially.
   """
@@ -161,18 +160,18 @@ def controller_failed(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   return action_term.controller_failed
 
 
-def _sine_height_at(p: dict[str, torch.Tensor], t: torch.Tensor) -> torch.Tensor:
+def _target_height_pos(p: dict[str, torch.Tensor], t: torch.Tensor) -> torch.Tensor:
   """CoM-height reference of the sine defined by physical params p, at time t."""
   omega = 2.0 * torch.pi * p["frequency"]
-  theta = omega * t + p["phase"]
-  return p["offset"] + p["amplitude"] * torch.sin(theta)
+  phase = omega * t
+  return p["offset"] + p["sin_amp"] * torch.sin(phase) + p["cos_amp"] * torch.cos(phase)
 
 
-def _sine_height_rate_at(p: dict[str, torch.Tensor], t: torch.Tensor) -> torch.Tensor:
+def _target_height_vel(p: dict[str, torch.Tensor], t: torch.Tensor) -> torch.Tensor:
   """Time-derivative of _sine_height_at, at time t."""
   omega = 2.0 * torch.pi * p["frequency"]
-  theta = omega * t + p["phase"]
-  return p["amplitude"] * omega * torch.cos(theta)
+  phase = omega * t
+  return p["sin_amp"] * omega * torch.cos(phase) - p["cos_amp"] * omega * torch.sin(phase)
 
 
 def sine_position_continuity(
@@ -200,8 +199,8 @@ def sine_position_continuity(
   it; revisit once you can see logged jump magnitudes during training.
   """
   action_term = env.action_manager.get_term(action_name)
-  h_prev = _sine_height_at(action_term._physical_prev, action_term._period_t0)
-  h_curr = _sine_height_at(action_term._physical_curr, action_term._period_t0)
+  h_prev = _target_height_pos(action_term._physical_prev, action_term._period_t0)
+  h_curr = _target_height_pos(action_term._physical_curr, action_term._period_t0)
   return torch.exp(-(h_curr - h_prev) ** 2 / (2.0 * sigma**2))
 
 
@@ -229,8 +228,8 @@ def sine_velocity_continuity(
   -- tunable, same rationale as sine_position_continuity's sigma.
   """
   action_term = env.action_manager.get_term(action_name)
-  v_prev = _sine_height_rate_at(action_term._physical_prev, action_term._period_t0)
-  v_curr = _sine_height_rate_at(action_term._physical_curr, action_term._period_t0)
+  v_prev = _target_height_vel(action_term._physical_prev, action_term._period_t0)
+  v_curr = _target_height_vel(action_term._physical_curr, action_term._period_t0)
   return torch.exp(-(v_curr - v_prev) ** 2 / (2.0 * sigma**2))
 
 
