@@ -25,7 +25,7 @@ from mc_mjlab.robots.robots_registry import get_main_robot_spec, prepare_cfg_for
 from mc_mjlab.tasks.ismpc_hybrid.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 20
+NUM_ENVS = 300
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 16.0
@@ -88,7 +88,7 @@ def _make_env_cfg(
       weight=6.0),
     "is_walking": RewardTermCfg(
       func=ismpc_mdp.is_walking, 
-      weight=-4.0, 
+      weight=-2.0, 
       params={"action_name": "ismpc_sine"}
     ),
     # "upright": RewardTermCfg(
@@ -106,7 +106,18 @@ def _make_env_cfg(
     ),
     "joint_torque": RewardTermCfg(
       func=ismpc_mdp.joint_torque_reward, 
-      weight=0.5),
+      weight=0.5
+    ),
+    "target_linear_vel": RewardTermCfg(
+        func=ismpc_mdp.target_linear_vel,
+        weight=2.0,
+        params={"command_name": "twist", "std": 0.1},
+    ),
+    "target_angular_vel": RewardTermCfg(
+        func=ismpc_mdp.target_angular_vel,
+        weight=0.5,
+        params={"command_name": "twist", "std": 0.05},
+    ),
   }
 
   terminations = {
@@ -237,7 +248,7 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       max_grad_norm=1.0,
     ),
     experiment_name="mc_rtc_ismpc_hybrid",
-    save_interval=50,
+    save_interval=100,
     num_steps_per_env=24,
     max_iterations=max_iterations,
     logger="wandb",

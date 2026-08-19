@@ -117,7 +117,7 @@ class ControllerPool:
     num_workers: int | None = None,
     use_worker_processes: bool = True,
     console_output: Literal["none", "single", "all"] = "none",
-    timeout_s: float = 60.0,
+    timeout_s: float = 15.0,
   ):
     if console_output not in ("none", "single", "all"):
       raise ValueError(

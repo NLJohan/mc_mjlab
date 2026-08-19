@@ -444,7 +444,7 @@ class IsmpcSineAction(ActionTerm):
     self._io.reset_controller_input(self._in_np)
     self._pool.reset_envs(env_indices)
     self._steps_since_run[env_indices] = 0
-    self._dispatch_ticks_since_sine_update[env_indices] = 0
+    self._dispatch_ticks_since_sine_update[env_indices] = 1
 
     env_indices_t = torch.tensor(env_indices, device=self.device, dtype=torch.long)
 
@@ -486,8 +486,8 @@ class IsmpcSineAction(ActionTerm):
     for k in self._physical_prev:
       self._physical_prev[k][env_indices_t] = 0.0
       self._physical_curr[k][env_indices_t] = 0.0
-    self._physical_prev["offset"][env_indices_t] = OFFSET_MIN
-    self._physical_curr["offset"][env_indices_t] = OFFSET_MIN
+    self._physical_prev["offset"][env_indices_t] = (OFFSET_MIN+OFFSET_MAX)/2
+    self._physical_curr["offset"][env_indices_t] = (OFFSET_MIN+OFFSET_MAX)/2
     self._period_t0[env_indices_t] = 0.0
 
     # Matches Walking_controller::reset()'s own policyWantsWalk default

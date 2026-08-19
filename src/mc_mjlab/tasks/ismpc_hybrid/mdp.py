@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -124,6 +125,32 @@ def last_sine_params(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   action_term = env.action_manager.get_term(action_name)
   return action_term.physical_params
 
+def target_linear_vel(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    std: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward tracking of linear velocity commands (xy axes) using exponential kernel."""
+    asset = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    lin_vel_error = torch.sum(
+        torch.square(command[:, :2] - asset.data.root_link_lin_vel_b[:, :2]), dim=1
+    )
+    return torch.exp(-lin_vel_error / std**2)
+
+
+def target_angular_vel(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    std: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward tracking of angular velocity commands (yaw) using exponential kernel."""
+    asset = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    ang_vel_error = torch.square(command[:, 2] - asset.data.root_link_ang_vel_b[:, 2])
+    return torch.exp(-ang_vel_error / std**2)
 
 def last_walk_action(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   """The policy's current walk/stop decision (1.0 = walk, 0.0 = stop), as
