@@ -1,4 +1,5 @@
-MainRobot: JVRC1
+# MainRobot: JVRC1
+MainRobot: HRP5P
 Timestep: 0.002
 
 # mc_rtc's built-in posture-holding controller.
