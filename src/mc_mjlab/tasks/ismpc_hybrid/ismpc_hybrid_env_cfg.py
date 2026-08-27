@@ -25,10 +25,10 @@ from mc_mjlab.robots.robots_registry import get_main_robot_spec, prepare_cfg_for
 from mc_mjlab.tasks.ismpc_hybrid.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 300
+NUM_ENVS = 20
 PLAY_NUM_ENVS = 1
 
-EPISODE_LENGTH_S = 16.0
+EPISODE_LENGTH_S = 8.0
 
 FRAMESKIP = 2
 
@@ -149,8 +149,8 @@ def _make_env_cfg(
       func=envs_mdp.reset_joints_by_offset,
       mode="reset",
       params={
-        "position_range": (-0.02, 0.02),  # rad
-        "velocity_range": (-0.05, 0.05),  # rad/s
+        "position_range": (-0.05, 0.05),  # rad
+        "velocity_range": (-0.3, 0.3),  # rad/s
         "asset_cfg": SceneEntityCfg("robot"),
       },
     ),
@@ -249,7 +249,7 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
     ),
     experiment_name="mc_rtc_ismpc_hybrid",
     save_interval=100,
-    num_steps_per_env=24,
+    num_steps_per_env=1000,
     max_iterations=max_iterations,
     logger="wandb",
   )

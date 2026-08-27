@@ -93,7 +93,7 @@ def upright_reward(env: ManagerBasedRlEnv, sigma: float = 0.1) -> torch.Tensor:
   return torch.exp(-gravity_xy_sq / (2.0 * sigma**2))
 
 
-def fell_over(env: ManagerBasedRlEnv, gravity_xy_threshold: float = 0.5) -> torch.Tensor:
+def fell_over(env: ManagerBasedRlEnv, gravity_xy_threshold: float = 0.3) -> torch.Tensor:
   """True once the entity's projected gravity's horizontal component
   exceeds a threshold -- i.e. the robot has tipped over substantially.
   """

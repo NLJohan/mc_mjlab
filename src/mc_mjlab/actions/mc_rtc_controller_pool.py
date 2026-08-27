@@ -351,6 +351,16 @@ class ControllerPool:
       self._host.reset_envs(env_indices, self.in_np)
       return
     workers = self._worker_of[env_indices]
+    target_workers = set(int(w) for w in np.unique(workers))
+    # Drain any outstanding step reply for workers we're about to reset --
+    # otherwise reset's own _await_ok can consume the stale step reply
+    # instead of reset's, permanently desyncing this worker's pipe.
+    pending = [w for w in self._inflight_workers if w in target_workers]
+    if pending:
+      revived = self._await_ok("step", pending, revive=True)
+      for w in revived:
+        self._mark_failed(self._worker_env_ids[w])
+      self._inflight_workers = [w for w in self._inflight_workers if w not in target_workers]
     by_worker: dict[int, list[int]] = {}
     for w in np.unique(workers):
       by_worker[int(w)] = [env_indices[k] for k in np.flatnonzero(workers == w)]

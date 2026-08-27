@@ -36,10 +36,12 @@ if TYPE_CHECKING:
 
 
 # --- Physical ranges, locked in earlier in this project. ---
-OFFSET_MIN, OFFSET_MAX = 0.4, 1.0  # m
+OFFSET_MIN, OFFSET_MAX = 0.4, 1.05  # m
+offset_bias = 0.9
+
 FREQUENCY_MIN, FREQUENCY_MAX = 0.1, 8.0  # Hz
 
-AMPLITUDE_SCALE = 0.05  # new constant, tune this: raw~O(1) -> physical amplitude ~O(0.05)
+AMPLITUDE_SCALE = 0.10  # new constant, tune this: raw~O(1) -> physical amplitude ~O(0.05)
 
 
 @dataclass(kw_only=True)
@@ -98,14 +100,25 @@ class IsmpcSineActionCfg(ActionTermCfg):
 
   console_output: str = "none"
 
-  # Set to explore full OFFSET_MIN OFFSET_MAX range in natural range from 
-  # arithmetic mean
-  offset_scale: float = (OFFSET_MAX-OFFSET_MIN)/2
-  offset_bias: float = (OFFSET_MAX+OFFSET_MIN)/2
-  # Set to explore full FREQUENCY_MIN FREQUENCY_MAX in log range from 
-  # geometric mean 
+  offset_scale: float = 0.075
+  offset_bias: float = 0.9
+
   frequency_scale: float = torch.log(torch.tensor(FREQUENCY_MAX / FREQUENCY_MIN)).item() / 2
   frequency_bias: float = torch.log(torch.tensor(FREQUENCY_MIN * FREQUENCY_MAX)).item() / 2
+
+  """Scales raw_sin_amp/raw_cos_amp into physical sin_amp/cos_amp (m) before
+    the offset-based radius clamp. Combined reachable oscillation radius at
+    raw values of magnitude r (per-axis) is roughly amplitude_scale * r *
+    sqrt(2) if both axes are excited equally; tune alongside the policy's
+    action-distribution std to target a specific typical-exploration ceiling
+    rather than only the structural (offset-clamped) maximum."""
+  amplitude_scale: float = 0.10
+
+  """Shifts the walk/stop decision threshold away from 0. Positive values
+  make 'walk' more likely at policy init (raw actions near 0); negative
+  values make 'stop' more likely. Leave at 0.0 for the original unbiased
+  50/50 behavior."""
+  walk_gate_bias: float = 0.0
 
   def build(self, env: ManagerBasedRlEnv) -> "IsmpcSineAction":
     return IsmpcSineAction(self, env)
@@ -320,36 +333,36 @@ class IsmpcSineAction(ActionTerm):
   # ---- Raw action -> physical units. ----
 
   def _map_to_physical(self, raw: torch.Tensor) -> dict[str, torch.Tensor]:
-    """First 4 of the 5-wide raw action -> {offset, frequency, alpha,
-    beta}, all structurally within their safe/valid ranges. The 5th
-    (walk-gate) dimension is handled separately by _map_walk_gate."""
-    raw_offset, raw_frequency, raw_sin_amp, raw_cos_amp = raw[..., :4].unbind(dim=-1)
+      """First 4 of the 5-wide raw action -> {offset, frequency, alpha,
+      beta}, all structurally within their safe/valid ranges. The 5th
+      (walk-gate) dimension is handled separately by _map_walk_gate."""
+      raw_offset, raw_frequency, raw_sin_amp, raw_cos_amp = raw[..., :4].unbind(dim=-1)
 
-    offset = torch.clamp(
-      self.cfg.offset_scale * raw_offset + self.cfg.offset_bias,
-      min=OFFSET_MIN,
-      max=OFFSET_MAX,
-    )
+      offset = torch.clamp(
+          self.cfg.offset_scale * raw_offset + self.cfg.offset_bias,
+          min=OFFSET_MIN,
+          max=OFFSET_MAX,
+      )
 
-    frequency = torch.clamp(
-      torch.exp(self.cfg.frequency_scale * raw_frequency + self.cfg.frequency_bias),
-      min=FREQUENCY_MIN,
-      max=FREQUENCY_MAX,
-    )
+      frequency = torch.clamp(
+          torch.exp(self.cfg.frequency_scale * raw_frequency + self.cfg.frequency_bias),
+          min=FREQUENCY_MIN,
+          max=FREQUENCY_MAX,
+      )
 
-    sin_amp_raw = raw_sin_amp * AMPLITUDE_SCALE
-    cos_amp_raw = raw_cos_amp * AMPLITUDE_SCALE
-    radius = torch.sqrt(sin_amp_raw * sin_amp_raw + cos_amp_raw * cos_amp_raw)
-    amplitude_ratio = offset / torch.maximum(radius, offset)
-    sin_amp = sin_amp_raw * amplitude_ratio
-    cos_amp = cos_amp_raw * amplitude_ratio
+      sin_amp_raw = raw_sin_amp * self.cfg.amplitude_scale
+      cos_amp_raw = raw_cos_amp * self.cfg.amplitude_scale
+      radius = torch.sqrt(sin_amp_raw * sin_amp_raw + cos_amp_raw * cos_amp_raw)
+      amplitude_ratio = offset / torch.maximum(radius, offset)
+      sin_amp = sin_amp_raw * amplitude_ratio
+      cos_amp = cos_amp_raw * amplitude_ratio
 
-    return {
-      "offset": offset,
-      "frequency": frequency,
-      "sin_amp": sin_amp,
-      "cos_amp": cos_amp,
-    }
+      return {
+          "offset": offset,
+          "frequency": frequency,
+          "sin_amp": sin_amp,
+          "cos_amp": cos_amp,
+      }
 
   def _map_walk_gate(self, raw: torch.Tensor) -> torch.Tensor:
     """5th raw action -> bool walk/stop decision.
@@ -364,7 +377,7 @@ class IsmpcSineAction(ActionTerm):
     matching a standard zero-centered Gaussian policy's natural symmetry
     (no reason to bias the initial exploration toward either side).
     """
-    return raw > 0.0
+    return raw > self.cfg.walk_gate_bias
 
   # ---- Accessors for observation/reward terms. ----
 
@@ -486,8 +499,8 @@ class IsmpcSineAction(ActionTerm):
     for k in self._physical_prev:
       self._physical_prev[k][env_indices_t] = 0.0
       self._physical_curr[k][env_indices_t] = 0.0
-    self._physical_prev["offset"][env_indices_t] = (OFFSET_MIN+OFFSET_MAX)/2
-    self._physical_curr["offset"][env_indices_t] = (OFFSET_MIN+OFFSET_MAX)/2
+    self._physical_prev["offset"][env_indices_t] = self.cfg.offset_bias
+    self._physical_curr["offset"][env_indices_t] = self.cfg.offset_bias
     self._period_t0[env_indices_t] = 0.0
 
     # Matches Walking_controller::reset()'s own policyWantsWalk default
