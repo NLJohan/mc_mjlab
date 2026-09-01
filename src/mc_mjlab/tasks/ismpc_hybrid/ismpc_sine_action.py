@@ -152,16 +152,6 @@ class IsmpcSineAction(ActionTerm):
     self._raw_actions = torch.zeros(self.num_envs, 5, device=self.device)
     self._processed_actions = torch.zeros_like(self._raw_actions)
 
-    # --- DEBUG: monotonic per-env dispatch counter + a record of what was
-    # sent on each dispatch, so a failure observed later at collect() time
-    # can be matched back to the exact params that caused it, even across
-    # the async dispatch/collect gap and even if a reset happens to this
-    # env in between. Remove once the root cause is found.
-    self._debug_dispatch_id = [0] * self.num_envs
-    self._debug_dispatch_log: dict[int, dict] = {}
-    self._debug_pending_dispatch_ids: list[list[int]] = [[] for _ in range(self.num_envs)]
-    # --- END DEBUG ---
-
     # Sine-param update cadence, in units of controller-dispatch ticks (not
     # physics substeps): e.g. frameskip=2 (500Hz controller) with
     # sine_param_frequency_hz=20 means the controller dispatches every
@@ -242,6 +232,14 @@ class IsmpcSineAction(ActionTerm):
     self._steps_since_run = torch.zeros(
       self.num_envs, dtype=torch.long, device=self.device
     )
+
+    # Plain-Python mirror of the counter above, used ONLY to compute
+    # run_indices in apply_actions() without a GPU nonzero()/tolist() sync
+    # (measured at ~11s/12800 steps, the single largest .nonzero() cost in
+    # training). Must be kept in lockstep with the GPU tensor at every
+    # mutation site: the reset zeroing below and the += 1 in apply_actions.
+    self._steps_since_run_cpu = [0] * self.num_envs
+
     self.controller_failed = torch.zeros(
       self.num_envs, dtype=torch.bool, device=self.device
     )
@@ -457,6 +455,8 @@ class IsmpcSineAction(ActionTerm):
     self._io.reset_controller_input(self._in_np)
     self._pool.reset_envs(env_indices)
     self._steps_since_run[env_indices] = 0
+    for _i in env_indices:
+      self._steps_since_run_cpu[_i] = 0
     self._dispatch_ticks_since_sine_update[env_indices] = 1
 
     env_indices_t = torch.tensor(env_indices, device=self.device, dtype=torch.long)
@@ -515,8 +515,8 @@ class IsmpcSineAction(ActionTerm):
 
   def apply_actions(self) -> None:
     substep_in_period = self._steps_since_run % self.cfg.frameskip
-    run_envs = substep_in_period == 0
-    run_indices = run_envs.nonzero(as_tuple=False).squeeze(-1).tolist()
+    run_indices = [i for i, s in enumerate(self._steps_since_run_cpu) if s % self.cfg.frameskip == 0]
+
     if isinstance(run_indices, int):
       run_indices = [run_indices]
 
@@ -570,34 +570,6 @@ class IsmpcSineAction(ActionTerm):
           self._is_walking[env_indices_t] = self._io.read_is_walking(
             self._out_np, env_indices
           )
-
-          # --- DEBUG: pop the oldest pending dispatch id for env 0 (FIFO --
-          # collect() results arrive in the same order they were dispatched,
-          # assuming the pool preserves per-env ordering, which every other
-          # part of this action already assumes via _steps_since_run/
-          # _has_staged_control's sequencing) and print its recorded params
-          # if this collect reports a failure. This is the corrected version
-          # of the earlier debug attempt: that one read self._physical_curr
-          # AFTER collect(), which a reset() interleaved between the failing
-          # dispatch and this collect() could have already zeroed out. This
-          # version logs at dispatch time instead, immune to that. Remove
-          # once the root cause is found.
-          if 0 in env_indices:
-            local_idx = env_indices.index(0)
-            pending = self._debug_pending_dispatch_ids[0]
-            popped_id = pending.pop(0) if pending else None
-            if bool(newly_failed[local_idx]):
-              record = (
-                self._debug_dispatch_log.get(popped_id)
-                if popped_id is not None
-                else None
-              )
-              print(
-                f"[DEBUG controller_failed] env=0 CONFIRMED failure for "
-                f"dispatch_id={popped_id} record={record}",
-                flush=True,
-              )
-          # --- END DEBUG ---
 
           self.controller_failed[env_indices_t] |= newly_failed
 
@@ -694,35 +666,6 @@ class IsmpcSineAction(ActionTerm):
         self._in_np, twist[:, 0], twist[:, 1], twist[:, 2]
       )
 
-      # --- DEBUG: record what's actually being dispatched for env 0 this
-      # tick, tagged with a monotonic id, BEFORE dispatch -- uncontaminated
-      # by any reset that might happen to this env before we later collect
-      # the result. Remove once the root cause is found.
-      if 0 in run_indices:
-        did = self._debug_dispatch_id[0]
-        self._debug_dispatch_id[0] += 1
-        t_now = float(self._env.episode_length_buf[0]) * float(self._env.step_dt)
-        record = {
-          "sim_t": t_now,
-          "offset": float(self._physical_curr["offset"][0]),
-          "frequency": float(self._physical_curr["frequency"][0]),
-          "sin_amp": float(self._physical_curr["sin_amp"][0]),
-          "cos_amp": float(self._physical_curr["cos_amp"][0]),
-          "period_t0": float(self._period_t0[0]),
-          "steps_since_run": int(self._steps_since_run[0]),
-          "dispatch_ticks_since_sine_update": int(
-            self._dispatch_ticks_since_sine_update[0]
-          ),
-        }
-        self._debug_dispatch_log[did] = record
-        self._debug_pending_dispatch_ids[0].append(did)
-        # Bound memory: keep only the last 200 dispatch records.
-        if len(self._debug_dispatch_log) > 200:
-          oldest = min(self._debug_dispatch_log)
-          del self._debug_dispatch_log[oldest]
-        # print(f"[DEBUG dispatch] env=0 dispatch_id={did} {record}", flush=True) 
-      # --- END DEBUG ---
-
       # Reset/dispatch race guard (see constructor comment on
       # _reset_generation): stamp each dispatched env with the reset
       # generation current RIGHT NOW, at send time. If reset() bumps the
@@ -743,7 +686,8 @@ class IsmpcSineAction(ActionTerm):
       for c in ("q", "alpha")
     }
     self._steps_since_run += 1
-
+    for _i in range(self.num_envs):
+        self._steps_since_run_cpu[_i] += 1
     # No residual: mc_rtc's own q/alpha drive the joints directly, unmodified.
     self._entity.set_joint_position_target(
       interpolated_control["q"], joint_ids=self._target_ids

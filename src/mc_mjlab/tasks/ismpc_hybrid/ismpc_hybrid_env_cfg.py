@@ -25,7 +25,7 @@ from mc_mjlab.robots.robots_registry import get_main_robot_spec, prepare_cfg_for
 from mc_mjlab.tasks.ismpc_hybrid.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 20
+NUM_ENVS = 300
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 8.0
@@ -249,7 +249,7 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
     ),
     experiment_name="mc_rtc_ismpc_hybrid",
     save_interval=100,
-    num_steps_per_env=1000,
+    num_steps_per_env=256,
     max_iterations=max_iterations,
     logger="wandb",
   )

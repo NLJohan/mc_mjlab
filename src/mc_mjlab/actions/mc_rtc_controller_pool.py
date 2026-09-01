@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import multiprocessing as mp
+
 import os
 import time
 import weakref
@@ -418,12 +419,12 @@ class ControllerPool:
   def collect(self) -> list[int] | None:
     """Await the outstanding step; return its env indices, or ``None`` if idle."""
     if not self._dispatched_indices:
-      return None
+        return None
     if self._inflight_workers:
-      revived = self._await_ok("step", self._inflight_workers, revive=True)
-      self._inflight_workers = []
-      for w in revived:
-        self._mark_failed(self._worker_env_ids[w])
+        revived = self._await_ok_batched("step", self._inflight_workers, revive=True)
+        self._inflight_workers = []
+        for w in revived:
+            self._mark_failed(self._worker_env_ids[w])
     env_indices = self._dispatched_indices
     self._dispatched_indices = []
     return env_indices
@@ -471,6 +472,103 @@ class ControllerPool:
       f"mc_rtc worker {w} died (exit code {proc.exitcode}) during {what}; it "
       f"hosts envs {env_ids[0]}..{env_ids[-1]}"
     )
+
+  def _await_ok_batched(
+    self,
+    what: str,
+    workers: list[int] | None = None,
+    timeout: float | None = None,
+    revive: bool = False,
+  ) -> list[int]:
+    """Same contract as ``_await_ok``, but waits on all pending workers'
+    connections in a single multiplexed syscall per iteration instead of
+    polling each worker's connection sequentially. This matters once the
+    worker count is more than a handful: the old loop paid one blocking
+    ``conn.poll()`` per worker, per step, even when every worker's result
+    was already sitting in its pipe -- O(num_workers) syscalls per step
+    instead of O(1). See profiling notes: at 20 workers this was the
+    single largest cost in the training step.
+    """
+
+    revived: list[int] = []
+    pending = list(workers) if workers is not None else list(range(len(self._conns)))
+    effective_timeout = timeout if timeout is not None else self.timeout_s
+    deadline = (
+      None if effective_timeout is None else time.monotonic() + effective_timeout
+    )
+
+    while pending:
+      conn_to_worker = {self._conns[w]: w for w in pending}
+      remaining = None
+      if deadline is not None:
+        remaining = max(0.0, deadline - time.monotonic())
+      # Same 1.0s liveness-check cadence as the old per-worker _recv loop:
+      # wake up periodically even with no timeout budget, so a dead worker
+      # is noticed promptly rather than only at the very end of the budget.
+      wait_for = 1.0 if remaining is None else min(1.0, remaining)
+      ready = mp.connection.wait(list(conn_to_worker.keys()), timeout=wait_for)
+
+      if not ready:
+        # Nobody answered within this slice: check liveness of everyone
+        # still pending (matches _recv's per-worker "if not proc.is_alive()"
+        # check), then check the overall deadline (matches _recv's
+        # deadline check), exactly as the old sequential loop did per-worker.
+        for w in list(pending):
+          if not self._procs[w].is_alive():
+            self._fail_pending(w, what, revive, revived, pending, timed_out=False)
+        if deadline is not None and time.monotonic() >= deadline:
+          for w in list(pending):
+            self._fail_pending(
+              w, what, revive, revived, pending,
+              timed_out=True, timeout_val=effective_timeout,
+            )
+        continue
+
+      for conn in ready:
+        w = conn_to_worker[conn]
+        try:
+          tag, payload = conn.recv()
+        except (EOFError, ConnectionResetError, BrokenPipeError):
+          self._fail_pending(w, what, revive, revived, pending, timed_out=False)
+          continue
+        pending.remove(w)
+        if tag != "ok":
+          raise RuntimeError(f"mc_rtc worker {w} failed during {what}:\n{payload}")
+
+    return revived
+
+  def _fail_pending(
+    self,
+    w: int,
+    what: str,
+    revive: bool,
+    revived: list[int],
+    pending: list[int],
+    timed_out: bool,
+    timeout_val: float | None = None,
+  ) -> None:
+    """Raise or revive worker ``w``, mirroring _recv's error messages."""
+    env_ids = self._worker_env_ids[w]
+    proc = self._procs[w]
+    if timed_out:
+      exc: Exception = TimeoutError(
+        f"mc_rtc worker {w} went unresponsive for {timeout_val:.0f}s during "
+        f"{what}; it hosts envs {env_ids[0]}..{env_ids[-1]}. The controller "
+        f"is most likely wedged inside mc_rtc ({what}). Re-run with "
+        f"MC_MJLAB_WORKER_LOG_DIR=<dir> for per-worker logs with "
+        f"faulthandler enabled."
+      )
+    else:
+      exc = RuntimeError(
+        f"mc_rtc worker {w} died (exit code {proc.exitcode}) during {what}; "
+        f"it hosts envs {env_ids[0]}..{env_ids[-1]}"
+      )
+    if not revive:
+      raise exc
+    self._revive_worker(w, str(exc).split(". ")[0].splitlines()[0])
+    revived.append(w)
+    if w in pending:
+      pending.remove(w)
 
   def _await_ok(
     self,
