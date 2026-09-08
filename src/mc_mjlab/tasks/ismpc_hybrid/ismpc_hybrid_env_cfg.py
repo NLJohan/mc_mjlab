@@ -25,7 +25,7 @@ from mc_mjlab.robots.robots_registry import get_main_robot_spec, prepare_cfg_for
 from mc_mjlab.tasks.ismpc_hybrid.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 300
+NUM_ENVS = 200
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 8.0
@@ -68,6 +68,9 @@ def _make_env_cfg(
     ),
     "last_walk_action": ObservationTermCfg(
       func=ismpc_mdp.last_walk_action, params={"action_name": "ismpc_sine"}
+    ),
+    "last_step_timing_action": ObservationTermCfg(
+      func=ismpc_mdp.last_step_timing_action, params={"action_name": "ismpc_sine"}
     ),
     "ismpc_wants_stop": ObservationTermCfg(
       func=ismpc_mdp.ismpc_wants_stop, params={"action_name": "ismpc_sine"}

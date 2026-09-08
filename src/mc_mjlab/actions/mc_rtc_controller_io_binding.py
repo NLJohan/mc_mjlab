@@ -114,6 +114,7 @@ class ControllerIoBinding:
     has_ismpc_sine: bool = False,
     has_ismpc_velocity: bool = False,
     has_ismpc_walk_gate: bool = False,
+    has_ismpc_ts: bool = False,
   ):
     self._env = env
     self._entity = entity
@@ -218,6 +219,7 @@ class ControllerIoBinding:
       has_ismpc_sine=has_ismpc_sine,
       has_ismpc_velocity=has_ismpc_velocity,
       has_ismpc_walk_gate=has_ismpc_walk_gate,
+      has_ismpc_ts=has_ismpc_ts,
     )
 
     # Gather columns for a single fancy-indexed sensordata copy per step;
@@ -402,6 +404,29 @@ class ControllerIoBinding:
     )
     off = self.layout.ismpc_walk_off
     in_np[:, off] = walk_enabled.to(dtype=torch.float32).cpu().numpy()
+
+  def write_ismpc_ts(self, in_np: np.ndarray, ts: torch.Tensor) -> None:
+    """Write the RL policy's commanded step timing (Ts, s between
+    footsteps) for every env, this step.
+
+    Clamped controller-side to ``controller_config_.ts_range`` regardless
+    of what's written here -- see ``Walking_controller::ts(double)``.
+    Manual GUI control of Ts remains available and independent of this
+    channel (see ``Walking_controller::policyControlsTs``): this write
+    always lands worker-side when the layout has ``has_ismpc_ts`` set, the
+    GUI checkbox only gates whether the GUI's own NumberInput may also
+    write.
+
+    Requires ``self.layout.has_ismpc_ts``; callers that don't set that on
+    their action's ``IoLayout`` should never reach this method.
+    """
+    assert self.layout.has_ismpc_ts, (
+      "write_ismpc_ts called but this IoLayout was built with "
+      "has_ismpc_ts=False -- the input row has no column reserved for "
+      "this value."
+    )
+    off = self.layout.ismpc_ts_off
+    in_np[:, off] = ts.cpu().numpy()
 
   def read_ismpc_wants_stop(
     self, out_np: np.ndarray, env_indices: list[int]

@@ -43,18 +43,27 @@ FREQUENCY_MIN, FREQUENCY_MAX = 0.1, 8.0  # Hz
 
 AMPLITUDE_SCALE = 0.10  # new constant, tune this: raw~O(1) -> physical amplitude ~O(0.05)
 
+# Step timing (Ts, seconds between footsteps). Matches
+# Walking_controller::kDefaultTSteps (1.1) and the controller's own
+# ts_range clamp (0.4-2.0, from mc_rtc.yaml's ismpc.ts_range) -- this range
+# is a soft/exploration-shaping bound on top of that hard controller-side
+# clamp, not a replacement for it.
+TS_MIN, TS_MAX = 0.4, 2.0  # s
+TS_DEFAULT = 1.1  # s -- must match Walking_controller::kDefaultTSteps
+
 
 @dataclass(kw_only=True)
 class IsmpcSineActionCfg(ActionTermCfg):
   """Configuration for the learned ISMPC CoM-height sine parameter action.
 
   Subclasses ActionTermCfg directly, NOT BaseActionCfg: this action controls
-  no per-joint actuators at all (its action space is a fixed 4 -- offset,
-  amplitude_ratio, frequency, phase -- unrelated to joint count), so
-  BaseActionCfg's actuator_names/scale/offset machinery (sized off matched
-  joints) does not apply here. Joint actuation is still driven by mc_rtc's
-  own q/alpha output, same as the residual actions, but that's wiring
-  internal to this action, not something ActionTermCfg needs to know about.
+  no per-joint actuators at all (its action space is a fixed 6 -- offset,
+  amplitude_ratio, frequency, phase, walk-gate, step timing -- unrelated to
+  joint count), so BaseActionCfg's actuator_names/scale/offset machinery
+  (sized off matched joints) does not apply here. Joint actuation is still
+  driven by mc_rtc's own q/alpha output, same as the residual actions, but
+  that's wiring internal to this action, not something ActionTermCfg needs
+  to know about.
   """
 
   target_actuator_names: tuple[str, ...] = (".*",)
@@ -120,6 +129,18 @@ class IsmpcSineActionCfg(ActionTermCfg):
   50/50 behavior."""
   walk_gate_bias: float = 0.0
 
+  """Scales raw_ts into physical Ts (s) before the TS_MIN/TS_MAX clamp:
+  ts = clip(ts_scale * raw_ts + ts_bias, TS_MIN, TS_MAX). ts_bias = 1.1
+  centers the mapping on the controller's own default/reset value, so
+  raw_ts=0 (a freshly-initialized policy's typical early output) reproduces
+  today's fixed-Ts behavior exactly. ts_scale = 0.35 keeps raw~O(1)
+  excursions (+-1) comfortably inside the range (Ts in [0.75, 1.45]) --
+  reaching the actual TS_MIN/TS_MAX clamp edges needs |raw_ts| > ~2.6, so
+  clipping is a rare tail event early in training, not routine, matching
+  the "extreme values unlikely at first" requirement this was tuned for."""
+  ts_scale: float = 0.35
+  ts_bias: float = TS_DEFAULT
+
   def build(self, env: ManagerBasedRlEnv) -> "IsmpcSineAction":
     return IsmpcSineAction(self, env)
 
@@ -149,7 +170,7 @@ class IsmpcSineAction(ActionTerm):
       self._target_ids, device=self.device, dtype=torch.long
     )
 
-    self._raw_actions = torch.zeros(self.num_envs, 5, device=self.device)
+    self._raw_actions = torch.zeros(self.num_envs, 6, device=self.device)
     self._processed_actions = torch.zeros_like(self._raw_actions)
 
     # Sine-param update cadence, in units of controller-dispatch ticks (not
@@ -200,6 +221,7 @@ class IsmpcSineAction(ActionTerm):
       has_ismpc_sine=True,
       has_ismpc_velocity=True,
       has_ismpc_walk_gate=True,
+      has_ismpc_ts=True,
     )
     if cfg.pd_gains_path is not None:
       from mc_mjlab.actions.mc_rtc_controller_io_binding import (
@@ -299,6 +321,20 @@ class IsmpcSineAction(ActionTerm):
     self._walk_enabled = torch.zeros(
       self.num_envs, dtype=torch.bool, device=self.device
     )
+
+    # --- Step timing (Ts). ---
+    # Same "current value, updated only on the slow sine cadence, written
+    # every dispatch tick regardless" pattern as _physical_curr above --
+    # kept as its own tensor (not folded into _physical_curr/_physical_prev)
+    # since Ts isn't part of the CoM-height sine and has no continuity-
+    # penalty use, only a plain "current commanded value" need. Initialized
+    # to TS_DEFAULT so the very first dispatch tick (before any
+    # due_for_sine_update batch has run) writes the same value
+    # Walking_controller::reset() itself defaults to, rather than 0.0 --
+    # a step timing of 0 would be nonsensical even transiently.
+    self._ts_curr = torch.full(
+      (self.num_envs,), TS_DEFAULT, device=self.device
+    )
     self._ismpc_wants_stop = torch.zeros(
       self.num_envs, dtype=torch.bool, device=self.device
     )
@@ -315,7 +351,7 @@ class IsmpcSineAction(ActionTerm):
 
   @property
   def action_dim(self) -> int:
-    return 5
+    return 6
 
   @property
   def raw_action(self) -> torch.Tensor:
@@ -377,6 +413,23 @@ class IsmpcSineAction(ActionTerm):
     """
     return raw > self.cfg.walk_gate_bias
 
+  def _map_step_timing(self, raw: torch.Tensor) -> torch.Tensor:
+    """6th raw action -> physical Ts (s), linearly scaled and clamped.
+
+    Same shape as the offset mapping above: ts = clip(ts_scale * raw +
+    ts_bias, TS_MIN, TS_MAX). See IsmpcSineActionCfg.ts_scale/ts_bias's
+    docstring for how the constants were chosen (centered on
+    TS_DEFAULT=1.1, extreme values rare at raw~O(1)). The controller
+    applies its own independent ts_range clamp on top of this one (see
+    Walking_controller::ts(double)) -- this clamp only shapes exploration,
+    it is not the safety mechanism.
+    """
+    return torch.clamp(
+      self.cfg.ts_scale * raw + self.cfg.ts_bias,
+      min=TS_MIN,
+      max=TS_MAX,
+    )
+
   # ---- Accessors for observation/reward terms. ----
 
   @property
@@ -404,6 +457,13 @@ class IsmpcSineAction(ActionTerm):
     role for the sine params: lets the policy condition on its own last
     decision directly, same rationale as last_sine_params in mdp.py."""
     return self._walk_enabled.to(dtype=torch.get_default_dtype()).unsqueeze(-1)
+
+  @property
+  def last_step_timing_action(self) -> torch.Tensor:
+    """The policy's current step-timing (Ts) command, as a (num_envs, 1)
+    float observation (s) -- mirrors physical_params'/last_walk_action's
+    role: lets the policy condition on its own last decision directly."""
+    return self._ts_curr.unsqueeze(-1)
 
   @property
   def ismpc_wants_stop_obs(self) -> torch.Tensor:
@@ -502,6 +562,16 @@ class IsmpcSineAction(ActionTerm):
     self._physical_prev["offset"][env_indices_t] = self.cfg.offset_bias
     self._physical_curr["offset"][env_indices_t] = self.cfg.offset_bias
     self._period_t0[env_indices_t] = 0.0
+
+    # Matches Walking_controller::reset()'s own T_Steps default
+    # (kDefaultTSteps, see the C++ side) -- every episode is independent,
+    # so the Python-side mirror must snap back to the same default the
+    # controller itself just reset to, rather than riding on whatever the
+    # previous episode's policy (or, in manual mode, a GUI edit) last left
+    # it at until the next slow-cadence sine_update_indices_t batch
+    # overwrites it (which, per _dispatch_ticks_since_sine_update's reset
+    # to 1 just above, is not necessarily the very next dispatch tick).
+    self._ts_curr[env_indices_t] = TS_DEFAULT
 
     # Matches Walking_controller::reset()'s own policyWantsWalk default
     # (False) -- see the constructor's comment on _walk_enabled. ISMPC has
@@ -628,6 +698,14 @@ class IsmpcSineAction(ActionTerm):
           self._processed_actions[sine_update_indices_t, 4]
         )
 
+        # Step timing (Ts) updates on the SAME cadence as the sine params/
+        # walk gate above, same rationale (consistent NN inference
+        # frequency across all of this action's channels). Uses the 6th
+        # (last) raw-action dim.
+        self._ts_curr[sine_update_indices_t] = self._map_step_timing(
+          self._processed_actions[sine_update_indices_t, 5]
+        )
+
       self._dispatch_ticks_since_sine_update[run_indices_t] = (
         self._dispatch_ticks_since_sine_update[run_indices_t] + 1
       ) % self._sine_param_period_ticks
@@ -650,6 +728,9 @@ class IsmpcSineAction(ActionTerm):
       # slow clock" convention as the sine params above.
       self._io.write_ismpc_walk_gate(self._in_np, self._walk_enabled)
 
+      # Same "write current value every dispatch tick, update only on the
+      # slow clock" convention as the sine params/walk gate above.
+      self._io.write_ismpc_ts(self._in_np, self._ts_curr)
 
       # Push the per-env sampled twist command into the shared input row so
       # ismpc_walking's reference velocity actually varies per-env (see the

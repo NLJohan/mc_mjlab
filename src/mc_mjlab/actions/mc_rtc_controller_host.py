@@ -160,6 +160,22 @@ class IoLayout:
                     otherwise have wanted (see ismpc_wants_stop_off below,
                     the observation the policy can react to instead).
 
+    [ismpc_ts_off, +1)  present only when ``has_ismpc_ts``: the RL-set step
+                    timing Ts (s between footsteps), written by the action
+                    term and consumed worker-side via the
+                    ismpc_walking_python bridge's set_step_timing right
+                    before ``controller.run()``, same timing as the other
+                    ISMPC channels above. Clamped controller-side to
+                    ``controller_config_.ts_range`` regardless of what's
+                    written here (see ``Walking_controller::ts(double)``).
+                    Independent of has_ismpc_walk_gate/has_ismpc_sine/
+                    has_ismpc_velocity, appended after all three so existing
+                    layouts' widths are unaffected by this field existing.
+                    Manual GUI control of Ts remains available (see
+                    ``Walking_controller::policyControlsTs``); this channel
+                    is only consulted here when the task sets
+                    ``has_ismpc_ts=True``.
+
   Output row: one T-wide block per entry of ``output_channels``, in order --
   e.g. the default ``("q", "alpha")`` gives q in ``[0, T)`` and alpha in
   ``[T, 2T)``, for the target joints -- followed by a single status column at
@@ -207,6 +223,13 @@ class IoLayout:
   # unaffected by this field existing. See policyWantsWalk/ismpc_wants_stop
   # in Walking_controller.h for the full design rationale.
   has_ismpc_walk_gate: bool = False
+  # Whether this layout carries the RL-policy step-timing (Ts) input
+  # column. Independent of has_ismpc_sine/has_ismpc_velocity/
+  # has_ismpc_walk_gate, appended after all three so existing layouts'
+  # widths are unaffected by this field existing. See
+  # policyControlsTs/SetPolicyStepTiming in Walking_controller.h for the
+  # full design rationale (manual-vs-RL mode split).
+  has_ismpc_ts: bool = False
 
   @property
   def root_off(self) -> int:
@@ -235,9 +258,14 @@ class IoLayout:
     return base + 3 if self.has_ismpc_velocity else base
 
   @property
-  def in_width(self) -> int:
+  def ismpc_ts_off(self) -> int:
     base = self.ismpc_walk_off
     return base + 1 if self.has_ismpc_walk_gate else base
+
+  @property
+  def in_width(self) -> int:
+    base = self.ismpc_ts_off
+    return base + 1 if self.has_ismpc_ts else base
 
   @property
   def status_off(self) -> int:
@@ -558,6 +586,10 @@ class ControllerHost:
       out_arr[env_id][layout.status_off] = 1.0
       return
 
+    # DIAGNOSTIC (temporary): phase-timing start. See the matching block
+    # after run() for what this measures and why. Remove together.
+    _t_start = time.perf_counter()
+
     controller.setEncoderValues(self._expand(row[0:T], self._default_encoders))
     controller.setEncoderVelocities(self._expand(row[T : 2 * T], self._zero_base))
 
@@ -647,6 +679,13 @@ class ControllerHost:
 
     controller.setJointTorques(self._expand(row[2 * T : 3 * T], self._zero_base))
 
+    # DIAGNOSTIC (temporary): phase boundary, sensors done / bridge writes
+    # starting -- isolates the ISMPC-specific bridge calls below (absent in
+    # standalone mc_mujoco) from the sensor-setting block above (present in
+    # both), to find where the ~430us vs ~200us gap vs standalone actually
+    # lives. Remove alongside the other diagnostic blocks once resolved.
+    _t_sensors_done = time.perf_counter()
+
     if layout.has_ismpc_sine:
       if ismpc_walking_python is None:
         raise ImportError(
@@ -716,45 +755,95 @@ class ControllerHost:
       walk_enabled = float(row[layout.ismpc_walk_off]) > 0.5
       ismpc_walking_python.set_policy_wants_walk(controller.controller(), walk_enabled)
 
+    if layout.has_ismpc_ts:
+      if ismpc_walking_python is None:
+        raise ImportError(
+          "IoLayout.has_ismpc_ts is set but the ismpc_walking_python "
+          "bridge module could not be imported; build it as part of "
+          "ismpc_walking's CMake (see ismpc_walking_python/CMakeLists "
+          "entry) and ensure it's on PYTHONPATH."
+        )
+      # Same routing rationale as the other ISMPC channels above. Clamped
+      # controller-side to ts_range regardless of what's written here (see
+      # Walking_controller::ts(double)); manual GUI control of Ts remains
+      # available and independent of this write (see
+      # Walking_controller::policyControlsTs) -- this call always lands
+      # when has_ismpc_ts is set, the GUI checkbox only gates whether the
+      # GUI's OWN NumberInput is also allowed to write.
+      ts = float(row[layout.ismpc_ts_off])
+      ismpc_walking_python.set_step_timing(controller.controller(), ts)
+
     # mc_mujoco stops the whole sim when run() reports failure. A trainer
     # cannot: the QP giving up is the normal end of a fall, and it must cost
     # one episode, not the run. Latch it and let the trainer terminate the env
     # (the last good outputs stay in the block for the substeps still to come).
+
+    # DIAGNOSTIC (temporary): measure real controller.run() wall time inside
+    # the worker, split into four phases: sensor setup (present in
+    # standalone mc_mujoco too), ISMPC bridge writes (mc_mjlab-only),
+    # run() itself, and post-run readback (mc_mjlab-only). Writes directly
+    # to a per-worker file, bypassing suppress_output/console_output
+    # fd-redirection entirely. Remove once the ~430us vs ~200us gap vs
+    # standalone mc_mujoco is understood.
+    _t_bridge_write_done = time.perf_counter()
     ok = controller.run()
+    _t_run_done = time.perf_counter()
     self._failed[local] = not ok
 
-    # DIAGNOSTIC (temporary) -- see self._consecutive_qp_failures's comment
-    # in __init__. Checked regardless of `ok`, since the pathological state
-    # this is chasing is specifically ok==True with an unhealthy solver.
     if ismpc_walking_python is not None:
       qp_ok = ismpc_walking_python.qp_succeeded(controller.controller())
       if qp_ok is False:
         self._consecutive_qp_failures[local] += 1
       elif qp_ok is True:
         self._consecutive_qp_failures[local] = 0
-      # qp_ok is None (wrong controller type) -> leave counter untouched.
     mbc = controller.robot().mbc
     out_row = out_arr[env_id]
     out_row[layout.status_off] = 0.0 if ok else 1.0
 
     if layout.has_ismpc_walk_gate:
-      # Read back AFTER run(): ismpc_wants_stop reflects the MPC solve that
-      # just happened (ComputeWalkingTrajectory() runs on a separate thread,
-      # triggered from run(), and clears/re-sets this flag each solve -- see
-      # Walking_controller.h). ismpc_walking_python is guaranteed non-None
-      # here since the has_ismpc_walk_gate branch above already raised if it
-      # weren't. get_ismpc_wants_stop returns None only if the loaded
-      # controller isn't a Walking_controller (config/task mismatch, not
-      # routine) -- fall back to 0.0 (i.e. "no opinion") rather than raise,
-      # since this is a read-only observation, not a required control input.
       wants_stop = ismpc_walking_python.get_ismpc_wants_stop(controller.controller())
       out_row[layout.ismpc_wants_stop_off] = 1.0 if wants_stop else 0.0
-      # Same timing/fallback rationale as ismpc_wants_stop_off just above --
-      # ground truth (Robot_Walking) as of the solve that just happened, 0.0
-      # ("not walking") if the bridge call itself failed (wrong controller
-      # type), since this is a read-only observation, not a required input.
       is_walking = ismpc_walking_python.get_is_walking(controller.controller())
       out_row[layout.is_walking_off] = 1.0 if is_walking else 0.0
+
+    _t_readback_done = time.perf_counter()
+
+    # DIAGNOSTIC (temporary): four-phase breakdown, to find where the
+    # ~430us (mc_mjlab, single worker) vs ~200us (standalone mc_mujoco) gap
+    # actually lives. sensors: present in both mc_mujoco and mc_mjlab.
+    # bridge_write / readback: mc_mjlab-only additions (ISMPC sine/velocity/
+    # walk-gate channel). run: the QP solve itself. Remove all four
+    # diagnostic blocks in this function together once resolved.
+    _dt_sensors = _t_sensors_done - _t_start
+    _dt_bridge_write = _t_bridge_write_done - _t_sensors_done
+    _dt_run = _t_run_done - _t_bridge_write_done
+    _dt_readback = _t_readback_done - _t_run_done
+    self._diag_run_total = getattr(self, "_diag_run_total", 0.0) + _dt_run
+    self._diag_sensors_total = getattr(self, "_diag_sensors_total", 0.0) + _dt_sensors
+    self._diag_bridge_write_total = (
+      getattr(self, "_diag_bridge_write_total", 0.0) + _dt_bridge_write
+    )
+    self._diag_readback_total = (
+      getattr(self, "_diag_readback_total", 0.0) + _dt_readback
+    )
+    self._diag_run_count = getattr(self, "_diag_run_count", 0) + 1
+    if self._diag_run_count % 200 == 0:
+      n = self._diag_run_count
+      diag_dir = os.environ.get("MC_MJLAB_DIAG_DIR", "/tmp/mc_mjlab_diag")
+      try:
+        os.makedirs(diag_dir, exist_ok=True)
+        with open(
+          os.path.join(diag_dir, f"worker-{os.getpid()}.diag.log"), "a"
+        ) as f:
+          f.write(
+            f"n={n} envs_hosted={len(self._env_ids)} env={env_id} "
+            f"sensors_avg_us={self._diag_sensors_total / n * 1e6:.1f} "
+            f"bridge_write_avg_us={self._diag_bridge_write_total / n * 1e6:.1f} "
+            f"run_avg_us={self._diag_run_total / n * 1e6:.1f} "
+            f"readback_avg_us={self._diag_readback_total / n * 1e6:.1f}\n"
+          )
+      except OSError:
+        pass
 
     for c, attr in enumerate(self._output_attrs):
       values = getattr(mbc, attr)

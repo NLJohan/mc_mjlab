@@ -161,6 +161,17 @@ def last_walk_action(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   return action_term.last_walk_action
 
 
+def last_step_timing_action(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """The policy's current step-timing (Ts, seconds between footsteps)
+  command, as an observation -- mirrors last_walk_action's/
+  last_sine_params' role: lets the policy condition on its own last Ts
+  decision directly, rather than having to infer it from downstream
+  effects (gait cadence, stability error) alone.
+  """
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.last_step_timing_action
+
+
 def ismpc_wants_stop(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   """ISMPC's own advisory safety opinion from the most recent MPC solve
   (1.0 = ISMPC would have stopped walking on its own), as an observation.
