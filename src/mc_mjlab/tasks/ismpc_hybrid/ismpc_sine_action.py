@@ -466,6 +466,39 @@ class IsmpcSineAction(ActionTerm):
     return self._ts_curr.unsqueeze(-1)
 
   @property
+  def target_height_obs(self) -> torch.Tensor:
+    """Live CoM-height reference (m), evaluated NOW (not just at the last
+    period splice), as a (num_envs, 1) tensor -- the same sine function
+    sine_position_continuity's h_curr uses, but evaluated at
+    (episode_length_buf * step_dt - _period_t0) instead of only at
+    _period_t0 itself, so this tracks continuously rather than only
+    updating once per sine period.
+
+    Purely for debugging/visualization (the mdp.py plotting shim reads
+    this as a zero-weight fake reward term for the play-viewer's native
+    plot panel) -- NOT a substitute for the C++-side ground truth
+    (ismpc_walking_python.get_com_height_ref, which reads what
+    Walking_controller/ISMPC_Solver is ACTUALLY tracking). This is what
+    the Python side currently believes the reference should be; a
+    divergence between this and the C++ readback would itself be
+    informative, but that comparison isn't wired up yet -- see
+    get_com_height_ref's existing bridge function, unused by this action
+    as of this writing.
+    """
+    now = self._env.episode_length_buf.to(
+      dtype=torch.get_default_dtype()
+    ) * self._env.step_dt
+    t_in_period = now - self._period_t0
+    omega = 2.0 * torch.pi * self._physical_curr["frequency"]
+    phase = omega * t_in_period
+    h = (
+      self._physical_curr["offset"]
+      + self._physical_curr["sin_amp"] * torch.sin(phase)
+      + self._physical_curr["cos_amp"] * torch.cos(phase)
+    )
+    return h.unsqueeze(-1)
+
+  @property
   def ismpc_wants_stop_obs(self) -> torch.Tensor:
     """ISMPC's own advisory safety opinion from the most recent MPC solve,
     as a (num_envs, 1) float observation (1.0 = ISMPC would have stopped).

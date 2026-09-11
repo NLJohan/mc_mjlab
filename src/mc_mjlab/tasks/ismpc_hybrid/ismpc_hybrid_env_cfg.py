@@ -8,6 +8,7 @@ from pathlib import Path
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
+from mjlab.envs.mdp.dr import body as dr_body
 from mjlab.managers.action_manager import ActionTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
@@ -19,19 +20,69 @@ from mjlab.scene import SceneCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.terrains import TerrainEntityCfg
+from mjlab.terrains.terrain_generator import TerrainGeneratorCfg
+from mjlab.terrains.heightfield_terrains import HfRandomUniformTerrainCfg
 
 from mc_mjlab import MC_RTC_YAML_PATH
 from mc_mjlab.robots.robots_registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.tasks.ismpc_hybrid.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 200
+NUM_ENVS = 300
 PLAY_NUM_ENVS = 1
 
-EPISODE_LENGTH_S = 8.0
+EPISODE_LENGTH_S = 6.0
 
 FRAMESKIP = 2
 
+# --- Push disturbances (mjlab.envs.mdp.events.apply_body_impulse). ---
+PUSH_FORCE_TORSO_N = (-60.0, 60.0)
+PUSH_FORCE_HAND_N = (-40.0, 40.0)
+PUSH_DURATION_S = (0.1, 0.5)
+PUSH_COOLDOWN_TORSO_S = (2.0, 6.0)
+PUSH_COOLDOWN_HAND_S = (3.0, 8.0)
+
+# --- Mass/inertia domain randomization. ---
+BODY_MASS_ALPHA_RANGE = (-0.05, 0.05)
+HAND_PAYLOAD_MASS_RANGE_KG = (0.0, 3.0)
+
+# --- Uneven terrain (mjlab.terrains, HfRandomUniformTerrainCfg). ---
+ENABLE_UNEVEN_TERRAIN = False
+TERRAIN_NUM_ROWS = 1
+TERRAIN_NUM_COLS = 8
+TERRAIN_NOISE_RANGE_M = (-0.015, 0.015)
+TERRAIN_PATCH_SIZE_M = (8.0, 8.0)
+
+
+def _make_terrain_cfg() -> TerrainEntityCfg:
+  """Build the scene's TerrainEntityCfg, gated on ENABLE_UNEVEN_TERRAIN.
+
+  True -> the small-amplitude generator/heightfield terrain (see the block
+  above for the full design rationale). False -> the original flat plane,
+  byte-for-byte the same as before uneven terrain was introduced.
+  """
+  if not ENABLE_UNEVEN_TERRAIN:
+    return TerrainEntityCfg(terrain_type="plane")
+  return TerrainEntityCfg(
+    terrain_type="generator",
+    terrain_generator=TerrainGeneratorCfg(
+      curriculum=False,
+      size=TERRAIN_PATCH_SIZE_M,
+      num_rows=TERRAIN_NUM_ROWS,
+      num_cols=TERRAIN_NUM_COLS,
+      border_width=1.0,
+      sub_terrains={
+        "rough": HfRandomUniformTerrainCfg(
+          noise_range=TERRAIN_NOISE_RANGE_M,
+          noise_step=0.005,
+          downsampled_scale=0.4,
+          horizontal_scale=0.1,
+          vertical_scale=0.005,
+          scale_with_difficulty=False,
+        ),
+      },
+    ),
+  )
 
 def _make_env_cfg(
   num_envs: int = NUM_ENVS,
@@ -89,8 +140,8 @@ def _make_env_cfg(
     "is_alive": RewardTermCfg(
       func=ismpc_mdp.is_alive, 
       weight=6.0),
-    "is_walking": RewardTermCfg(
-      func=ismpc_mdp.is_walking, 
+    "not_walking_penalty": RewardTermCfg(
+      func=ismpc_mdp.not_walking_penalty, 
       weight=-2.0, 
       params={"action_name": "ismpc_sine"}
     ),
@@ -121,6 +172,22 @@ def _make_env_cfg(
         weight=0.5,
         params={"command_name": "twist", "std": 0.05},
     ),
+    # --- Plotting-only, weight=0.0
+    "debug_target_height": RewardTermCfg(
+      func=ismpc_mdp.debug_target_height,
+      weight=0.0,
+      params={"action_name": "ismpc_sine"},
+    ),
+    "debug_step_timing": RewardTermCfg(
+      func=ismpc_mdp.debug_step_timing,
+      weight=0.0,
+      params={"action_name": "ismpc_sine"},
+    ),
+    "debug_is_walking": RewardTermCfg(
+      func=ismpc_mdp.debug_is_walking,
+      weight=0.0,
+      params={"action_name": "ismpc_sine"},
+    ),
   }
 
   terminations = {
@@ -130,19 +197,10 @@ def _make_env_cfg(
       func=ismpc_mdp.controller_failed, 
       params={"action_name": "ismpc_sine"}
     ),
+    "time_out": TerminationTermCfg(func=envs_mdp.time_out, time_out=True),
   }
 
-  # Domain randomization on reset. reset_scene_to_default must run first --
-  # it establishes the default posture mc_rtc's controller expects as its
-  # baseline (same ordering constraint as residual_balance_env_cfg.py's
-  # reset_base, which offsets from what this writes); reset_joints then
-  # offsets from that default rather than replacing it.
-  #
-  # Conservative starting ranges, not tuned: small enough that the initial
-  # joint config shouldn't push any joint near its limits or destabilize
-  # ismpc_walking's contact re-establishment right after reset, large enough
-  # to give real state diversity across envs/episodes. Widen once training
-  # is confirmed stable at these values.
+  # Domain randomization on reset
   events = {
     "reset_scene_to_default": EventTermCfg(
       func=envs_mdp.reset_scene_to_default, 
@@ -157,17 +215,62 @@ def _make_env_cfg(
         "asset_cfg": SceneEntityCfg("robot"),
       },
     ),
+    "push_torso": EventTermCfg(
+      func=envs_mdp.apply_body_impulse,
+      mode="step",
+      params={
+        "asset_cfg": SceneEntityCfg("robot", body_names=["Body"]),
+        "force_range": PUSH_FORCE_TORSO_N,
+        "torque_range": (0.0, 0.0),
+        "duration_s": PUSH_DURATION_S,
+        "cooldown_s": PUSH_COOLDOWN_TORSO_S,
+      },
+    ),
+    "push_right_hand": EventTermCfg(
+      func=envs_mdp.apply_body_impulse,
+      mode="step",
+      params={
+        "asset_cfg": SceneEntityCfg("robot", body_names=["Rhand_Link0_Plan2"]),
+        "force_range": PUSH_FORCE_HAND_N,
+        "torque_range": (0.0, 0.0),
+        "duration_s": PUSH_DURATION_S,
+        "cooldown_s": PUSH_COOLDOWN_HAND_S,
+      },
+    ),
+    "push_left_hand": EventTermCfg(
+      func=envs_mdp.apply_body_impulse,
+      mode="step",
+      params={
+        "asset_cfg": SceneEntityCfg("robot", body_names=["Lhand_Link0_Plan2"]),
+        "force_range": PUSH_FORCE_HAND_N,
+        "torque_range": (0.0, 0.0),
+        "duration_s": PUSH_DURATION_S,
+        "cooldown_s": PUSH_COOLDOWN_HAND_S,
+      },
+    ),
+    "randomize_body_density": EventTermCfg(
+      func=dr_body.pseudo_inertia,
+      mode="reset",
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "alpha_range": BODY_MASS_ALPHA_RANGE,
+        "distribution": "uniform",
+      },
+    ),
+    "randomize_hand_payload": EventTermCfg(
+      func=dr_body.body_mass,
+      mode="reset",
+      params={
+        "asset_cfg": SceneEntityCfg(
+          "robot", body_names=["Rhand_Link0_Plan2", "Lhand_Link0_Plan2"]
+        ),
+        "ranges": HAND_PAYLOAD_MASS_RANGE_KG,
+        "operation": "add",
+        "distribution": "uniform",
+      },
+    ),
   }
 
-  # Per-episode target velocity, resampled on mjlab's own schedule (not
-  # ISMPC-specific yet -- nothing currently reads this command and pushes it
-  # into ismpc_walking's auto_start/reference_velocity; that needs a new
-  # bridge function + Walking_controller setter, deferred as a follow-up).
-  # init_velocity_prob left at 0.0 for now: giving the robot a literal
-  # nonzero starting root velocity in the physics sim, independent of
-  # whether ismpc_walking is actually being commanded to walk at that
-  # speed, could fight the controller's own footstep planning rather than
-  # help it -- revisit once the ISMPC-side wiring exists and the two can be
   # made consistent with each other.
   commands = {
     "twist": UniformVelocityCommandCfg(
@@ -184,7 +287,7 @@ def _make_env_cfg(
   return ManagerBasedRlEnvCfg(
     scene=SceneCfg(
       num_envs=num_envs,
-      terrain=TerrainEntityCfg(terrain_type="plane"),
+      terrain=_make_terrain_cfg(),
       entities={"robot": robot_cfg},
     ),
     observations=observations,
@@ -212,6 +315,8 @@ def _make_env_cfg(
 
 def _apply_play_overrides(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
   cfg.scene.num_envs = PLAY_NUM_ENVS
+  for name in ("debug_target_height", "debug_step_timing", "debug_is_walking"):
+    cfg.rewards[name].weight = 1.0
   return cfg
 
 
@@ -223,19 +328,22 @@ def ismpc_hybrid_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
 
 def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
-  # FOO: copied from residual_balance's PPO hyperparameters verbatim;
-  # untuned for this task's very different action space (4-dim, non-joint).
   return RslRlOnPolicyRunnerCfg(
     actor=RslRlModelCfg(
       hidden_dims=(512, 256, 128),
       activation="elu",
+      obs_normalization=True,
       distribution_cfg={
         "class_name": "GaussianDistribution",
         "init_std": 0.2,
         "std_type": "scalar",
       },
     ),
-    critic=RslRlModelCfg(hidden_dims=(512, 256, 128), activation="elu"),
+    critic=RslRlModelCfg(
+      hidden_dims=(512, 256, 128),
+      activation="elu",
+      obs_normalization=True,
+    ),
     algorithm=RslRlPpoAlgorithmCfg(
       value_loss_coef=1.0,
       use_clipped_value_loss=True,

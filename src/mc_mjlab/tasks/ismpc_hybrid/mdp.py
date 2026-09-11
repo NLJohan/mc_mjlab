@@ -32,33 +32,29 @@ def is_alive(env: ManagerBasedRlEnv) -> torch.Tensor:
   return torch.ones(env.num_envs, device=env.device)
 
 
-def is_walking(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
-  """Reward component for "is the robot actually walking right now" --
-  penalizes staying alive-but-stopped relative to alive-and-walking (see
-  the is_alive/is_walking split rationale: the policy has full authority
-  to stop walking for safety, per Walking_controller::policyWantsWalk, but
-  should pay a real (if smaller than falling) cost for choosing to, so
-  "stop and stand forever" doesn't become a dominant strategy).
+def not_walking_penalty(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """Reward component for "is the robot currently stopped" -- returns 1.0
+  when NOT walking, 0.0 when walking (note the negation: this is a penalty
+  indicator, meant to be combined with a NEGATIVE weight, not a reward
+  indicator combined with a positive one -- see the weight note below).
+  Named for what it returns (previously misleadingly named `is_walking`,
+  which returned the opposite of what that name implied).
 
-  TODO(bridge): this reads action_term.is_walking_obs, which does NOT YET
-  EXIST. It requires a new ground-truth readback of the controller's
-  ACTUAL current Robot_Walking/!Stop state (distinct from
-  ismpc_wants_stop_obs, which is only ISMPC's advisory opinion, and from
-  last_walk_action, which is only the policy's own commanded intent --
-  neither alone is safe to reward against, since the policy could report
-  "walking" without ISMPC actually walking, or vice versa). Needs, in
-  order:
-    1. Walking_controller: getter exposing Robot_Walking (or !Stop).
-    2. ismpc_walking_python bridge: new is_walking(ctl) -> bool | None,
-       mirroring get_com_height_ref/qp_succeeded's existing structure.
-    3. mc_rtc_controller_io_binding.py / mc_rtc_controller_host.py: new
-       output-row readback, alongside the existing ismpc_wants_stop one.
-    4. IsmpcSineAction: new self._is_walking buffer + is_walking_obs
-       property, populated the same way self._ismpc_wants_stop already is
-       (see ismpc_sine_action.py around read_ismpc_wants_stop).
-  Until then, this function will raise AttributeError if actually called --
-  intentionally not stubbed to return a fake value, so a broken/missing
-  bridge fails loudly instead of silently training against a placeholder.
+  Penalizes staying alive-but-stopped relative to alive-and-walking (see
+  the is_alive/not_walking_penalty split rationale: the policy has full
+  authority to stop walking for safety, per
+  Walking_controller::policyWantsWalk, but should pay a real (if smaller
+  than falling) cost for choosing to, so "stop and stand forever" doesn't
+  become a dominant strategy).
+
+  Reads action_term.is_walking_obs -- ground truth (Robot_Walking),
+  distinct from ismpc_wants_stop_obs (ISMPC's own advisory opinion) and
+  from last_walk_action (only the policy's commanded intent): neither of
+  those alone is safe to reward against, since the policy could command
+  "walking" without ISMPC actually walking, or vice versa. is_walking_obs
+  is populated via the ismpc_walking_python bridge's is_walking readback,
+  wired through mc_rtc_controller_io_binding.py/mc_rtc_controller_host.py
+  same as ismpc_wants_stop.
 
   Weights (set in ismpc_hybrid_env_cfg.py's rewards dict, not here): the
   user's stated design is alive+walking=10, alive+not-walking=5, i.e. this
@@ -308,3 +304,48 @@ def target_twist(env: ManagerBasedRlEnv, command_name: str = "twist") -> torch.T
   policy's actual job.
   """
   return env.command_manager.get_command(command_name)
+
+
+# --- Debug-only "reward" shims, weight=0.0 in ismpc_hybrid_env_cfg.py. ---
+#
+# NativeMujocoViewer's native in-viewer plot panel (mjlab/viewer/native.py,
+# toggled with the P key during `uv run play`) is wired specifically to
+# reward_manager's active terms -- there is no separate "register an
+# arbitrary scalar for plotting" hook. Rather than fork/monkeypatch that
+# viewer code (which mc_mjlab doesn't own), these three terms expose
+# exactly the signals asked for -- target CoM height, step timing (Ts),
+# and the walking/stopped flag -- AS zero-weight reward terms purely so
+# they ride the same plotting machinery for free. weight=0.0 means they
+# contribute nothing to total reward or to training in any way; they exist
+# solely to be visible in the play viewer's plot strip. Do not give these
+# a nonzero weight without renaming them out of this block and writing a
+# real docstring justifying the shaping choice -- their current docstrings
+# describe plotting, not reward design.
+
+
+def debug_target_height(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """PLOTTING ONLY (weight=0.0) -- live CoM-height reference (m), for the
+  play viewer's native plot panel. See
+  IsmpcSineAction.target_height_obs's docstring for what this is (and is
+  not) ground truth for."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.target_height_obs.squeeze(-1)
+
+
+def debug_step_timing(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """PLOTTING ONLY (weight=0.0) -- current commanded Ts (s), for the play
+  viewer's native plot panel."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.last_step_timing_action.squeeze(-1)
+
+
+def debug_is_walking(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """PLOTTING ONLY (weight=0.0) -- ground-truth walking/stopped flag (1.0 =
+  walking, 0.0 = stopped), for the play viewer's native plot panel.
+  Reads is_walking_obs (Robot_Walking ground truth from the controller),
+  NOT last_walk_action (the policy's own commanded intent) -- for a
+  debugging display you want to see what's actually happening, not just
+  what was asked for; see is_walking_obs's docstring for why the two can
+  legitimately disagree."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.is_walking_obs.squeeze(-1)
