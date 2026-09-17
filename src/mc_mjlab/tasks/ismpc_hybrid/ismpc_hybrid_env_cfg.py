@@ -24,7 +24,7 @@ from mjlab.terrains.terrain_generator import TerrainGeneratorCfg
 from mjlab.terrains.heightfield_terrains import HfRandomUniformTerrainCfg
 
 from mc_mjlab import MC_RTC_YAML_PATH
-from mc_mjlab.robots.robots_registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
+from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.tasks.ismpc_hybrid.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 

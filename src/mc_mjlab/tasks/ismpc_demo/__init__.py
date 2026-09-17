@@ -14,7 +14,7 @@ from mc_mjlab.tasks.ismpc_demo.ismpc_demo_env_cfg import (
   ismpc_demo_env_cfg,
   ismpc_demo_rl_cfg,
 )
-from mc_mjlab.utils.task_naming import get_task_name
+from mc_mjlab.tasks.naming import get_task_name
 
 TASK_DIR = Path(__file__).resolve().parent.name
 

@@ -1,13 +1,18 @@
 """RHPS1 constants and helpers."""
 
+from __future__ import annotations
+
 from pathlib import Path
 
 import mujoco
 from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
 
-from mc_mjlab.robots import mc_rtc_robot_configuration as mc_rtc
-from mc_mjlab.robots.additional_sensors_configuration import add_locomotion_sensors
-from mc_mjlab.robots.collision_configuration import (
+from mc_mjlab.robots import robot_module as mc_rtc
+from mc_mjlab.robots.actuators import (
+  get_armature_from_spec,
+  get_pd_actuator_cfgs,
+)
+from mc_mjlab.robots.collisions import (
   get_collision_presets,
   group_and_disable_collision_geoms,
   name_foot_collision_geoms,
@@ -17,14 +22,9 @@ from mc_mjlab.robots.mc_mujoco_assets import (
   MC_MUJOCO_SHARE_DIR,
   ensure_asset_symlink,
 )
-from mc_mjlab.robots.pd_actuator_configuration import (
-  get_armature_from_spec,
-  get_pd_actuator_cfgs,
-)
+from mc_mjlab.robots.sensors import add_locomotion_sensors
 
-##
 # MJCF and assets.
-##
 
 RHPS1_MC_RTC_MODULE_NAME = "RHPS1_MuJoCo"
 RHPS1_MC_RTC_ASSETS_DIR = MC_MUJOCO_SHARE_DIR / "RHPS1"
@@ -38,6 +38,7 @@ ROOT_BODY = "BODY"
 
 
 def ensure_assets() -> None:
+  """Link the MJCF, meshes and PD gains in from the mc_mujoco share."""
   ensure_asset_symlink(RHPS1_MESH_DIR, RHPS1_MC_RTC_ASSETS_DIR / "meshes")
   ensure_asset_symlink(RHPS1_XML, RHPS1_MC_RTC_ASSETS_DIR / "xml" / "RHPS1main.xml")
   ensure_asset_symlink(RHPS1_PD_GAINS_DIR, RHPS1_MC_RTC_ASSETS_DIR / "pdgains")
@@ -65,16 +66,11 @@ def get_spec() -> mujoco.MjSpec:
   return spec
 
 
-##
 # Joint tables.
-##
 
 
-# Every joint in the mc_rtc refJointOrder is actuated and receives the RL
-# residual. RHPS1main has no fingers, so this is all 30 rotary joints (the 8
-# passive slide linkages are zero-DoF in the module and excluded), matching the
-# 30 motors the MJCF declares. To leave a joint fully passive, pass it to
-# ``get_actuated_joints``'s ``non_actuated``; nothing here needs it today.
+# All refJointOrder joints are actuated; `get_actuated_joints`'s
+# `non_actuated` is how to make one passive. docs/robots.md#actuated-joint-sets
 
 
 def get_residual_joints() -> tuple[str, ...]:
@@ -85,9 +81,7 @@ def get_residual_joints() -> tuple[str, ...]:
   )
 
 
-##
 # Collision presets. See collision.get_collision_presets for the contact model.
-##
 
 RHPS1_FOOT_COLLISION_EXPR = r"^(left|right)_foot_collision$"
 
@@ -99,9 +93,7 @@ RHPS1_FOOT_COLLISION_EXPR = r"^(left|right)_foot_collision$"
 
 RHPS1_COLLISION = RHPS1_FULL_COLLISION
 
-##
 # configuration build.
-##
 
 
 def get_robot_cfg() -> EntityCfg:
@@ -121,7 +113,11 @@ def get_robot_cfg() -> EntityCfg:
   )
 
   articulation = EntityArticulationInfoCfg(
-    actuators=get_pd_actuator_cfgs(joints, get_armature_from_spec(spec, joints)),
+    actuators=get_pd_actuator_cfgs(
+      joints,
+      get_armature_from_spec(spec, joints),
+      effort_limit=mc_rtc.get_effort_limits(RHPS1_MC_RTC_MODULE_NAME),
+    ),
     soft_joint_pos_limit_factor=0.99,
   )
 

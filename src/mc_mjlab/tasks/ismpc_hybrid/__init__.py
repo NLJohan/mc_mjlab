@@ -13,7 +13,7 @@ from mc_mjlab.tasks.ismpc_hybrid.ismpc_hybrid_env_cfg import (
   ismpc_hybrid_env_cfg,
   ismpc_hybrid_ppo_cfg,
 )
-from mc_mjlab.utils.task_naming import get_task_name
+from mc_mjlab.tasks.naming import get_task_name
 
 TASK_DIR = Path(__file__).resolve().parent.name
 

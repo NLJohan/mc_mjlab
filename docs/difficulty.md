@@ -1,0 +1,571 @@
+# Difficulty
+
+How hard the residual balance task is: how hard the robot is shoved, when the
+shoving starts, and how long an episode runs. All three interact — changing one
+without the others moves the baseline survival rate, which is the number the
+task is actually calibrated against.
+
+Constants live in `src/mc_mjlab/tasks/residual_balance/residual_balance_env_cfg.py`.
+
+## finite_impulse_curriculum
+
+**Current:** training uses a finite external wrench at the root, not a velocity
+teleport. Each disturbance samples a uniform body-frame planar direction, an
+`0.08-0.20 s` duration, and a `0-0.25 m` vertical moment arm. Force is computed
+from the environment's randomized total robot mass so its time integral equals
+the requested equivalent delta velocity. The first event lands after a
+`10-12 s` warm-up, then repeats every `5-7 s`.
+
+The equivalent-delta-velocity curriculum is `[0.10, 0.25] m/s` initially,
+`[0.10, 0.40] m/s` after 48,000 environment steps, and `[0.10, 0.50] m/s` after
+96,000. `disturbance="velocity"` retains the old velocity kick only for detector
+calibration and compatibility evaluation.
+
+**Re-measure if:** mass, policy step time, force application semantics, root body,
+or controller gait changes.
+
+**History:**
+- 2026-08-24 — live verification over 16 environments x 1000 steps delivered
+  32 impulses. Equivalent-delta-velocity error was at most `7.5e-08 m/s`;
+  duration and `0.25 m` moment-arm assertions passed. The accepted detector
+  reached maximum authority `0.741`, mean duty `0.941%`, and exactly zero
+  inactive residual.
+
+## stratified_finite_impulse_curriculum
+
+**Current:** the `Position-Ankle-Matched-Impulse` task replaces the global-step
+impulse curriculum with a stationary mixture drawn once per environment reset.
+It exists because training and qualification did not share a support.
+
+**The mismatch.** `finite_impulse_curriculum` holds `[0.10, 0.25] m/s` for the
+first 48,000 policy steps. The 13-arm screen ran 188 iterations, which is 48,128
+policy steps per environment, so every arm trained essentially entirely inside
+`[0.10, 0.25]`. `PairedDisturbances` then scores `current_kick` and
+`finite_impulse` at `0.40 m/s` and `robust` at `[0.50, 0.60] m/s` — 1.6x to 2.4x
+above the training support. `promotion()` requires
+`sum(policy hazard) / sum(baseline hazard) <= 0.90` across all four scenarios.
+
+**Correction, 2026-08-27.** This section originally justified the band shares
+with baseline hazards of `9.375%` for finite impulse and `78.125%` for robust,
+described as the qualifier's own. They are not: those were measured under
+`--achievement-stage 0`, whose pushes are `0.25 m/s` and `[0.30, 0.35] m/s`. The
+qualifier's defaults are `0.40` and `[0.50, 0.60]`, and the first paired run at
+those magnitudes measured baseline hazard `0.969`, `1.000` and `1.000` for
+current-kick, finite-impulse and robust. The controller falls in essentially
+every disturbed episode there, so the hazard gate does not ask for a share of a
+robust-dominated sum — it asks the policy to survive a regime that kills mc_rtc
+every time, and `recovery_dcm_error` is averaged over recoveries that never
+complete. The distribution-mismatch argument below still holds and is stronger
+for it; the claim about where the hazard denominator sits did not.
+
+The stage-0 achievement run measured exactly that split: finite-impulse hazard
+improved from `9.375%` to `6.25%` while robust hazard worsened from `78.125%` to
+`90.625%`, for an overall ratio of `1.107`. The policy improved what it trained
+on and degraded what it did not. Advancing past stage 0 required passing a gate
+containing the robust band, so the curriculum could not reach the difficulty its
+own gate scored.
+
+**The mixture.** Bands are `QUALIFICATION_MATCHED_BANDS`, weights are
+`QUALIFICATION_MATCHED_WEIGHTS`:
+
+| Cohort | Equivalent delta velocity | Share | Covers |
+| --- | --- | ---: | --- |
+| standing | none | 20% | `nominal` gait, duty, and foot-slip gates |
+| band 0 | `[0.10, 0.25] m/s` | 25% | the historical training support |
+| band 1 | `[0.25, 0.40] m/s` | 25% | `current_kick` and `finite_impulse` at `0.40` |
+| band 2 | `[0.40, 0.60] m/s` | 30% | `robust` at `[0.50, 0.60]` |
+
+Standing keeps 20% because `nominal` carries its own promotion gates: authority
+duty at most `5%`, and `zmp_error` and `foot_slip` upper-CI regression under
+`5%`. Band 2 takes the largest share because it dominates the hazard denominator,
+but not more: a fallen robot has no recovery window to track, so flooding the
+rollout with the hardest band would starve the very `recovery_dcm_error` measure
+that the promotion gate ranks on. 45% of episodes stay at or below the
+historical distribution.
+
+**The alternates are pre-registered, not chosen after the fact.**
+`QUALIFICATION_MATCHED_MIXTURES` holds one mixture per way the promotion gate can
+reject `matched`, so the follow-up arm is a named argument rather than a fresh
+edit made while looking at a verdict:
+
+| mixture | standing | band 0 | band 1 | band 2 | run it when |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `matched` | 20% | 25% | 25% | 30% | default |
+| `gait` | 35% | 30% | 20% | 15% | the `nominal` gait or duty gates regress |
+| `hazard` | 10% | 15% | 25% | 50% | `nominal` holds but the hazard ratio does not |
+
+The rule is one-directional on purpose. A `nominal` regression means the top
+band is crowding out the no-push practice those gates measure, so standing mass
+goes up. A hazard-ratio failure with `nominal` intact means the opposite: the
+robust band still has too little weight to move a denominator it dominates.
+Writing both down before the verdict is what keeps the second arm a test rather
+than a knob turned until something passes.
+
+**Two verdicts no mixture repairs.** `nominal: authority duty exceeds 5%` is a
+detector verdict, not a difficulty one: the `nominal` scenario applies no push,
+so duty there is whatever `tasks/residual_balance/recovery_detector.json` fires
+on an undisturbed
+gait, and reweighting the training mixture cannot move it. The repair is
+recalibration, and `recovery_authority_coverage` is the reading that says whether
+the same calibration has also lost recall where it matters. The seed's `gate_mean`
+of `0.066` is measured under pushes and is not that number.
+
+Likewise a *simultaneous* `nominal` and hazard failure falsifies the mixture
+hypothesis rather than selecting between its alternates: no reweighting buys both
+at once, and the next variable is residual authority or the detector, not the
+band shares.
+
+**Why stationary rather than a curriculum.** The 500-iteration budget run took
+its best 60-iteration ZMP and recovery windows at iterations 175 and 178,
+immediately before the stage boundary at 188, then degraded and produced NaNs at
+488. Non-stationary difficulty is implicated in that decay, and any schedule that
+reaches the robust band at 96,000 steps never arrives inside a screen budget.
+Sampling the mixture at reset rather than per step keeps an episode's difficulty
+fixed while it runs, so a recovery window is not scored across a difficulty
+change.
+
+**How to read it.** The `impulse_speed` metric reports the equivalent delta
+velocity of each environment's last impulse. Against the ankle screen arm it must
+rise; if it does not, the mixture is not reaching the sampler. Measured
+2026-08-27 over paired two-iteration smokes at 8 environments, 6 workers, and
+identical settings:
+
+| diagnostic | ankle control | matched impulse | change |
+| --- | ---: | ---: | ---: |
+| `impulse_speed` | 0.1025 | 0.3564 | 3.5x |
+| `gate_mean` | 0.0092 | 0.1632 | 17.7x |
+| mean episode length | 259.0 | 228.5 | -11.8% |
+
+The mixture reaches the sampler. The authority duty is the load-bearing number:
+the policy previously acted on `0.9%` of these steps, and inactive steps carry no
+action gradient at all, so the objective had almost nothing to optimize. Episode
+length falling only 11.8% says the `30%` top-band share is not collapsing
+episodes, which was the main risk in choosing it.
+
+Both `dcm_error` (0.0334 to 0.0776) and `recovery_dcm_error` (0.0175 to 0.0590)
+rise, as they must: harder pushes produce larger excursions. That is why nothing
+here is evidence of policy quality. The hypothesis is falsified if
+robust-scenario hazard does not improve relative to the ankle control, and it is
+only supported by paired qualification against the controller baseline, never by
+these curves.
+
+**Re-measure if:** `PairedDisturbances` magnitudes, the promotion hazard gate,
+episode length, reset rate, or the baseline failure boundary changes.
+
+**History:**
+- 2026-08-27 — created after the stage-0 achievement run showed in-distribution
+  improvement and out-of-distribution degradation on the same checkpoint.
+
+## episode_length_impulse_curriculum
+
+**Current:** an optional ladder that moves a `stratified_finite_impulse_curriculum`
+between mixtures on smoothed terminal episode length. It is wired into no
+registered task; it exists so difficulty can advance without a human in the loop.
+
+**Why episode length is the right variable**, measured on the 188-iteration
+matched-impulse seed against a 4,500-step cap (`episode_length_s = 90`):
+
+| | |
+| --- | ---: |
+| mean by sixths | 1807, 2970, 3073, 3049, 2806, 2849 |
+| last-60 mean | 2815, or `0.626` of the cap |
+| per-iteration standard deviation, last 60 | 147, `5.2%` relative |
+| hazard union over ~128 episodes | `0.542`, `8.1%` relative |
+
+The learning rise is `+1266` steps against a `147` noise floor, it never
+approaches the cap, and it is a *graded* signal where the fall rate is a
+Bernoulli one — 5.2% relative noise against 8.1%. Length carries more per
+iteration than survival does.
+
+**Mechanics.** `curriculum_manager.compute(env_ids=...)` is the first call in
+mjlab's `_reset_idx`, and `episode_length_buf` is zeroed at its end, so the term
+reads the true terminal lengths of exactly the envs that just finished. It
+smooths their mean as a fraction of `max_episode_length`, advances a rung at
+`0.65`, drops one below `0.45`, and restarts the smoothing after either — the
+old rung's survival is not evidence about the new one. The deadband is what
+stops a mixture change from immediately undoing itself.
+
+**The standing cohort makes the ladder self-tightening.** A no-push episode
+always reaches the cap, so the smoothed fraction is
+`standing_share + (1 - standing_share) * pushed_fraction`. A fixed `0.65`
+threshold therefore demands progressively more of the cohort that is actually
+pushed:
+
+| rung | standing share | pushed survival needed |
+| --- | ---: | ---: |
+| `gait` | 35% | 0.462 |
+| `matched` | 20% | 0.563 |
+| `hazard` | 10% | 0.611 |
+
+That is the useful direction, and it falls out of the mixture rather than being
+tuned in.
+
+**This advances difficulty; it does not promote a policy.** The signal is
+self-referential — the same rollouts that train the policy declare it ready — so
+it can never be evidence that the residual beat mc_rtc. Paired qualification
+remains the only thing that says that. The split is deliberate:
+[leo-mjlab-review.md](leo-mjlab-review.md) tranche 5 applied promotion-grade
+held-out evidence to what is really a training knob, and the cost was that the
+knob never moved — the real achievement run sat at stage 0 for 500 iterations,
+and its `model_180` finished after the trainer exited and was never consumed.
+Advancing difficulty is cheap, reversible and self-correcting; promoting a policy
+is an evidence claim. They should not share a gate.
+
+**Re-measure if:** `episode_length_s`, the band mixtures, the standing share, or
+the termination set changes — every threshold here is a fraction of the cap and a
+function of the standing share.
+
+**History:**
+- 2026-08-27 — added after the matched-impulse seed showed episode length rising
+  8.6x its own noise floor without approaching the cap.
+
+## MC_MJLAB_PUSH_DEBUG
+
+**Current:** unset. Set it to a positive float during `play` to make impulses
+visible: it scales the sampled equivalent delta velocity by that factor, caps the
+warm-up at `1 s`, and prints one `[push]` line per triggered environment with the
+magnitude and heading.
+
+```sh
+MC_MJLAB_PUSH_DEBUG=3 uv run play <task> --checkpoint <model.pt>
+```
+
+**Why it has to be an environment variable.** `play` exposes no `--env.*`
+overrides, only `train` does, so the push parameters are unreachable from the
+command line. And a finite impulse enters through
+`write_external_wrench_to_sim`, which draws nothing — the viewer's `debug_vis`
+arrow is the *velocity command*, not the push. Without this the only evidence a
+push happened is the robot's own stagger, which at the default
+`[0.10, 0.25] m/s` band over `0.08-0.20 s` is easy to miss entirely, and which
+never occurs in the first `10 s` of an episode.
+
+**It is a viewing aid, never a measurement.** Scaling the band changes the
+disturbance distribution, so nothing observed under it is comparable to a
+training curve or a qualification. Leave it unset for anything that produces a
+number.
+
+**Re-measure if:** the impulse implementation stops going through the external
+wrench, or the viewer gains a force visualization.
+
+**History:**
+- 2026-08-28 — added after the shipped `play` gave no way to see a perturbation.
+
+## Retired: the curriculum_diagnostics tasks
+
+**Retired:** 2026-09-16 — both tasks and `scripts/run_curriculum_diagnostics.py`
+were deleted with the archived registrations. The measurements are kept.
+
+**Was:** Two additive ankle-authority tasks isolate the difficulty change
+that coincides with the long run's early optimum. `Curriculum-Frozen` keeps the
+impulse range at `[0.10, 0.25] m/s`. `Curriculum-Gradual` holds that range through
+48,000 policy steps, then linearly raises its upper bound to `0.40 m/s` at 80,000
+and `0.50 m/s` at 112,000. Both keep the torque-margin weight at `-0.05`, so the
+diagnostic changes only impulse difficulty.
+
+`scripts/run_curriculum_diagnostics.py` ran two 2-iteration, 8-environment smoke
+tests before two 220-iteration, 128-environment diagnostics. Smoke tests use
+TensorBoard; diagnostics use W&B by default. Every run enables mjlab's NaN guard,
+saves locally every 20 iterations, and records resumable state under
+`logs/curriculum_diagnostics/`.
+
+The 220-iteration budget reaches 56,320 policy steps. The gradual arm therefore
+ends with a `0.289 m/s` upper bound: enough to cross the old 48,000-step boundary
+without introducing the old instantaneous `0.25 -> 0.40 m/s` jump. This is a
+mechanism diagnostic, not a promotion run. Compare pre-boundary and late-window
+ZMP/recovery metrics, then apply paired deterministic qualification to any
+shortlisted checkpoint.
+
+**Re-measure if:** the rollout length, policy-step budget, disturbance stages,
+authority set, or torque-margin schedule changes.
+
+**History:**
+- 2026-08-26 — prepared the frozen-versus-gradual experiment after the 500-iteration
+  budget run reached its best 60-iteration ZMP and recovery windows at iterations
+  175 and 178, just before the old stage boundary at iteration 188, then degraded
+  and produced NaNs at iteration 488.
+
+## achievement_finite_impulse_curriculum
+
+**Current:** the separately registered
+`Position-Ankle-Curriculum-Achievement` task is the main-capable curriculum. Its
+stage is independent of `common_step_counter`; only a held-out report accepted
+by `AchievementCurriculumBridge` changes it. The physical stages are equivalent
+body-frame delta-velocity ranges `[0.10, 0.25]`, `[0.10, 0.40]`, and
+`[0.10, 0.50] m/s`. Push direction, interval, duration, point of application,
+residual authority, observations, randomization, and the `-0.05` torque-margin
+weight stay fixed, so one physical challenge changes.
+
+The reset-time mixtures list standing first, followed by physical stages zero
+through two:
+
+| Active stage | Standing | Stage 0 | Stage 1 | Stage 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 25% | 75% | 0% | 0% |
+| 1 | 15% | 25% | 60% | 0% |
+| 2 | 15% | 15% | 20% | 50% |
+
+Existing episodes keep their sampled level when a report arrives; the new
+mixture enters as environments reset. This prevents an all-environment step
+change and retains both no-push balance and previously qualified recovery.
+
+**Re-measure if:** stage-zero feasibility, the baseline failure boundary,
+episode reset rate, push implementation, residual authority, or qualification
+variance changes.
+
+**History:**
+
+- 2026-08-26 — tranche 5 added reset-cohort rehearsal and held-out stage state;
+  the frozen and gradual tasks remain step-schedule diagnostics.
+
+## AchievementCurriculumBridge
+
+**Current:** the runner watches `<run>/curriculum/qualification.json` at PPO
+iteration boundaries. A valid report must describe exactly one checkpoint from
+the active run, match the requested stage contract, contain nominal,
+current-kick, finite-impulse, and robust scenarios, and use at least two unique
+seeds. Two distinct eligible reports qualify the stage. Three distinct
+ineligible reports demote one stage, including from a previously mastered final
+stage. A stage/checkpoint/seed identity hash prevents the same evidence from
+counting twice even if JSON formatting or reported metrics change.
+
+Stage qualification copies the evaluated checkpoint to
+`qualified_stage_<stage>_model_<iteration>.pt`. Rollback changes future training
+cohorts but deliberately does not rewind the live policy or optimizer; use the
+preserved checkpoint for an explicit policy rewind. `state.json`,
+`qualification_request.json`, and append-only `events.jsonl` expose the live
+protocol. Every subsequent model checkpoint embeds the stage, pass/regression
+streaks, processed-evidence hashes, mastery state, last-good path, and one
+qualified-checkpoint path per stage. Full resume restores those values exactly;
+actor-only evaluation does not change them. A report absent from the restored
+checkpoint's processed hashes is replayed after a same-directory resume, so an
+iteration-boundary decision is not silently discarded before the next save.
+
+Held-out stage pushes use `0.25`, `0.40`, and `0.50 m/s` for current-kick and
+finite-impulse scenarios. Their robust guards use `[0.30, 0.35]`,
+`[0.45, 0.50]`, and `[0.55, 0.60] m/s`, respectively, with the existing stage-one
+physics randomization. Promotion still uses the unchanged safety, nominal,
+recovery, and hazard gates in `qualify_checkpoints.py`.
+
+### Driving the loop
+
+The run publishes the stage it wants evidence for under
+`<run>/curriculum/qualification_request.json`; read it back to the qualifier
+rather than passing a stage by hand:
+
+```sh
+run_dir=/absolute/path/to/the/run
+checkpoint="$run_dir/model_100.pt"
+stage=$(jq -r .stage "$run_dir/curriculum/qualification_request.json")
+uv run python scripts/qualify_checkpoints.py "$checkpoint" \
+  --achievement-stage "$stage" --out-dir "$run_dir/curriculum"
+```
+
+Achievement mode defaults to seeds 42 and 43, all four qualification scenarios,
+and ankle authority. A second distinct passing report advances the stage; three
+valid failing reports roll it back. Use a later checkpoint or different seeds
+when replacing the report. The exact stage-passing checkpoint is retained under
+`<run>/curriculum/`, and the complete hysteresis state is embedded in subsequent
+training checkpoints.
+
+**Re-measure if:** the promotion gates, paired-sample variance, required seed
+count, stage magnitudes, or checkpoint cadence changes.
+
+**History:**
+
+- 2026-08-26 — schema 1 established two-pass advancement, three-regression
+  rollback, stage-contract hashing, last-good preservation, and checkpointed
+  resume continuity.
+
+## randomization_stage
+
+**Current:** stage zero is the standard task. Archived `Position-Robust1` samples
+friction `+-10%`, active PD gains `+-5%`, and motor strength `+-5%`. Actor
+observations sample `0-1` policy-step delay, while
+actuator commands sample `0-1` mc_rtc controller-period delay (`0-2` physics
+substeps). Archived `Position-Robust2` doubled every range and permitted two delay
+steps; stage two and both archived ids were removed on 2026-09-16, leaving stage
+one for the active qualifier's `robust` scenario and its calibration tools.
+Randomization is static
+per environment construction; ordinary training does not enable it before the
+standard-task promotion gate is met.
+
+Mass/inertia and COM are intentionally excluded. Expanding either family for
+per-world randomization and recomputing MuJoCo constants changed HRP5P's walking
+dynamics even when every requested perturbation was exactly zero.
+
+**Re-measure if:** mjlab's per-world inertial-field expansion, observation delay,
+actuator delay, or effort-limit implementations change.
+
+**History:**
+- 2026-08-25 — excluded mass/inertia and COM after component ablation isolated a
+  pre-push failure. Nominal and every other component survived 8/8 for 12 s;
+  pseudo-inertia, direct mass/inertia scaling, and COM offset each survived only
+  1/8. The latter two still failed with their perturbations set exactly to zero,
+  locating the incompatibility in field expansion/recomputation rather than the
+  requested ranges. After removing those fields, the combined stage-one profile
+  and its nominal control each survived 16/16 for 12 s with no worker failure.
+- 2026-08-24 — added as explicit task variants so robustness is a gated stage,
+  not a silent change to the standard task.
+- 2026-08-24 — a live smoke test rejected interpreting controller delay as a
+  full 20 ms policy step: the cohort repeatedly reset before its first impulse.
+  Controller delay now uses the coupling's actual 2 ms period.
+- 2026-08-24 — mjlab's generic PD-gain randomizer was also rejected because it
+  scaled the armature-derived construction defaults, silently replacing the
+  reference `PDgains_sim.dat` values. Scaling the active gains instead passed a
+  stage-one live run over 4 environments x 1000 steps: 8 impulses, maximum
+  authority `0.516`, duty `0.722%`, exact inactive zeroing, and impulse error
+  `5.2e-08 m/s`.
+
+## map_com_stability
+
+**Current:** `scripts/map_com_stability.py` changes the compiled simulator model
+while leaving mc_rtc's robot model nominal. It moves the root torso's inertial
+position enough to produce the requested initial whole-robot COM offset, then
+runs zero-residual, push-free walking. This bypasses the invalid per-world
+inertial-field expansion path.
+
+A seed-42 screen used 4 environments per point and a 12 s horizon. Every point
+had zero worker failures. The transition intervals are:
+
+| initial COM offset | last 4/4 survival | partial survival | first 0/4 survival |
+| --- | ---: | ---: | ---: |
+| backward x | -55 mm | none sampled | -60 mm |
+| forward x | +80 mm | +85 mm: 2/4; +90 mm: 1/4 | +95 mm |
+| negative y | -45 mm | -50 mm: 3/4; -55 mm: 1/4 | -60 mm |
+| positive y | +50 mm | none sampled | +55 mm |
+| vertical z | -100 to +100 mm | none | not reached |
+
+The intended `+-5 mm` COM range is therefore well inside this short-horizon
+envelope. These are aggregate initial offsets produced through the torso, not
+independent per-link errors, and the extreme torso shifts are diagnostic rather
+than plausible morphology. Run with a longer horizon and more seeds before
+treating a boundary as a controller guarantee.
+
+**Re-measure if:** the robot model, walking controller, installed gait, encoder
+bias, horizon, or method used to distribute COM error changes.
+
+**History:**
+- 2026-08-25 — added the compiled-model sweep after runtime COM randomization
+  falsely made 7/8 nominal-value environments fall. Genuine compiled COM error
+  remained stable across at least `+-40 mm` on every axis.
+
+## push_velocity
+
+**Current:** `0.4` — the task's difficulty dial. Both directions ruin training:
+too gentle and mc_rtc never falls, so the best residual is no residual; too hard
+and the robot falls whatever the residual does, which plateaus the policy at a
+fraction of an episode. 0.4 is deliberately past the point where the baseline
+copes, so that the residual's contribution shows up as survival rather than
+being hidden inside a controller that would have coped anyway.
+
+It lives in the module rather than as a CLI flag because it sits inside an event
+term's `velocity_range` dict, which tyro does not flatten.
+
+**Re-measure if:** the sampling changes, or the walk window moves.
+
+The number to watch is the baseline's survival rate, not the push magnitude. The
+ceiling is where the robot falls whatever the residual does.
+
+**Verified 2026-08-14 at the current symmetric sampling: 0.4 is right.** Baseline
+survival 20.8% [11.7%, 34.3%] over 48 trimmed episodes (74 completed, 24 envs x
+8 min), against the ~22% `WALK_WINDOW_S` was sized for. Post-warm-up hazard
+0.0212/s against the 0.019/s predicted; mean episode 48.3 s, median 42.5 s.
+
+There had been reason to doubt it: 0.4 was calibrated during the 2026-07-31 runs,
+whose working tree had `"x": (push_velocity, push_velocity)` — a degenerate range,
+so every push was exactly +0.4 in x *and* +0.4 in y, a constant 0.566 m/s shove in
+the same direction every time. Sampled symmetrically the same 0.4 is much gentler
+(mean |v| ~ 0.31 m/s, random direction, sometimes ~0). The two effects evidently
+cancelled; the measurement above is what settles it.
+
+**Do not read survival off a short training run.** A 40-iteration run gives
+1920 steps per env, and no episode can reach the 4500-step cap inside that, so
+`time_out` is structurally impossible and only falls complete: the same data
+filtered to that window reads 0% survival and a 22 s mean, against the true 20.8%
+and 48.3 s. `Episode_Termination/*` and `Mean episode length` in the training log
+are biased by 1/duration until runs are long relative to the cap — see
+[evaluation.md](evaluation.md#fixed-episodes-per-env-not-everything-that-finished).
+
+**History:**
+- 0.1 already lost the zero-residual baseline about half its episodes
+  (`fell_over` + `collapsed` vs `time_out`, over 65 s x 16 envs). A *walking*
+  robot is far easier to topple than a standing one, which is why that reads
+  timid next to mjlab's velocity task (+/-0.5).
+- 2026-08-03 — raised to 0.4, deliberately past that point.
+- 2026-08-14 — briefly committed as `0.0`, which disabled every disturbance in
+  the task; caught in review and amended back to 0.4.
+
+## Retired: push_angular_velocity
+
+**Retired:** 2026-09-16 — the dial was `0.0` from the day it was added and no
+caller ever set it, so it was deleted rather than carried.
+
+**Was:** `0.0` — the `roll`/`pitch` components of the push are off. It has
+been 0.0 since the task was introduced; the dial exists so angular disturbance
+can be added without restructuring the event term.
+
+## warmup_s
+
+**Current:** `10.0` — how long an episode runs before pushes begin. The cadence
+is untouched: the term suppresses rather than reschedules, so pushes still arrive
+every 5-7 s once they start, and the first real push lands on the first tick
+after the warm-up, which desynchronises it across envs instead of hitting every
+robot at the same phase.
+
+**Re-measure if:** the posture-settle time changes. The warm-up exists to clear
+it.
+
+**How it suppresses:** `push_and_record` drops the envs still inside `warmup_s`
+and returns without pushing — it does **not** reschedule. `EventManager` owns the
+countdown and re-samples it whenever the term fires regardless of what the term
+returns, so skipping here delays the *first* push without altering the 5-7 s
+cadence that follows. It also means a timer-watching observer counts pushes that
+never landed; see [evaluation.md](evaluation.md#binning-by-time-since-a-push).
+
+**History:**
+- Measured over 528 zero-residual episodes, the hazard rate is 0.005/s before the
+  first push, 0.122/s across the 4-8 s window that contains it, and ~0.019/s flat
+  for the rest of the episode. **48% of all deaths were that one event**, which
+  lands while the robot is still finishing its ~4 s posture settle: the task was
+  scoring a startup lottery rather than push recovery while walking.
+- Removing it makes the task easier (survival ~20% -> ~39% at a 60 s cap), which
+  is why `WALK_WINDOW_S` grew alongside.
+
+## episode_length_s
+
+**Current:** `90.0` — how long the base controller actually walks, and therefore
+how long an episode is worth running. An episode running past the walk trains the
+residual on a stationary robot, which is the opposite of this task — doubly so
+since a standing robot outscores a walking one on both tracking terms (0.75 vs
+0.66 for ZMP).
+
+**Re-measure if:** the installed FSM changes. This tracks the *installed*
+controller, not anything in this repo.
+
+The FSM currently walks indefinitely, so the ceiling is ours to pick:
+`Logistic::FSMMoveBoxTableToLeftShelf` begins with `Walking::WalkCmdVelImpl`
+(`targetCmdVel: [0.1, 0, 0]`, `timeout: 1000.0`) rather than
+`Logistic::GoToTable`, which is commented out. That edit lives in the installed
+workspace file
+(`~/workspace/install/lib/mc_controller/etc/LogisticController_ismpc.yaml`), not
+in this repo, and a workspace rebuild reverts it. The top-level `transitions:`
+map alone does not show this — it ends at `Logistic::Demo`, and the walk is
+inside that Meta state's own transitions.
+
+**History:**
+- `16.0` — sized for the stock config, which walked 1 m to the table and then
+  stood for good.
+- `60.0` — after the installed FSM was changed to walk indefinitely. ~4 s of
+  posture settling then ~6 m of walking.
+- `90.0` — when `PUSH_WARMUP_S` arrived; the two have to move together. The
+  warm-up removes the first-push massacre, which on its own would have lifted
+  survival from ~20% to ~39% and given away the headroom `PUSH_VELOCITY = 0.4`
+  was calibrated for. At the measured post-warm-up hazard of ~0.019/s,
+  `exp(-0.019 * (T - 10))` puts 90 s back at ~22%: the same difficulty as before,
+  with the mortality spread across steady walking instead of piled onto one
+  startup event. It also buys 13.3 pushes per episode against 10, and a third
+  fewer resets per hour — worth real throughput, since an env reset destroys and
+  rebuilds its mc_rtc controller.
+
+**Survival numbers from before the warm-up change are not comparable to ones
+after it.**

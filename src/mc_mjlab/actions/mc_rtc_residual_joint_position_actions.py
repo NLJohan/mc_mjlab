@@ -1,11 +1,4 @@
-"""Residual joint-position action term backed by per-env mc_rtc controllers.
-
-Adds an RL residual on top of each mc_rtc controller's joint-position output
-(velocity tracks the raw output). The worker pool, shared-memory I/O, the
-one-period-behind dispatch pipeline and the target interpolation all live in
-``mc_rtc_residual_action.McRtcResidualActionBase``; this module only maps the
-interpolated controller output to position/velocity targets.
-"""
+"""Residual joint-position action term backed by per-env mc_rtc controllers."""
 
 from __future__ import annotations
 
@@ -18,6 +11,7 @@ from mc_mjlab.actions.mc_rtc_residual_action import (
   McRtcResidualActionBase,
   McRtcResidualActionCfg,
 )
+from mc_mjlab.residuals.safety import project_residual
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -32,20 +26,17 @@ class McRtcResidualJointPositionActionCfg(McRtcResidualActionCfg):
 
 
 class McRtcResidualJointPositionAction(McRtcResidualActionBase):
-  """mc_rtc residual action driving joint position + velocity targets.
-
-  The RL residual is added to the interpolated controller position; velocity
-  tracks the raw controller output (no residual).
-  """
+  """mc_rtc residual action driving joint position + velocity targets."""
 
   cfg: McRtcResidualJointPositionActionCfg
 
   # Controller outputs consumed, in output-block order (host writes q then alpha).
   output_channels = ("q", "alpha")
+  residual_unit = "rad"
 
   def _seed_interpolation(self, env_ids: torch.Tensor) -> None:
     # Position ramps from the current stance; velocity from zero.
-    stance = self._entity.data.joint_pos[:, self._target_ids]
+    stance = self._entity.data.joint_pos_biased[:, self._target_ids]
     self._previous_control["q"][env_ids] = stance[env_ids]
     self._next_control["q"][env_ids] = stance[env_ids]
     self._previous_control["alpha"][env_ids] = 0.0
@@ -53,9 +44,15 @@ class McRtcResidualJointPositionAction(McRtcResidualActionBase):
 
   def _apply_control(
     self, interpolated_control: dict[str, torch.Tensor], residual: torch.Tensor
-  ) -> None:
-    target = interpolated_control["q"] + residual
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    bias = self._entity.data.encoder_bias[:, self._target_ids]
+    nominal = interpolated_control["q"] - bias
+    target, executed, projected = project_residual(
+      nominal, residual, self._position_lower, self._position_upper
+    )
     self._entity.set_joint_position_target(target, joint_ids=self._target_ids)
     self._entity.set_joint_velocity_target(
-      interpolated_control["alpha"], joint_ids=self._target_ids
+      interpolated_control["alpha"].clamp(self._velocity_lower, self._velocity_upper),
+      joint_ids=self._target_ids,
     )
+    return executed, projected

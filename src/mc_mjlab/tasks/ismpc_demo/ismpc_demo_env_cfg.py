@@ -29,7 +29,7 @@ from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
 
 from mc_mjlab import MC_RTC_YAML_PATH
-from mc_mjlab.robots.robots_registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
+from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.tasks.ismpc_demo.scripted_ismpc_sine_action import (
   ScriptedIsmpcSineDemoActionCfg,
 )
