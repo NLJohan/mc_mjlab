@@ -482,24 +482,6 @@ class ControllerHost:
         encoders = self._expand(row[0:T], self._default_encoders)
         pos = row[ro : ro + 3]
         quat = row[ro + 3 : ro + 7]
-        # DEBUG: raw root qvel/qacc as handed to us by mjlab/MuJoCo, read
-        # BEFORE any mc_rtc call -- independent of the KinematicInertial
-        # observer's own (separately known-buggy) internal velocity
-        # estimate. If this is ever meaningfully nonzero at reset, the
-        # physical simulation itself is not fully at rest when reset_envs()
-        # runs, which would explain "robot falls again on respawn" as a
-        # genuine physics/ordering issue rather than (or in addition to)
-        # the observer-estimate bug.
-        root_qvel = row[ro + 7 : ro + 13]
-        root_qacc = row[ro + 13 : ro + 16]
-        joint_qvel = row[T : 2 * T]
-        print(
-          f"[reset_envs DEBUG] env={env_id} pos={pos.tolist()} "
-          f"root_qvel={root_qvel.tolist()} root_qacc={root_qacc.tolist()} "
-          f"joint_qvel_maxabs={float(np.max(np.abs(joint_qvel))):.4f} "
-          f"joint_qvel={joint_qvel.tolist()}",
-          flush=True,
-        )
 
         if layout.use_reset and self._initialized[local]:
           # reset() takes the inverse of the MuJoCo world<-body quaternion

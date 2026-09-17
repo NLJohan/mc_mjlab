@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from mjlab.envs.mdp.events import apply_body_impulse
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 if TYPE_CHECKING:
@@ -349,3 +350,87 @@ def debug_is_walking(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   legitimately disagree."""
   action_term = env.action_manager.get_term(action_name)
   return action_term.is_walking_obs.squeeze(-1)
+
+
+class settle_gated_apply_body_impulse:
+  """Wraps mjlab.envs.mdp.events.apply_body_impulse so it cannot trigger a
+  push during the first ``settle_ticks`` steps of an episode.
+
+  Root cause this fixes: apply_body_impulse's OWN reset() already resamples
+  a fresh cooldown at every episode reset (so a push can't fire at literally
+  tick 0), but that cooldown is drawn from the ordinary cooldown_s RANGE --
+  nothing prevents an unlucky low draw from landing in the first few ticks
+  of a fresh episode. mode="step" means this can happen on ANY tick,
+  including the very first ones, independent of IsmpcSineAction's own
+  one-tick settle guard (_dispatch_ticks_since_sine_update's reset-time
+  seed to 1) for the POLICY's own actions -- that guard only covers the
+  policy's sine/walk-gate/Ts outputs, it has no knowledge of, and provides
+  no protection against, this separate push event. An early push landing
+  before the robot/policy has had any chance to settle can trigger an
+  immediate fell_over/collapsed, which resets the env again, which can
+  itself draw another unlucky early cooldown -- for a small, unlucky subset
+  of envs this compounds into the exact "resets every single tick, forever"
+  pattern seen in the reset_race_guard spam this was written to fix (see
+  the training-investigation thread: envs 74/295/87 discarding stale
+  collected results on essentially every collect() cycle, while ~297 other
+  envs were fine -- consistent with only a small unlucky subset ever
+  drawing a bad early cooldown).
+
+  Mechanism: delegates every call to a real, internally-held
+  apply_body_impulse instance (constructed with the SAME cfg/params this
+  wrapper receives, minus settle_ticks itself), but before delegating,
+  forces _interval_time_left back up to at least settle_ticks worth of
+  seconds for any env still inside its settle window -- so the wrapped
+  instance's own cooldown-expiry check can never see a <=0 value for those
+  envs, and its trigger branch is simply never reached for them. This is
+  NOT "let it trigger then zero the force": the wrapped instance's internal
+  state is corrected BEFORE its trigger logic runs, so no impulse is ever
+  computed or written for a settling env in the first place.
+
+  cfg.params must include everything apply_body_impulse itself needs
+  (asset_cfg, force_range, torque_range, duration_s, cooldown_s), PLUS
+  settle_ticks (int, number of env steps after reset during which pushes
+  are suppressed for that env).
+  """
+
+  def __init__(self, cfg, env: ManagerBasedRlEnv):
+    self._env = env
+    self._settle_ticks = int(cfg.params["settle_ticks"])
+    # The wrapped instance must NOT see settle_ticks in its own params --
+    # apply_body_impulse.__call__ has no such kwarg and would raise on an
+    # unexpected argument.
+    inner_params = {k: v for k, v in cfg.params.items() if k != "settle_ticks"}
+
+    class _InnerCfg:
+      params = inner_params
+
+    self._inner = apply_body_impulse(_InnerCfg(), env)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    settle_ticks: int,
+    **inner_kwargs,
+  ) -> None:
+    del env_ids  # apply_body_impulse itself always operates on all envs.
+    still_settling = env.episode_length_buf < self._settle_ticks
+    if bool(still_settling.any()):
+      # Push the wrapped instance's cooldown timer back out for settling
+      # envs, every step, so it never counts down to a trigger for them.
+      # settle_ticks is a step count; convert to the same seconds unit
+      # _interval_time_left is tracked in.
+      floor_s = self._settle_ticks * env.step_dt
+      current = self._inner._interval_time_left
+      self._inner._interval_time_left = torch.where(
+        still_settling, torch.clamp(current, min=floor_s), current
+      )
+    self._inner(env, None, **inner_kwargs)
+
+  def debug_vis(self, visualizer) -> None:
+    if hasattr(self._inner, "debug_vis"):
+      self._inner.debug_vis(visualizer)
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if hasattr(self._inner, "reset"):
+      self._inner.reset(env_ids)

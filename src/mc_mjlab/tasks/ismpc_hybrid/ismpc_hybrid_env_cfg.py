@@ -28,7 +28,7 @@ from mc_mjlab.robots.robots_registry import get_main_robot_spec, prepare_cfg_for
 from mc_mjlab.tasks.ismpc_hybrid.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 300
+NUM_ENVS = 500
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 6.0
@@ -36,11 +36,12 @@ EPISODE_LENGTH_S = 6.0
 FRAMESKIP = 2
 
 # --- Push disturbances (mjlab.envs.mdp.events.apply_body_impulse). ---
-PUSH_FORCE_TORSO_N = (-60.0, 60.0)
-PUSH_FORCE_HAND_N = (-40.0, 40.0)
-PUSH_DURATION_S = (0.1, 0.5)
-PUSH_COOLDOWN_TORSO_S = (2.0, 6.0)
-PUSH_COOLDOWN_HAND_S = (3.0, 8.0)
+PUSH_SETTLE_TICKS = 20
+PUSH_FORCE_TORSO_N = (-50.0, 50.0)
+PUSH_FORCE_HAND_N = (-100.0, 100.0)
+PUSH_DURATION_S = (0.1, 0.6)
+PUSH_COOLDOWN_TORSO_S = (3.0, 15.0)
+PUSH_COOLDOWN_HAND_S = (3.0, 15.0)
 
 # --- Mass/inertia domain randomization. ---
 BODY_MASS_ALPHA_RANGE = (-0.05, 0.05)
@@ -49,8 +50,8 @@ HAND_PAYLOAD_MASS_RANGE_KG = (0.0, 3.0)
 # --- Uneven terrain (mjlab.terrains, HfRandomUniformTerrainCfg). ---
 ENABLE_UNEVEN_TERRAIN = False
 TERRAIN_NUM_ROWS = 1
-TERRAIN_NUM_COLS = 8
-TERRAIN_NOISE_RANGE_M = (-0.015, 0.015)
+TERRAIN_NUM_COLS = 1
+TERRAIN_NOISE_RANGE_M = (-0.005, 0.005)
 TERRAIN_PATCH_SIZE_M = (8.0, 8.0)
 
 
@@ -151,16 +152,16 @@ def _make_env_cfg(
     "sine_position_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_position_continuity,
       weight=1.0,
-      params={"action_name": "ismpc_sine"},
+      params={"action_name": "ismpc_sine", "sigma" : 0.003},
     ),
     "sine_velocity_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_velocity_continuity,
-      weight=1.0,
+      weight=0.1,
       params={"action_name": "ismpc_sine"},
     ),
     "joint_torque": RewardTermCfg(
       func=ismpc_mdp.joint_torque_reward, 
-      weight=0.5
+      weight=1.0
     ),
     "target_linear_vel": RewardTermCfg(
         func=ismpc_mdp.target_linear_vel,
@@ -210,13 +211,13 @@ def _make_env_cfg(
       func=envs_mdp.reset_joints_by_offset,
       mode="reset",
       params={
-        "position_range": (-0.05, 0.05),  # rad
-        "velocity_range": (-0.3, 0.3),  # rad/s
+        "position_range": (-0.02, 0.02),  # rad
+        "velocity_range": (-0.01, 0.01),  # rad/s
         "asset_cfg": SceneEntityCfg("robot"),
       },
     ),
     "push_torso": EventTermCfg(
-      func=envs_mdp.apply_body_impulse,
+      func=ismpc_mdp.settle_gated_apply_body_impulse,
       mode="step",
       params={
         "asset_cfg": SceneEntityCfg("robot", body_names=["Body"]),
@@ -224,10 +225,11 @@ def _make_env_cfg(
         "torque_range": (0.0, 0.0),
         "duration_s": PUSH_DURATION_S,
         "cooldown_s": PUSH_COOLDOWN_TORSO_S,
+        "settle_ticks": PUSH_SETTLE_TICKS,
       },
     ),
     "push_right_hand": EventTermCfg(
-      func=envs_mdp.apply_body_impulse,
+      func=ismpc_mdp.settle_gated_apply_body_impulse,
       mode="step",
       params={
         "asset_cfg": SceneEntityCfg("robot", body_names=["Rhand_Link0_Plan2"]),
@@ -235,10 +237,11 @@ def _make_env_cfg(
         "torque_range": (0.0, 0.0),
         "duration_s": PUSH_DURATION_S,
         "cooldown_s": PUSH_COOLDOWN_HAND_S,
+        "settle_ticks": PUSH_SETTLE_TICKS,
       },
     ),
     "push_left_hand": EventTermCfg(
-      func=envs_mdp.apply_body_impulse,
+      func=ismpc_mdp.settle_gated_apply_body_impulse,
       mode="step",
       params={
         "asset_cfg": SceneEntityCfg("robot", body_names=["Lhand_Link0_Plan2"]),
@@ -246,6 +249,7 @@ def _make_env_cfg(
         "torque_range": (0.0, 0.0),
         "duration_s": PUSH_DURATION_S,
         "cooldown_s": PUSH_COOLDOWN_HAND_S,
+        "settle_ticks": PUSH_SETTLE_TICKS,
       },
     ),
     "randomize_body_density": EventTermCfg(
@@ -335,7 +339,7 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       obs_normalization=True,
       distribution_cfg={
         "class_name": "GaussianDistribution",
-        "init_std": 0.2,
+        "init_std": 0.4,
         "std_type": "scalar",
       },
     ),
@@ -360,7 +364,7 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
     ),
     experiment_name="mc_rtc_ismpc_hybrid",
     save_interval=100,
-    num_steps_per_env=256,
+    num_steps_per_env=512,
     max_iterations=max_iterations,
     logger="wandb",
   )
