@@ -28,7 +28,7 @@ from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 400
+NUM_ENVS = 500
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 6.0
@@ -212,7 +212,7 @@ def _make_env_cfg(
       func=envs_mdp.reset_joints_by_offset,
       mode="reset",
       params={
-        "position_range": (-0.02, 0.02),  # rad
+        "position_range": (-0.2, 0.2),  # rad
         "velocity_range": (-0.01, 0.01),  # rad/s
         "asset_cfg": SceneEntityCfg("robot"),
       },

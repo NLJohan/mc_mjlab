@@ -62,8 +62,41 @@ void ControllerInstance::reset(IoInput input, IoOutput output)
     }
 
     const auto pose = prepare_reset(input);
-    const auto name = m_controller->controller().robot().name();
-    m_controller->reset({{name, m_q}}, {{name, pose}});
+
+    // Soft reset, matching the old mc_rtc_controller_host.py reset_envs()'s
+    // init() branch: re-run MCGlobalController::init() on the SAME, still-alive
+    // controller instead of the destructive reset()/erase()+AddController()
+    // path. That binding never exposed MCGlobalController::reset() at all, so
+    // in production every past reset already took exactly this path.
+    const Eigen::Vector3d zero = Eigen::Vector3d::Zero();
+    auto &controller = m_controller->controller();
+
+    // Zero velocity/acceleration explicitly -- init() does not touch these,
+    // and leaving stale values here produced garbage comVelocity() readings
+    // post-reset (observer computing an innovation against stale sensor
+    // state), per the original bug this sequence was written to fix.
+    if (!m_layout.input.body_sensors.empty() &&
+        std::find(m_layout.input.body_sensors.begin(), m_layout.input.body_sensors.end(),
+                  InputLayout::floating_base_sensor) != m_layout.input.body_sensors.end())
+    {
+        // FloatingBase gets position/orientation set here too, from the same
+        // fresh pose used for init()'s attitude below -- without this the
+        // sensor buffer still holds the previous episode's last pre-fall pose
+        // at the moment init() runs the observer pipeline.
+        m_controller->setSensorPosition(pose.translation());
+        m_controller->setSensorOrientation(Eigen::Quaterniond(pose.rotation()));
+        m_controller->setSensorLinearVelocity(zero);
+        m_controller->setSensorAngularVelocity(zero);
+        m_controller->setSensorLinearAcceleration(zero);
+    }
+    m_controller->setSensorAngularVelocity(zero);
+    m_controller->setSensorLinearAcceleration(zero);
+
+    io_to_encoders(input.subspan(m_layout.input.q_offset()), m_q);
+    m_controller->setEncoderValues(m_q);
+
+    m_controller->init(m_q, pose);
+
     finish_reset(input, pose);
     apply_output(output);
 

@@ -268,10 +268,7 @@ class McRtcActionBase(BaseAction):
       )
       self._next_control[channel].copy_(scratch)
     self._has_staged_control.zero_()
-
-    # Sample the current state and dispatch this period's solve without
-    # blocking; it overlaps the next `frameskip` substeps of sim.
-    self._bridge.fill_controller_input(self._in_np)
+    
     write_inputs(
       self._in_np,
       self._datastore_scalar_input_columns,
@@ -286,6 +283,11 @@ class McRtcActionBase(BaseAction):
     )
 
     self._dispatch_resets[:] = self._pending_reset
+    # Sample the current state and dispatch this period's solve without
+    # blocking; it overlaps the next `frameskip` substeps of sim.
+    reset_mask = torch.as_tensor(self._dispatch_resets, device=self.device, dtype=torch.bool) 
+    self._bridge.fill_controller_input(self._in_np, reset_mask=reset_mask)
+
     self._in_np[:, self._bridge.layout.input.reset_offset()] = self._dispatch_resets
     # An unserviced row must never look like a fresh successful result.
     self._out_np[:, self._bridge.layout.output.status_offset()] = int(

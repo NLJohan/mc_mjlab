@@ -76,19 +76,33 @@ class SimControllerBridge:
     self._clear_state_feedback_offsets()
     self._alloc_device_buffers(env.num_envs)
 
-  def fill_controller_input(self, rows: np.ndarray) -> None:
-    """Write biased encoders, measured effort, local root pose and raw sensors."""
-    block = self._input_block
-    self._fill_joint_columns(block)
-    self._fill_root_columns(block)
-    self._fill_sensor_columns(block)
-    self._apply_state_feedback_offsets(block)
+  def fill_controller_input(self, rows: np.ndarray, reset_mask: torch.Tensor | None = None) -> None:
+      block = self._input_block
+      self._fill_joint_columns(block)
+      self._fill_root_columns(block)
+      self._fill_sensor_columns(block)
+      self._apply_state_feedback_offsets(block)
 
-    # Last: every step above reads the root rotation as mjlab wxyz, native wants xyzw.
-    ro = self.layout.input.root_offset()
-    block[:, ro + 3 : ro + 7] = block[:, self._quat_xyzw_t]
+      if reset_mask is not None and reset_mask.any():
+          layout = self.layout.input
+          count = len(layout.joint_order)
+          # Zero joint velocities for resetting rows only -- mirrors the old
+          # reset_controller_input's explicit zeroing (root_qvel/joint_qvel were
+          # confirmed nonzero on reset otherwise; see mc_rtc_controller_io_binding.py
+          # history). The live fill above already wrote raw sim velocity into every
+          # row unconditionally; this corrects only the rows that are resetting.
+          block[reset_mask, layout.qd_offset() : layout.qd_offset() + count] = 0.0
+          ro = layout.root_offset()
+          block[reset_mask, ro + 7 : ro + 10] = 0.0  # root linear velocity
+          # FloatingBase angular velocity/acceleration synthesized in _fill_sensor_columns
+          if _FLOATING_BASE in layout.body_sensors and self._root_dof_adr >= 0:
+              index = layout.body_sensors.index(_FLOATING_BASE)
+              off = layout.body_sensors_offset() + _SENSOR_STRIDE * index
+              block[reset_mask, off : off + 6] = 0.0  # angular velocity + accel
 
-    self._host_view(rows, "input")[:, : self._input_width].copy_(block)
+      ro = self.layout.input.root_offset()
+      block[:, ro + 3 : ro + 7] = block[:, self._quat_xyzw_t]
+      self._host_view(rows, "input")[:, : self._input_width].copy_(block)
 
   def upload_controller_output(self, rows: np.ndarray) -> torch.Tensor:
     """Copy the whole output block to the device; every gather then runs there."""

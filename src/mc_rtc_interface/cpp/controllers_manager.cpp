@@ -384,10 +384,21 @@ void ControllersManager::await_worker_start(Worker &worker)
 void ControllersManager::retire_worker(Worker &worker)
 {
     std::error_code error;
-    const bool                running = worker.child.running(error);
+    const bool running = worker.child.running(error);
     if (error) throw std::runtime_error("failed to inspect worker process: " + error.message());
-    if (running) worker.child.terminate(error);
-    if (error) throw std::runtime_error("failed to terminate worker process: " + error.message());
+    if (running)
+    {
+        worker.child.terminate(error);
+        if (error) throw std::runtime_error("failed to terminate worker process: " + error.message());
+    }
+    // terminate() only sends the signal; it does not wait for exit or reap the
+    // child. Without this, the process can still be a zombie (or briefly still
+    // alive) right after retire_worker() returns, which fails check_reaped()'s
+    // kill(pid,0)==ESRCH / waitpid(...)==ECHILD expectations in
+    // test_controllers_manager.cpp, deterministically, not just under load.
+    worker.child.wait(error);
+    if (error) throw std::runtime_error("failed to reap worker process: " + error.message());
+
     worker.socket.reset();
     worker.status = WorkerStatus::Retired;
     std::fill(worker.reset_rows.begin(), worker.reset_rows.end(), false);

@@ -21,5 +21,5 @@ register_mjlab_task(
   task_id=get_task_name(TASK_DIR),
   env_cfg=ismpc_hybrid_env_cfg(),
   play_env_cfg=ismpc_hybrid_env_cfg(play=True),
-  rl_cfg=ismpc_hybrid_ppo_cfg(max_iterations=20),
+  rl_cfg=ismpc_hybrid_ppo_cfg(max_iterations=1000),
 )
