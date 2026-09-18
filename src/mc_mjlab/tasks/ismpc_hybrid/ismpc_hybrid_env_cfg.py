@@ -25,10 +25,10 @@ from mjlab.terrains.heightfield_terrains import HfRandomUniformTerrainCfg
 
 from mc_mjlab import MC_RTC_YAML_PATH
 from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
-from mc_mjlab.tasks.ismpc_hybrid.ismpc_sine_action import IsmpcSineActionCfg
+from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 500
+NUM_ENVS = 400
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 6.0
@@ -99,9 +99,10 @@ def _make_env_cfg(
   actions: dict[str, ActionTermCfg] = {
     "ismpc_sine": IsmpcSineActionCfg(
       entity_name="robot",
-      target_actuator_names=(".*",),
+      actuator_names=(".*",),
       mc_rtc_config_path=str(mc_rtc_yaml),
       mc_rtc_robot_name=robot_name,
+      required_controller="ismpc_walking",
       frameskip=FRAMESKIP,
       num_workers=num_workers,
       pd_gains_path=str(robot.pd_gains_path),

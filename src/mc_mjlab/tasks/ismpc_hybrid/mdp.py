@@ -6,6 +6,17 @@ condition to be a sane RL problem). None of this is ISMPC-specific -- no
 CoM-height tracking error, no footstep/QP-quality term, nothing that uses
 the bridge's get_com_height_ref/qp_succeeded getters yet.
 
+Ported from the old Cython-bridge ismpc_hybrid/mdp.py onto the native
+`mc_rtc_interface`-backed `IsmpcSineAction` (mc_mjlab/actions/ismpc_sine_action.py).
+Every function here is unchanged except `ismpc_wants_stop` and
+`debug_is_walking`, which now read `action_term.ismpc_wants_stop_obs` /
+`action_term.is_walking_obs` -- both properties already exist on the new
+action term (backed by the generic datastore-output machinery inherited
+from `McRtcActionBase`) with the same names/shapes as before, so nothing
+else in this file changes. `sine_position_continuity`/`sine_velocity_continuity`
+keep reaching directly into `action_term._physical_prev`/`_physical_curr`/
+`_period_t0`, which exist on `IsmpcSineAction` with the same names.
+
 ASSUMED, NOT VERIFIED: the exact function signature mjlab's
 RewardTermCfg/TerminationTermCfg expect (`func(env, **params) -> Tensor`).
 Modeled on the pattern implied by residual_balance's usage, not confirmed
@@ -53,9 +64,9 @@ def not_walking_penalty(env: ManagerBasedRlEnv, action_name: str) -> torch.Tenso
   from last_walk_action (only the policy's commanded intent): neither of
   those alone is safe to reward against, since the policy could command
   "walking" without ISMPC actually walking, or vice versa. is_walking_obs
-  is populated via the ismpc_walking_python bridge's is_walking readback,
-  wired through mc_rtc_controller_io_binding.py/mc_rtc_controller_host.py
-  same as ismpc_wants_stop.
+  is populated via the mc_rtc_interface datastore output
+  `ismpc_walking::robot_walking_d`, collected each control period the same
+  way every other datastore getter is (McRtcActionBase._collect_controller_output).
 
   Weights (set in ismpc_hybrid_env_cfg.py's rewards dict, not here): the
   user's stated design is alive+walking=10, alive+not-walking=5, i.e. this
@@ -108,19 +119,20 @@ def collapsed(env: ManagerBasedRlEnv, min_root_height: float = 0.20) -> torch.Te
 
 
 def last_sine_params(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
-  """Current period's physical sine params (offset, amplitude_ratio,
-  frequency, phase), as an observation.
+  """Current period's physical sine params (offset, frequency, sin_amp,
+  cos_amp), as an observation.
 
   Exposing this (rather than only the raw pre-mapping action mjlab's
   built-in `last_action` observation would give) lets the policy condition
   on physically meaningful quantities directly, and -- per the phase-
   continuity discussion this design pass -- gives it the information it
-  needs to choose a new phase that continues smoothly from where the
+  needs to choose new sine params that continue smoothly from where the
   previous period's sine left off, rather than having to reconstruct that
-  from raw, pre-sigmoid/pre-clamp numbers.
+  from raw, pre-clamp numbers.
   """
   action_term = env.action_manager.get_term(action_name)
   return action_term.physical_params
+
 
 def target_linear_vel(
     env: ManagerBasedRlEnv,
@@ -148,6 +160,7 @@ def target_angular_vel(
     command = env.command_manager.get_command(command_name)
     ang_vel_error = torch.square(command[:, 2] - asset.data.root_link_ang_vel_b[:, 2])
     return torch.exp(-ang_vel_error / std**2)
+
 
 def last_walk_action(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   """The policy's current walk/stop decision (1.0 = walk, 0.0 = stop), as
@@ -180,6 +193,11 @@ def ismpc_wants_stop(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   react to -- or preemptively avoid -- situations where ISMPC's own safety
   logic disagrees with its walk decision, rather than only discovering
   that disagreement's consequences after the fact (e.g. via a fall).
+
+  Reads action_term.ismpc_wants_stop_obs, backed by the
+  `ismpc_walking::wants_stop_d` datastore output collected through
+  McRtcActionBase's generic datastore machinery -- replaces the old
+  Cython-bridge file's ControllerIoBinding.read_ismpc_wants_stop readback.
   """
   action_term = env.action_manager.get_term(action_name)
   return action_term.ismpc_wants_stop_obs
@@ -217,16 +235,16 @@ def sine_position_continuity(
   instant the switch took effect (action_term._period_t0).
 
   Deliberately NOT a penalty on the raw or physical *parameters* changing
-  (e.g. ||params_t - params_{t-1}||^2): two different (offset,
-  amplitude_ratio, frequency, phase) tuples can still produce a continuous
-  trajectory at the splice point (e.g. a phase shift that exactly
-  compensates a frequency change), and conversely small parameter changes
-  can still produce a visible position jump depending on where in the
-  cycle the switch lands. Evaluating both sines at the same instant and
-  comparing their value directly targets the physically meaningful
-  quantity: does the CoM height reference actually jump, which is what
-  would inject a spurious feedforward acceleration kick into
-  ISMPC_Solver's zc_ddot term (see ismpc_solver_patch.md).
+  (e.g. ||params_t - params_{t-1}||^2): two different (offset, frequency,
+  sin_amp, cos_amp) tuples can still produce a continuous trajectory at the
+  splice point (e.g. an amplitude split that exactly compensates a
+  frequency change), and conversely small parameter changes can still
+  produce a visible position jump depending on where in the cycle the
+  switch lands. Evaluating both sines at the same instant and comparing
+  their value directly targets the physically meaningful quantity: does
+  the CoM height reference actually jump, which is what would inject a
+  spurious feedforward acceleration kick into ISMPC_Solver's zc_ddot term
+  (see ismpc_solver_patch.md).
 
   sigma=0.03m: reward ~0.95 at a 1cm jump, ~0.25 at 5cm, ~0 by 10cm+ --
   tunable, chosen to sit near the boundary between splice discontinuities
@@ -271,7 +289,7 @@ def sine_velocity_continuity(
 def joint_torque_reward(env: ManagerBasedRlEnv, sigma: float = 100.0) -> torch.Tensor:
   """Gaussian-kernel reward for low joint effort: exp(-sum(tau^2) / (2*sigma^2)),
   summed over all DOFs (currently equivalent to "the target joint subset",
-  since IsmpcSineActionCfg.target_actuator_names=(".*",) already covers
+  since IsmpcSineActionCfg.actuator_names=(".*",) already covers
   every actuator in this task -- revisit the DOF scoping only if a future
   task variant narrows the action term's target set).
 
@@ -343,10 +361,11 @@ def debug_step_timing(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
 def debug_is_walking(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   """PLOTTING ONLY (weight=0.0) -- ground-truth walking/stopped flag (1.0 =
   walking, 0.0 = stopped), for the play viewer's native plot panel.
-  Reads is_walking_obs (Robot_Walking ground truth from the controller),
-  NOT last_walk_action (the policy's own commanded intent) -- for a
-  debugging display you want to see what's actually happening, not just
-  what was asked for; see is_walking_obs's docstring for why the two can
+  Reads is_walking_obs (Robot_Walking ground truth from the controller,
+  via the `ismpc_walking::robot_walking_d` datastore output), NOT
+  last_walk_action (the policy's own commanded intent) -- for a debugging
+  display you want to see what's actually happening, not just what was
+  asked for; see is_walking_obs's docstring for why the two can
   legitimately disagree."""
   action_term = env.action_manager.get_term(action_name)
   return action_term.is_walking_obs.squeeze(-1)
