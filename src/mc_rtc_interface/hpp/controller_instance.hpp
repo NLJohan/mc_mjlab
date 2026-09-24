@@ -35,6 +35,7 @@ class ControllerInstance
 
         std::vector<double> m_q, m_qd, m_tau;
         std::vector<size_t> m_io_to_mbc;
+        bool m_first_reset_done = false;
 
         inline static constexpr std::size_t invalid_index = std::numeric_limits<std::size_t>::max();
 
