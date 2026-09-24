@@ -74,7 +74,7 @@ class McRtcActionCfg(BaseActionCfg):
   datastore_vectors_outputs: tuple[str, ...] = ()
   """Native Vector3d getters collected each period, without interpolation."""
 
-  controller_timeout_ms: int = 60000
+  controller_timeout_ms: int = 6000
   """Native collection timeout, in milliseconds."""
 
   console_output: Literal["none", "single", "all"] = "none"
@@ -445,18 +445,6 @@ class McRtcActionBase(BaseAction):
       self._input_memory,
       self._output_memory,
     )
-
-    self._manager.dispatch(native.Command.Initialize)
-    failed = self._manager.collect()
-    status = self._out_np[:, self._bridge.layout.output.status_offset()]
-
-    if failed or np.any(status != int(native.OutputLayout.Status.OK)):
-      raise RuntimeError(
-        "native controller initialization failed; verify configured numeric "
-        "datastore callbacks and the mc_mjlab controller adapter "
-        f"(vectors={list(self._bridge.layout.output.datastore_vector3)}, "
-        f"scalars={list(self._bridge.layout.output.datastore_scalar)})"
-      )
 
     self._latch_datastore_outputs(
       self._bridge.upload_controller_output(self._out_np),
