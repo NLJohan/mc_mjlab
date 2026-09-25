@@ -74,7 +74,7 @@ class McRtcActionCfg(BaseActionCfg):
   datastore_vectors_outputs: tuple[str, ...] = ()
   """Native Vector3d getters collected each period, without interpolation."""
 
-  controller_timeout_ms: int = 6000
+  controller_timeout_ms: int = 60000
   """Native collection timeout, in milliseconds."""
 
   console_output: Literal["none", "single", "all"] = "none"
