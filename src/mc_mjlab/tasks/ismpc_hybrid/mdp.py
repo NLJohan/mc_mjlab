@@ -134,6 +134,31 @@ def last_sine_params(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   return action_term.physical_params
 
 
+def last_twist_action(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """The policy's current (vx, vy, omega) twist command, as an observation
+  -- mirrors last_sine_params'/last_step_timing_action's role, just for the
+  reference-velocity channel. This is the rate-limited value actually
+  written to ismpc_walking::set_rl_ref_vel this period (see
+  IsmpcSineAction.last_twist_action), not the raw pre-mapping action."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.last_twist_action
+
+
+def last_user_ref_vel(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """Human/joystick reference-velocity intent (vx, vy, omega), as an
+  observation -- read live from Walking_controller::user_reference_velocity
+  regardless of whether the controller-side rlVelocityControl toggle is
+  currently on. Lets the policy condition on what a human is asking for
+  (via the GUI "User reference velocity" ArrayInput or a connected
+  joystick) even while its own twist (last_twist_action) is the one
+  actually driving the footstep planner -- e.g. so a future policy variant
+  could learn to track or defer to human intent rather than being blind to
+  it. Zero when no human input is active (GUI default, or no joystick
+  connected)."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.last_user_ref_vel_obs
+
+
 def target_linear_vel(
     env: ManagerBasedRlEnv,
     command_name: str,
@@ -146,6 +171,7 @@ def target_linear_vel(
     lin_vel_error = torch.sum(
         torch.square(command[:, :2] - asset.data.root_link_lin_vel_b[:, :2]), dim=1
     )
+    print(command[:, :2])
     return torch.exp(-lin_vel_error / std**2)
 
 
@@ -286,41 +312,126 @@ def sine_velocity_continuity(
   return torch.exp(-(v_curr - v_prev) ** 2 / (2.0 * sigma**2))
 
 
-def joint_torque_reward(env: ManagerBasedRlEnv, sigma: float = 100.0) -> torch.Tensor:
-  """Gaussian-kernel reward for low joint effort: exp(-sum(tau^2) / (2*sigma^2)),
-  summed over all DOFs (currently equivalent to "the target joint subset",
-  since IsmpcSineActionCfg.actuator_names=(".*",) already covers
-  every actuator in this task -- revisit the DOF scoping only if a future
-  task variant narrows the action term's target set).
+# Lower body only: both legs + waist, per the robot's own _ref_joint_order
+# naming (RCY/RCR/RCP/RKP/RAP/RAR = right hip yaw/roll/pitch, knee pitch,
+# ankle pitch/roll; L-prefixed = left leg mirror; WP/WR/WY = waist
+# pitch/roll/yaw). Deliberately excludes HY/HP (head/neck) and every
+# arm/hand joint (RS*/LS*/RE*/LE*/RW*/LW*/RH*/LH*, plus the finger joints
+# RT*/RI*/RM*/LT*/LI*/LM*) -- confirmed against the robot's actual joint
+# list, not guessed from a general humanoid naming convention.
+LOWER_BODY_JOINT_NAMES = (
+  "RCY", "RCR", "RCP", "RKP", "RAP", "RAR",
+  "LCY", "LCR", "LCP", "LKP", "LAP", "LAR",
+  "WP", "WR", "WY",
+)
 
-  Legitimate on ordinary robotics/control grounds (reduces actuator heat,
-  peak torque demand, standard RL shaping) -- NOT included on the basis of
-  any specific human-biomechanics claim; see the removed penalty version's
-  docstring for the literature check that ruled that framing out.
+
+def _resolve_lower_body_joint_ids(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> None:
+  """Resolve asset_cfg.joint_ids in place, once, on first call.
+
+  SceneEntityCfg.joint_ids defaults to slice(None) (= "every joint") until
+  .resolve(scene) is called -- confirmed empirically: a bare
+  SceneEntityCfg("robot", joint_names=["RCY"]) still reports
+  joint_ids == slice(None) before resolve() runs. Nothing in the reward
+  manager path calls this automatically for a plain function parameter (unlike
+  the action term's own _target_ids, which IS resolved by BaseAction.__init__
+  from cfg.actuator_names). So this function must call resolve() itself,
+  exactly once -- resolve() mutates asset_cfg.joint_ids in place from a list
+  to... still a list (or slice(None) if it happened to match every joint,
+  which it won't here since this is a strict subset), so checking
+  `isinstance(asset_cfg.joint_ids, list)` is a safe, idempotent "already
+  resolved" guard for every call after the first.
+  """
+  if isinstance(asset_cfg.joint_ids, list):
+    return
+  asset_cfg.resolve(env.scene)
+
+
+def joint_torque_reward(
+  env: ManagerBasedRlEnv,
+  sigma: float = 200,
+  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=LOWER_BODY_JOINT_NAMES),
+) -> torch.Tensor:
+  """Gaussian-kernel reward for low joint effort: exp(-sum(tau^2) / (2*sigma^2)),
+  summed over LOWER BODY JOINTS ONLY (both legs + waist, 15 DOF -- see
+  LOWER_BODY_JOINT_NAMES). Previously summed every actuated DOF, arms/hands/
+  head included, via the raw env.sim.data.qfrc_actuator with no joint
+  filtering at all -- that meant an idle arm sitting at zero torque was
+  diluting the signal from legs, which is where effort actually matters for
+  a walking task, and made sigma impossible to tune meaningfully (a robot
+  holding its arms still contributes ~0 regardless of how the legs behave).
+
+  IMPORTANT -- asset_cfg default is a module-level SceneEntityCfg instance,
+  shared across every env that doesn't pass its own asset_cfg (standard
+  Python mutable-default-argument sharing, same as any dataclass instance
+  used as a default). This is intentional here, not a bug: joint topology
+  is identical across all parallel envs of a single run, so resolving once
+  and caching on that shared instance is exactly the right behavior, not a
+  cross-env leak (no per-env state is stored on it, only the fixed
+  name->id mapping). Do NOT give this function's asset_cfg per-instance
+  mutable state beyond joint_ids/joint_names resolution if it's ever
+  extended.
 
   sigma=100 (in sum-of-squared-Nm units, i.e. sigma^2=10000): a rough,
-  UNVALIDATED starting guess -- assumes something on the order of
-  ~30 Nm across ~12 actively-loaded joints during normal walking
-  (30^2 * 12 ~= 10800), giving reward ~0.6 at that rough "typical effort"
-  level and decaying by ~2x that. This is not measured against this
-  system's actual torques/PD gains/robot mass; set it properly once you
-  can see logged sum(qfrc_actuator**2) values from a real training run,
-  ideally picking sigma^2 near the middle of the observed range rather
-  than guessing.
+  UNVALIDATED starting guess -- STILL not measured against this system's
+  actual lower-body torques/PD gains/robot mass now that the DOF scope has
+  changed (previously it was an all-DOF guess, which is now a different,
+  larger-population quantity, so if a real distribution was fit against the
+  old all-joint sum, it doesn't carry over -- 12 idle arm/hand DOFs no
+  longer pad the sum toward zero, so the real 15-DOF sum(tau^2) is likely
+  SMALLER and more sharply varying than the guess this sigma was based on).
+  Use debug_joint_torque_raw (weight=0.0, wired into uv run play like the
+  other debug_* terms) to see actual logged sum(tau^2) values before
+  trusting this sigma -- pick sigma^2 near the middle of the observed
+  range, not by inspection of this docstring's arithmetic.
   """
-  return torch.exp(-torch.sum(env.sim.data.qfrc_actuator**2, dim=-1) / (2.0 * sigma**2))
+  _resolve_lower_body_joint_ids(env, asset_cfg)
+  asset = env.scene[asset_cfg.name]
+  tau_sq_sum = torch.sum(asset.data.qfrc_actuator[:, asset_cfg.joint_ids] ** 2, dim=-1)
+  return torch.exp(-tau_sq_sum / (2.0 * sigma**2))
+
+
+def debug_joint_torque_raw(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=LOWER_BODY_JOINT_NAMES),
+) -> torch.Tensor:
+  """PLOTTING-ONLY (weight=0.0 in ismpc_hybrid_env_cfg.py, same convention
+  as debug_target_height/debug_step_timing/debug_is_walking) -- the raw,
+  unscaled sum(tau^2) over the same lower-body joint set joint_torque_reward
+  uses, in sum-of-squared-Nm units, with NO Gaussian kernel applied. Exists
+  purely so `uv run play` (console_output="all" in play mode, per
+  ismpc_hybrid_env_cfg.ismpc_hybrid_env_cfg) shows this in the reward-terms
+  readout, letting you read off real typical/peak values for sigma tuning
+  instead of guessing -- see joint_torque_reward's docstring. Because this
+  shares the SAME module-level default asset_cfg object as
+  joint_torque_reward (both reference the identical LOWER_BODY_JOINT_NAMES
+  tuple, but construct their OWN separate SceneEntityCfg default per
+  function signature -- Python evaluates each default expression once per
+  def, not shared between the two functions), it resolves independently;
+  harmless, just a second one-time resolve() call rather than a shared
+  cache across both functions.
+  """
+  _resolve_lower_body_joint_ids(env, asset_cfg)
+  asset = env.scene[asset_cfg.name]
+  return torch.sum(asset.data.qfrc_actuator[:, asset_cfg.joint_ids] ** 2, dim=-1)
 
 
 def target_twist(env: ManagerBasedRlEnv, command_name: str = "twist") -> torch.Tensor:
   """Currently sampled target walking velocity (vx, vy, wz), as an
-  observation. The policy has no direct authority over velocity tracking
-  itself (footstep planning/execution is entirely internal to ISMPC), but
-  needs this as context: it explains part of what shows up in
-  base_lin_vel, and more importantly, the target speed/turn-rate is
-  plausibly informative for what CoM-height sine strategy is safe or
-  appropriate (e.g. a fast commanded walk likely needs different height
-  modulation than near-stationary standing) -- which is squarely the
-  policy's actual job.
+  observation.
+
+  The policy now has direct authority over velocity tracking via the twist
+  action (IsmpcSineAction._map_twist -> ismpc_walking::set_rl_ref_vel,
+  effective only while the controller-side rlVelocityControl toggle is on
+  -- see that action's module docstring). This observation remains useful
+  independent of that: it is the *target* the target_linear_vel/
+  target_angular_vel reward terms measure tracking against, and -- when
+  rlVelocityControl happens to be off, or during the settle window right
+  after reset before the twist action has taken effect -- it still explains
+  part of what shows up in base_lin_vel and is plausibly informative for
+  what CoM-height sine strategy is safe or appropriate (e.g. a fast
+  commanded walk likely needs different height modulation than
+  near-stationary standing).
   """
   return env.command_manager.get_command(command_name)
 

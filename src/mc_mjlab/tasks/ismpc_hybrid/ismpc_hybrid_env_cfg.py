@@ -28,7 +28,7 @@ from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 400
+NUM_ENVS = 700
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 8.0
@@ -125,6 +125,12 @@ def _make_env_cfg(
     "last_step_timing_action": ObservationTermCfg(
       func=ismpc_mdp.last_step_timing_action, params={"action_name": "ismpc_sine"}
     ),
+    "last_twist_action": ObservationTermCfg(
+      func=ismpc_mdp.last_twist_action, params={"action_name": "ismpc_sine"}
+    ),
+    "last_user_ref_vel": ObservationTermCfg(
+      func=ismpc_mdp.last_user_ref_vel, params={"action_name": "ismpc_sine"}
+    ),
     "ismpc_wants_stop": ObservationTermCfg(
       func=ismpc_mdp.ismpc_wants_stop, params={"action_name": "ismpc_sine"}
     ),
@@ -152,7 +158,7 @@ def _make_env_cfg(
     #   weight=1.0),
     "sine_position_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_position_continuity,
-      weight=1.0,
+      weight=0.1,
       params={"action_name": "ismpc_sine", "sigma" : 0.003},
     ),
     "sine_velocity_continuity": RewardTermCfg(
@@ -162,16 +168,18 @@ def _make_env_cfg(
     ),
     "joint_torque": RewardTermCfg(
       func=ismpc_mdp.joint_torque_reward, 
-      weight=1.0
+      weight=3.0,
+      params={"sigma": 150},
+
     ),
     "target_linear_vel": RewardTermCfg(
         func=ismpc_mdp.target_linear_vel,
-        weight=2.0,
+        weight=3.0,
         params={"command_name": "twist", "std": 0.1},
     ),
     "target_angular_vel": RewardTermCfg(
         func=ismpc_mdp.target_angular_vel,
-        weight=0.5,
+        weight=0.1,
         params={"command_name": "twist", "std": 0.05},
     ),
     # --- Plotting-only, weight=0.0
@@ -189,6 +197,10 @@ def _make_env_cfg(
       func=ismpc_mdp.debug_is_walking,
       weight=0.0,
       params={"action_name": "ismpc_sine"},
+    ),
+    "debug_joint_torque_raw": RewardTermCfg(
+      func=ismpc_mdp.debug_joint_torque_raw,
+      weight=0.0,
     ),
   }
 
@@ -320,7 +332,7 @@ def _make_env_cfg(
 
 def _apply_play_overrides(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
   cfg.scene.num_envs = PLAY_NUM_ENVS
-  for name in ("debug_target_height", "debug_step_timing", "debug_is_walking"):
+  for name in ("debug_target_height", "debug_step_timing", "debug_is_walking", "debug_joint_torque_raw"):
     cfg.rewards[name].weight = 1.0
   return cfg
 
@@ -356,7 +368,7 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       entropy_coef=0.0,
       num_learning_epochs=5,
       num_mini_batches=4,
-      learning_rate=1.0e-3,
+      learning_rate=3.0e-3,
       schedule="adaptive",
       gamma=0.99,
       lam=0.95,

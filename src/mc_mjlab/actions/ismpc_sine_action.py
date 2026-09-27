@@ -1,7 +1,7 @@
 """Learned CoM-height sine parameter action for ISMPC.
 
 This is the native-`mc_rtc_interface` counterpart of the old Cython-bridge
-`ismpc_sine_action.py`. The RL policy's 6 raw actions are mapped into
+`ismpc_sine_action.py`. The RL policy's 9 raw actions are mapped into
 physical ISMPC parameters each slow sine-param tick:
 
   offset            = clip(offset_scale * raw[0] + offset_bias, OFFSET_MIN, OFFSET_MAX)   (m)
@@ -10,13 +10,30 @@ physical ISMPC parameters each slow sine-param tick:
                        against offset so offset - amplitude >= 0 structurally
   walk_gate         = raw[4] > walk_gate_bias                               (bool)
   ts                = clip(ts_scale * raw[5] + ts_bias, TS_MIN, TS_MAX)     (s)
+  twist (vx,vy,w)   = rate_limit(clip(raw[6:9], -1, 1) * twist_scale)       (m/s, m/s, rad/s)
+                       -- see _map_twist/twist_max_delta for the per-axis rate limit
+
+The twist (vx, vy, omega) drives ismpc_walking's footstep reference velocity
+via a new datastore setter (SET_RL_REF_VEL), ONLY when the controller-side
+rlVelocityControl toggle is on (YAML `walking_controller.rl_velocity_control`
+or the "RL Reference Velocity" GUI checkbox in Walking_controller -- this
+toggle is NOT exposed to or writable from Python; see
+Walking_controller.h/.cpp). When that toggle is off, this class's writes to
+SET_RL_REF_VEL are harmless but inert: the controller's own mux
+(Walking_controller::updateReferenceVelocity()) ignores rl_reference_velocity
+and follows user_reference_velocity (GUI/joystick) instead. The controller
+also exposes user_reference_velocity read-only via SET_RL_REF_VEL's sibling
+getter (ismpc_walking::get_user_ref_vel, read as a datastore_vectors_outputs
+entry -- see last_user_ref_vel_obs) so the policy can observe human/joystick
+intent as context even while its own twist is the one actually driving the
+planner.
 
 Joint actuation itself is unchanged from the old file: mc_rtc's own q/alpha
 output drives the joints directly. There is no joint-space residual in this
 task -- RL only ever touches the ISMPC parameters, never joint commands.
 
 Subclasses `McRtcActionBase` (not `McRtcResidualActionBase`): this action has
-no residual concept whatsoever -- its action space is a fixed 6, unrelated to
+no residual concept whatsoever -- its action space is a fixed 9, unrelated to
 joint count, and mc_rtc_residual_action.py is neither imported from nor
 modified by this file.
 """
@@ -53,6 +70,14 @@ SET_POLICY_WANTS_WALK = "ismpc_walking::set_policy_wants_walk"
 SET_TS = "ismpc_walking::set_ts"
 GET_WANTS_STOP = "ismpc_walking::wants_stop_d"
 GET_ROBOT_WALKING = "ismpc_walking::robot_walking_d"
+# Vector3d (datastore_vectors_inputs/outputs), unlike the scalars above.
+# set_rl_ref_vel writes Walking_controller::rl_reference_velocity only --
+# inert unless the controller-side rlVelocityControl toggle is on (see the
+# module docstring). get_user_ref_vel reads Walking_controller::
+# user_reference_velocity (GUI/joystick intent), read-only, always live
+# regardless of rlVelocityControl.
+SET_RL_REF_VEL = "ismpc_walking::set_rl_ref_vel"
+GET_USER_REF_VEL = "ismpc_walking::get_user_ref_vel"
 
 
 @dataclass(kw_only=True)
@@ -117,12 +142,30 @@ class IsmpcSineActionCfg(McRtcActionCfg):
   value, so raw_ts=0 (a freshly-initialized policy's typical early output)
   reproduces the fixed-Ts behavior exactly."""
 
+  twist_scale: tuple[float, float, float] = (0.4, 0.1, 0.5)
+  """Per-axis (vx, vy, omega) maximum magnitude the raw twist action maps
+  to. Matches the UniformVelocityCommandCfg ranges already used for the
+  `twist` command in ismpc_hybrid_env_cfg.py (lin_vel_x=(-0.4,0.4),
+  lin_vel_y=(-0.1,0.1), ang_vel_z=(-0.5,0.5)), so the RL-driven reference
+  velocity spans the same range the target_linear_vel/target_angular_vel
+  reward terms already track against."""
+
+  twist_max_delta: tuple[float, float, float] = (0.1, 0.025, 0.125)
+  """Per-slow-tick (sine_param_frequency_hz cadence) rate limit on the
+  commanded twist, per axis. UNVALIDATED starting guess (roughly a quarter
+  of twist_scale per tick) -- tune once step-timing/QP-failure statistics
+  are visible during training. Too loose risks reproducing the "stale/
+  inconsistent velocity causes large QP breaks" failure mode documented in
+  Walking_controller::reset()'s own comments; too tight limits how quickly
+  the policy can respond to a changing velocity command."""
+
   def build(self, env) -> "IsmpcSineAction":
     return IsmpcSineAction(self, env)
 
 
 class IsmpcSineAction(McRtcActionBase):
-  """Maps a 6-dim raw RL action to ISMPC CoM-height sine + walk-gate + Ts.
+  """Maps a 9-dim raw RL action to ISMPC CoM-height sine + walk-gate + Ts +
+  twist (reference velocity).
 
   Subclasses `McRtcActionBase` directly, not `McRtcResidualActionBase`: no
   residual authority/gating/projection/printer concept applies -- the action
@@ -149,6 +192,15 @@ class IsmpcSineAction(McRtcActionBase):
     cfg.datastore_scalar_outputs = tuple(
       dict.fromkeys((*cfg.datastore_scalar_outputs, GET_WANTS_STOP, GET_ROBOT_WALKING))
     )
+    # Vector3d counterparts of the above, same declare-before-super() pattern
+    # and same (num_envs, 3)-shaped transport (set_datastore_vector_input /
+    # datastore_vector_output -- see mc_rtc_action_base.py).
+    cfg.datastore_vectors_inputs = tuple(
+      dict.fromkeys((*cfg.datastore_vectors_inputs, SET_RL_REF_VEL))
+    )
+    cfg.datastore_vectors_outputs = tuple(
+      dict.fromkeys((*cfg.datastore_vectors_outputs, GET_USER_REF_VEL))
+    )
 
     # `BaseAction.__init__` (via McRtcActionBase's own super().__init__())
     # resolves `_entity`/`_target_ids`/`_target_names` from `cfg.actuator_names`
@@ -160,17 +212,20 @@ class IsmpcSineAction(McRtcActionBase):
     # _raw_actions, _processed_actions, _scale, _offset, _clip off the
     # matched actuator count (len(target_ids)), since that's the only shape
     # BaseActionCfg's own fields (scale/offset/clip) know about. None of that
-    # has any meaning for this action's fixed 6-dim space, so _action_dim/
+    # has any meaning for this action's fixed 9-dim space, so _action_dim/
     # _raw_actions/_processed_actions are unconditionally replaced right
     # below, and _scale/_offset/_clip are simply never read anywhere in this
     # class (cfg.scale/cfg.offset/cfg.clip are left at BaseActionCfg's inert
     # defaults of 1.0/0.0/None and should not be set by task configs using
     # this action -- there is no affine mapping here, only the explicit
-    # _map_to_physical/_map_walk_gate/_map_step_timing methods below).
+    # _map_to_physical/_map_walk_gate/_map_step_timing/_map_twist methods
+    # below).
     super().__init__(cfg, env)
 
-    self._action_dim = 6
-    self._raw_actions = torch.zeros(self.num_envs, 6, device=self.device)
+    # Action dim 6 -> 9: +3 for the twist (vx, vy, omega). Old 6-dim
+    # checkpoints will not load against this -- accepted, per-plan.
+    self._action_dim = 9
+    self._raw_actions = torch.zeros(self.num_envs, 9, device=self.device)
     self._processed_actions = torch.zeros_like(self._raw_actions)
 
     # Sine-param update cadence, in units of controller-dispatch ticks (not
@@ -210,11 +265,17 @@ class IsmpcSineAction(McRtcActionBase):
     # --- Step timing (Ts). ---
     self._ts_curr = torch.full((self.num_envs,), TS_DEFAULT, device=self.device)
 
+    # --- Twist (reference velocity: vx, vy, omega). ---
+    # Defaults to zero -- matches Walking_controller::reset()'s own
+    # rl_reference_velocity.setZero(). Rate-limited toward the mapped target
+    # in _advance_sine_period via cfg.twist_max_delta.
+    self._twist_curr = torch.zeros(self.num_envs, 3, device=self.device)
+
   # ---- Required ActionTerm properties/methods. ----
 
   @property
   def action_dim(self) -> int:
-    return 6
+    return 9
 
   @property
   def raw_action(self) -> torch.Tensor:
@@ -222,8 +283,9 @@ class IsmpcSineAction(McRtcActionBase):
 
   def process_actions(self, actions: torch.Tensor) -> None:
     """Store this period's raw policy output; no scale/offset/clip here --
-    the six physical mappings happen in apply_actions/the slow-cadence
-    block, same split the old Cython-bridge file used."""
+    the seven physical mappings (sine x4, walk gate, Ts, twist) happen in
+    apply_actions/the slow-cadence block, same split the old Cython-bridge
+    file used."""
     self._raw_actions[:] = actions
     self._processed_actions[:] = actions
 
@@ -280,6 +342,21 @@ class IsmpcSineAction(McRtcActionBase):
       max=TS_MAX,
     )
 
+  def _map_twist(self, raw: torch.Tensor) -> torch.Tensor:
+    """Last 3 of the 9-wide raw action -> physical (vx, vy, omega), m/s and
+    rad/s.
+
+    Simple clamp-and-scale (not tanh): keeps raw=0 mapping exactly to
+    physical=0, matching the convention used by _map_step_timing, so a
+    freshly-initialized policy's near-zero output reproduces "no commanded
+    motion" rather than some arbitrary offset. Rate limiting toward this
+    target happens separately in _advance_sine_period (cfg.twist_max_delta)
+    -- this method only computes the instantaneous target, not the
+    rate-limited value actually written to the datastore.
+    """
+    scale = torch.tensor(self.cfg.twist_scale, device=raw.device, dtype=raw.dtype)
+    return torch.clamp(raw, -1.0, 1.0) * scale
+
   # ---- Accessors for observation/reward terms (ismpc_mdp.py). ----
 
   @property
@@ -305,6 +382,26 @@ class IsmpcSineAction(McRtcActionBase):
   def last_step_timing_action(self) -> torch.Tensor:
     """The policy's current step-timing (Ts) command, (num_envs, 1), seconds."""
     return self._ts_curr.unsqueeze(-1)
+
+  @property
+  def last_twist_action(self) -> torch.Tensor:
+    """The policy's current (vx, vy, omega) twist command, (num_envs, 3),
+    m/s and rad/s -- the rate-limited value actually written to
+    SET_RL_REF_VEL this period, not the raw per-tick target."""
+    return self._twist_curr
+
+  @property
+  def last_user_ref_vel_obs(self) -> torch.Tensor:
+    """Human/joystick reference-velocity intent (vx, vy, omega),
+    (num_envs, 3), read live from Walking_controller::user_reference_velocity
+    via the GET_USER_REF_VEL datastore output. Populated every control
+    period by the base's generic datastore-output collection
+    (McRtcActionBase._collect_controller_output), same mechanism as
+    ismpc_wants_stop_obs/is_walking_obs below -- always live regardless of
+    whether the controller-side rlVelocityControl toggle is on, so the
+    policy can condition on human intent as context even while its own
+    twist (last_twist_action) is the one actually driving the planner."""
+    return self.datastore_vector_output(GET_USER_REF_VEL)
 
   @property
   def target_height_obs(self) -> torch.Tensor:
@@ -392,6 +489,9 @@ class IsmpcSineAction(McRtcActionBase):
     # must snap back to the same defaults the controller itself resets to.
     self._ts_curr[rows] = TS_DEFAULT
     self._walk_enabled[rows] = False
+    # Same reasoning, extended to the twist: matches
+    # Walking_controller::reset()'s rl_reference_velocity.setZero().
+    self._twist_curr[rows] = 0.0
 
     # So the very next control period is treated as "due" for a sine
     # update, same as the old Cython-bridge file's own convention.
@@ -468,6 +568,21 @@ class IsmpcSineAction(McRtcActionBase):
         self._ts_curr,
       )
 
+      # Twist: same cadence, but additionally rate-limited (unlike offset/
+      # frequency/sin_amp/cos_amp/Ts, which snap directly to their mapped
+      # target every due tick) -- see cfg.twist_max_delta's docstring for
+      # why. due_for_sine_update is (num_envs,); unsqueeze to broadcast
+      # against the (num_envs, 3) twist tensors.
+      target_twist = self._map_twist(self._processed_actions[:, 6:9])
+      max_delta = torch.tensor(
+        self.cfg.twist_max_delta, device=self.device, dtype=target_twist.dtype
+      )
+      delta = torch.clamp(target_twist - self._twist_curr, -max_delta, max_delta)
+      rate_limited_twist = self._twist_curr + delta
+      self._twist_curr = torch.where(
+        due_for_sine_update.unsqueeze(-1), rate_limited_twist, self._twist_curr
+      )
+
     self._dispatch_ticks_since_sine_update = (
       self._dispatch_ticks_since_sine_update + 1
     ) % self._sine_param_period_ticks
@@ -486,3 +601,8 @@ class IsmpcSineAction(McRtcActionBase):
       self._walk_enabled.to(dtype=torch.get_default_dtype()),
     )
     self.set_datastore_scalar_input(SET_TS, self._ts_curr)
+    # Vector3d counterpart of the scalar writes above -- same unconditional
+    # every-period contract (datastore_vectors_inputs, not just
+    # datastore_scalar_inputs). Inert on the controller side whenever
+    # rlVelocityControl is off; see the module docstring.
+    self.set_datastore_vector_input(SET_RL_REF_VEL, self._twist_curr)
