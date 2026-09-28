@@ -159,21 +159,123 @@ def last_user_ref_vel(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   return action_term.last_user_ref_vel_obs
 
 
-def target_linear_vel(
+# def target_linear_vel(
+#     env: ManagerBasedRlEnv,
+#     command_name: str,
+#     std: float = 0.5,
+#     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+# ) -> torch.Tensor:
+#     """Reward tracking of linear velocity commands (xy axes) using exponential kernel."""
+#     asset = env.scene[asset_cfg.name]
+#     command = env.command_manager.get_command(command_name)
+#     lin_vel_error = torch.sum(
+#         torch.square(command[:, :2] - asset.data.root_link_lin_vel_b[:, :2]), dim=1
+#     )
+#     return torch.exp(-lin_vel_error / std**2)
+
+
+class target_vel_window:
+  """Boxcar-window velocity tracking for ONE axis (x or y).
+
+  Averages the achieved root-link body-frame velocity on `axis` over the
+  last window_s seconds and rewards it matching the command on that axis:
+  exp(-(command - avg)^2 / std^2). Instantiate once per axis (two
+  RewardTermCfg entries) so each axis gets its own std and weight.
+
+  ASSUMED, not verified: the reward manager constructs a class passed as
+  `func` as cls(cfg, env), reading axis from cfg.params. It does for the
+  event terms (settle_gated_apply_body_impulse). If it errors at startup,
+  tell me and I'll switch to a plain function with state stored on env.
+  """
+
+  def __init__(self, cfg, env: ManagerBasedRlEnv):
+    self._axis = int(cfg.params["axis"])
+    self._angular = bool(cfg.params.get("angular", False))
+    self._buf = None  # allocated on first call (needs window_s)
+    self._idx = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    self._count = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    self._rows = torch.arange(env.num_envs, device=env.device)
+
+  def __call__(
+    self,
     env: ManagerBasedRlEnv,
     command_name: str,
-    std: float = 0.5,
+    axis: int,
+    std: float = 0.05,
+    window_s: float = 1.1,
+    angular: bool = False, 
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """Reward tracking of linear velocity commands (xy axes) using exponential kernel."""
+  ) -> torch.Tensor:
+    del axis  # consumed in __init__ via cfg.params
+    asset = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)[:, self._axis]
+    vel = (
+      asset.data.root_link_ang_vel_b[:, 2]
+      if self._angular
+      else asset.data.root_link_lin_vel_b[:, self._axis]
+    )
+
+    if self._buf is None:
+      n = max(1, round(window_s / env.step_dt))
+      self._buf = torch.zeros(env.num_envs, n, device=env.device)
+    n = self._buf.shape[1]
+
+    fresh = env.episode_length_buf <= 1
+    self._idx = torch.where(fresh, torch.zeros_like(self._idx), self._idx)
+    self._count = torch.where(fresh, torch.zeros_like(self._count), self._count)
+
+    self._buf[self._rows, self._idx] = vel
+    self._idx = (self._idx + 1) % n
+    self._count = torch.clamp(self._count + 1, max=n)
+
+    slot = torch.arange(n, device=env.device).unsqueeze(0)
+    valid = slot < self._count.unsqueeze(-1)
+    avg = (self._buf * valid).sum(dim=1) / self._count
+
+    return torch.exp(-torch.square(cmd - avg) / std**2)
+class target_linear_vel_avg:
+  """Windowed-average version of target_linear_vel.
+
+  Compares the COMMAND against an exponential moving average of the
+  achieved root-link body-frame linear velocity (time constant window_s,
+  default 1.2 s ~ one gait cycle), instead of the instantaneous velocity.
+  Rationale: ISMPC's CoM velocity oscillates within each step, so an
+  instantaneous kernel can never reach ~1 even for a perfect gait.
+
+  Stateful callable class (same pattern as settle_gated_apply_body_impulse):
+  the manager constructs it with (cfg, env) and then calls it each step.
+  ASSUMED, not verified against mjlab's reward manager: that a class passed
+  as `func` is instantiated this way for reward terms too. It is for event
+  terms (your settle_gated_apply_body_impulse works), but rewards may
+  differ. If it errors at startup, tell me and I'll convert it to a plain
+  function with the state stored on `env`.
+  """
+
+  def __init__(self, cfg, env: ManagerBasedRlEnv):
+    self._avg = torch.zeros(env.num_envs, 2, device=env.device)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    std: float = 0.3,
+    window_s: float = 1.2,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+  ) -> torch.Tensor:
     asset = env.scene[asset_cfg.name]
     command = env.command_manager.get_command(command_name)
-    lin_vel_error = torch.sum(
-        torch.square(command[:, :2] - asset.data.root_link_lin_vel_b[:, :2]), dim=1
-    )
-    print(command[:, :2])
-    return torch.exp(-lin_vel_error / std**2)
+    vel = asset.data.root_link_lin_vel_b[:, :2]
 
+    # First step(s) of an episode: seed the average with the current
+    # velocity so no state carries over from the previous episode.
+    fresh = (env.episode_length_buf <= 1).unsqueeze(-1)
+    self._avg = torch.where(fresh, vel, self._avg)
+
+    alpha = min(1.0, env.step_dt / window_s)
+    self._avg = (1.0 - alpha) * self._avg + alpha * vel
+
+    err = torch.sum(torch.square(command[:, :2] - self._avg), dim=1)
+    return torch.exp(-err / std**2)
 
 def target_angular_vel(
     env: ManagerBasedRlEnv,
@@ -186,6 +288,33 @@ def target_angular_vel(
     command = env.command_manager.get_command(command_name)
     ang_vel_error = torch.square(command[:, 2] - asset.data.root_link_ang_vel_b[:, 2])
     return torch.exp(-ang_vel_error / std**2)
+
+def debug_target_omega(
+  env: ManagerBasedRlEnv, command_name: str = "twist"
+) -> torch.Tensor:
+  """PLOTTING ONLY (weight=0.0) -- commanded yaw rate (rad/s), column 2 of
+  the `twist` command. Raw input the policy observes; see
+  debug_target_vel_x."""
+  return env.command_manager.get_command(command_name)[:, 2]
+
+
+def debug_output_omega(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """PLOTTING ONLY (weight=0.0) -- the POLICY's own commanded yaw rate
+  (rad/s), rate-limited and mapped to physical units. Column 2 of
+  action_term.last_twist_action; see debug_output_vel_x."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.last_twist_action[:, 2]
+
+
+def debug_base_omega(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  """PLOTTING ONLY (weight=0.0) -- ACHIEVED root-link yaw rate (rad/s), body
+  frame. Same quantity target_angular_vel compares against the command
+  (root_link_ang_vel_b[:, 2]). Root link, not true CoM/heading."""
+  asset = env.scene[asset_cfg.name]
+  return asset.data.root_link_ang_vel_b[:, 2]
 
 
 def last_walk_action(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
@@ -349,7 +478,7 @@ def _resolve_lower_body_joint_ids(env: ManagerBasedRlEnv, asset_cfg: SceneEntity
 
 def joint_torque_reward(
   env: ManagerBasedRlEnv,
-  sigma: float = 200,
+  sigma: float = 100,
   asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=LOWER_BODY_JOINT_NAMES),
 ) -> torch.Tensor:
   """Gaussian-kernel reward for low joint effort: exp(-sum(tau^2) / (2*sigma^2)),
@@ -480,6 +609,74 @@ def debug_is_walking(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   legitimately disagree."""
   action_term = env.action_manager.get_term(action_name)
   return action_term.is_walking_obs.squeeze(-1)
+
+
+def debug_target_vel_x(
+  env: ManagerBasedRlEnv, command_name: str = "twist"
+) -> torch.Tensor:
+  """PLOTTING ONLY (weight=0.0) -- commanded reference velocity, x
+  component (m/s), for the play viewer's native plot panel. This is the
+  RAW INPUT the policy receives as an observation (target_twist / the
+  `twist` command sampled by UniformVelocityCommandCfg), not anything the
+  policy itself produced -- plotted alongside debug_output_vel_x so the two
+  can be visually compared to check both that the command is actually
+  reaching the robot/policy, and that the policy is learning to track it."""
+  return env.command_manager.get_command(command_name)[:, 0]
+
+
+def debug_target_vel_y(
+  env: ManagerBasedRlEnv, command_name: str = "twist"
+) -> torch.Tensor:
+  """PLOTTING ONLY (weight=0.0) -- commanded reference velocity, y
+  component (m/s). See debug_target_vel_x's docstring; same source
+  (env.command_manager.get_command), just column 1 instead of column 0."""
+  return env.command_manager.get_command(command_name)[:, 1]
+
+
+def debug_output_vel_x(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """PLOTTING ONLY (weight=0.0) -- the POLICY's own commanded twist, x
+  component (m/s), after mapping to physical units. Reads
+  action_term.last_twist_action (IsmpcSineAction._map_twist's output) --
+  the same rate-limited, already-physical value actually written to
+  ismpc_walking::set_rl_ref_vel this period, NOT the raw pre-mapping
+  action. Compare against debug_target_vel_x: if rlVelocityControl is on
+  and the policy has learned to track the command, these two should
+  converge; if they diverge, either the command isn't reaching the policy
+  as an observation, or the policy hasn't learned to track it yet -- this
+  pair of plots is what distinguishes those two failure modes visually."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.last_twist_action[:, 0]
+
+
+def debug_output_vel_y(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """PLOTTING ONLY (weight=0.0) -- the POLICY's own commanded twist, y
+  component (m/s), after mapping to physical units. See
+  debug_output_vel_x's docstring; same source
+  (action_term.last_twist_action), just column 1 instead of column 0."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.last_twist_action[:, 1]
+
+def debug_base_vel_x(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  """PLOTTING ONLY (weight=0.0) -- ACHIEVED root-link linear velocity, x
+  component (m/s), in the body frame. Same quantity target_linear_vel
+  compares against the command (root_link_lin_vel_b), so this is directly
+  comparable to debug_target_vel_x / debug_output_vel_x. Root link, not
+  true CoM."""
+  asset = env.scene[asset_cfg.name]
+  return asset.data.root_link_lin_vel_b[:, 0]
+
+
+def debug_base_vel_y(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  """PLOTTING ONLY (weight=0.0) -- achieved root-link linear velocity, y
+  component (m/s), body frame. See debug_base_vel_x."""
+  asset = env.scene[asset_cfg.name]
+  return asset.data.root_link_lin_vel_b[:, 1]
 
 
 class settle_gated_apply_body_impulse:

@@ -147,15 +147,32 @@ def _make_env_cfg(
   rewards = {
     "is_alive": RewardTermCfg(
       func=ismpc_mdp.is_alive, 
-      weight=6.0),
+      weight=1.0),
     "not_walking_penalty": RewardTermCfg(
       func=ismpc_mdp.not_walking_penalty, 
-      weight=-2.0, 
+      weight=-0.5, 
       params={"action_name": "ismpc_sine"}
     ),
-    # "upright": RewardTermCfg(
-    #   func=ismpc_mdp.upright_reward, 
-    #   weight=1.0),
+    "joint_torque": RewardTermCfg(
+      func=ismpc_mdp.joint_torque_reward, 
+      weight=2.0,
+      params={"sigma": 100},
+    ),
+    "target_vel_x": RewardTermCfg(
+        func=ismpc_mdp.target_vel_window,
+        weight=4.0,
+        params={"command_name": "twist", "axis": 0, "std": 0.05, "window_s": 1.1},
+    ),
+    "target_vel_y": RewardTermCfg(
+        func=ismpc_mdp.target_vel_window,
+        weight=0.1,
+        params={"command_name": "twist", "axis": 1, "std": 0.05, "window_s": 1.1},
+    ),
+    "target_omega": RewardTermCfg(
+        func=ismpc_mdp.target_vel_window,
+        weight=1.0,
+        params={"command_name": "twist", "axis": 2, "angular": True, "std": 0.07, "window_s": 1.1},
+    ),
     "sine_position_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_position_continuity,
       weight=0.1,
@@ -163,24 +180,8 @@ def _make_env_cfg(
     ),
     "sine_velocity_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_velocity_continuity,
-      weight=0.1,
+      weight=0.0,
       params={"action_name": "ismpc_sine"},
-    ),
-    "joint_torque": RewardTermCfg(
-      func=ismpc_mdp.joint_torque_reward, 
-      weight=3.0,
-      params={"sigma": 150},
-
-    ),
-    "target_linear_vel": RewardTermCfg(
-        func=ismpc_mdp.target_linear_vel,
-        weight=3.0,
-        params={"command_name": "twist", "std": 0.1},
-    ),
-    "target_angular_vel": RewardTermCfg(
-        func=ismpc_mdp.target_angular_vel,
-        weight=0.1,
-        params={"command_name": "twist", "std": 0.05},
     ),
     # --- Plotting-only, weight=0.0
     "debug_target_height": RewardTermCfg(
@@ -200,6 +201,48 @@ def _make_env_cfg(
     ),
     "debug_joint_torque_raw": RewardTermCfg(
       func=ismpc_mdp.debug_joint_torque_raw,
+      weight=0.0,
+    ),
+    "debug_target_vel_x": RewardTermCfg(
+      func=ismpc_mdp.debug_target_vel_x,
+      weight=0.0,
+      params={"command_name": "twist"},
+    ),
+    "debug_output_vel_x": RewardTermCfg(
+      func=ismpc_mdp.debug_output_vel_x,
+      weight=0.0,
+      params={"action_name": "ismpc_sine"},
+    ),
+    "debug_base_vel_x": RewardTermCfg(
+      func=ismpc_mdp.debug_base_vel_x,
+      weight=0.0,
+    ),
+    "debug_target_vel_y": RewardTermCfg(
+      func=ismpc_mdp.debug_target_vel_y,
+      weight=0.0,
+      params={"command_name": "twist"},
+    ),
+    "debug_output_vel_y": RewardTermCfg(
+      func=ismpc_mdp.debug_output_vel_y,
+      weight=0.0,
+      params={"action_name": "ismpc_sine"},
+    ),
+    "debug_base_vel_y": RewardTermCfg(
+      func=ismpc_mdp.debug_base_vel_y,
+      weight=0.0,
+    ),
+    "debug_target_omega": RewardTermCfg(
+      func=ismpc_mdp.debug_target_omega,
+      weight=0.0,
+      params={"command_name": "twist"},
+    ),
+    "debug_output_omega": RewardTermCfg(
+      func=ismpc_mdp.debug_output_omega,
+      weight=0.0,
+      params={"action_name": "ismpc_sine"},
+    ),
+    "debug_base_omega": RewardTermCfg(
+      func=ismpc_mdp.debug_base_omega,
       weight=0.0,
     ),
   }
@@ -294,9 +337,9 @@ def _make_env_cfg(
       entity_name="robot",
       resampling_time_range=(EPISODE_LENGTH_S, EPISODE_LENGTH_S),
       ranges=UniformVelocityCommandCfg.Ranges(
-        lin_vel_x=(-0.4, 0.4),
+        lin_vel_x=(-0.5, 0.5),
         lin_vel_y=(-0.1, 0.1),
-        ang_vel_z=(-0.5, 0.5),
+        ang_vel_z=(-0.2, 0.2),
       ),
     ),
   }
@@ -332,7 +375,21 @@ def _make_env_cfg(
 
 def _apply_play_overrides(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
   cfg.scene.num_envs = PLAY_NUM_ENVS
-  for name in ("debug_target_height", "debug_step_timing", "debug_is_walking", "debug_joint_torque_raw"):
+  for name in (
+    "debug_target_height",
+    "debug_step_timing",
+    "debug_is_walking",
+    "debug_joint_torque_raw",
+    "debug_target_vel_x",
+    "debug_output_vel_x",
+    "debug_base_vel_x",
+    "debug_target_vel_y",
+    "debug_output_vel_y",
+    "debug_base_vel_y",
+    "debug_target_omega",
+    "debug_output_omega",
+    "debug_base_omega",
+  ):
     cfg.rewards[name].weight = 1.0
   return cfg
 
@@ -341,6 +398,7 @@ def ismpc_hybrid_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg = _make_env_cfg(console_output="all" if play else "none")
   if play:
     _apply_play_overrides(cfg)
+  cfg.rewards = {k: v for k, v in cfg.rewards.items() if v.weight != 0.0}
   return cfg
 
 
@@ -352,7 +410,7 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       obs_normalization=True,
       distribution_cfg={
         "class_name": "GaussianDistribution",
-        "init_std": 0.4,
+        "init_std": 0.2,
         "std_type": "scalar",
       },
     ),
@@ -368,7 +426,7 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       entropy_coef=0.0,
       num_learning_epochs=5,
       num_mini_batches=4,
-      learning_rate=3.0e-3,
+      learning_rate=1.0e-3,
       schedule="adaptive",
       gamma=0.99,
       lam=0.95,

@@ -142,22 +142,25 @@ class IsmpcSineActionCfg(McRtcActionCfg):
   value, so raw_ts=0 (a freshly-initialized policy's typical early output)
   reproduces the fixed-Ts behavior exactly."""
 
-  twist_scale: tuple[float, float, float] = (0.4, 0.1, 0.5)
-  """Per-axis (vx, vy, omega) maximum magnitude the raw twist action maps
-  to. Matches the UniformVelocityCommandCfg ranges already used for the
-  `twist` command in ismpc_hybrid_env_cfg.py (lin_vel_x=(-0.4,0.4),
-  lin_vel_y=(-0.1,0.1), ang_vel_z=(-0.5,0.5)), so the RL-driven reference
-  velocity spans the same range the target_linear_vel/target_angular_vel
-  reward terms already track against."""
+  twist_scale: tuple[float, float, float] = (0.5, 0.1, 0.2)
+  """Per-axis (vx, vy, omega) magnitude limit of the policy's reference
+  twist: physical = clamp(raw, -1, 1) * twist_scale, in (m/s, m/s, rad/s).
 
-  twist_max_delta: tuple[float, float, float] = (0.1, 0.025, 0.125)
-  """Per-slow-tick (sine_param_frequency_hz cadence) rate limit on the
-  commanded twist, per axis. UNVALIDATED starting guess (roughly a quarter
-  of twist_scale per tick) -- tune once step-timing/QP-failure statistics
-  are visible during training. Too loose risks reproducing the "stale/
-  inconsistent velocity causes large QP breaks" failure mode documented in
-  Walking_controller::reset()'s own comments; too tight limits how quickly
-  the policy can respond to a changing velocity command."""
+  Set to bound the twist the policy can request to (vx ±0.5, vy ±0.1,
+  omega ±0.2). vx and vy match the `twist` command ranges in
+  ismpc_hybrid_env_cfg.py; keep them in sync if either changes. omega's
+  command range is currently (0, 0) there, so its limit only bounds what
+  the policy may request."""
+
+  twist_max_delta: tuple[float, float, float] = (0.3, 0.1, 0.125)
+  """Per-axis rate limit on the commanded twist, in physical units per slow
+  tick (one tick = 1 / sine_param_frequency_hz s, 0.05 s at 20 Hz), so
+  the twist can move by at most this much every 0.05 s.
+
+  Too loose risks large QP breaks from abrupt reference-velocity changes
+  (see Walking_controller::reset()'s comments); too tight slows the
+  policy's response to a changing command. Unvalidated: tune against
+  controller_failed telemetry."""
 
   def build(self, env) -> "IsmpcSineAction":
     return IsmpcSineAction(self, env)
