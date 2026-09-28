@@ -28,7 +28,7 @@ from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 700
+NUM_ENVS = 400
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 8.0
@@ -54,6 +54,15 @@ TERRAIN_NUM_COLS = 1
 TERRAIN_NOISE_RANGE_M = (-0.005, 0.005)
 TERRAIN_PATCH_SIZE_M = (8.0, 8.0)
 
+
+# Curriculum stages. "step" is env.common_step_counter (1 iteration = 512).
+CURRICULUM_STAGES = [
+  {"step": 0,          "lin_vel_x": (-0.15, 0.15), "lin_vel_y": (-0.03, 0.03), "ang_vel_z": (-0.05, 0.05), "push_scale": 0.0},
+  {"step": 250 * 512,  "lin_vel_x": (-0.3, 0.3),   "lin_vel_y": (-0.06, 0.06),   "ang_vel_z": (-0.1, 0.1),   "push_scale": 0.0},
+  {"step": 500 * 512,  "lin_vel_x": (-0.3, 0.3),   "lin_vel_y": (-0.06, 0.06),   "ang_vel_z": (-0.1, 0.1),   "push_scale": 0.5},
+  {"step": 750 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
+]
+PLAY_CURRICULUM_STAGE = 3  # last stage: full task. Change to inspect another.
 
 def _make_terrain_cfg() -> TerrainEntityCfg:
   """Build the scene's TerrainEntityCfg, gated on ENABLE_UNEVEN_TERRAIN.
@@ -391,6 +400,7 @@ def _apply_play_overrides(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
     "debug_base_omega",
   ):
     cfg.rewards[name].weight = 1.0
+    cfg.curriculum["stages"].params["fixed_stage"] = PLAY_CURRICULUM_STAGE
   return cfg
 
 

@@ -159,21 +159,6 @@ def last_user_ref_vel(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   return action_term.last_user_ref_vel_obs
 
 
-# def target_linear_vel(
-#     env: ManagerBasedRlEnv,
-#     command_name: str,
-#     std: float = 0.5,
-#     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-# ) -> torch.Tensor:
-#     """Reward tracking of linear velocity commands (xy axes) using exponential kernel."""
-#     asset = env.scene[asset_cfg.name]
-#     command = env.command_manager.get_command(command_name)
-#     lin_vel_error = torch.sum(
-#         torch.square(command[:, :2] - asset.data.root_link_lin_vel_b[:, :2]), dim=1
-#     )
-#     return torch.exp(-lin_vel_error / std**2)
-
-
 class target_vel_window:
   """Boxcar-window velocity tracking for ONE axis (x or y).
 
@@ -761,3 +746,64 @@ class settle_gated_apply_body_impulse:
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     if hasattr(self._inner, "reset"):
       self._inner.reset(env_ids)
+
+class stage_curriculum:
+  """Staged curriculum over command ranges and push force.
+
+  Each stage is a dict:
+    {"step": int,                      # env steps (env.common_step_counter) at which it starts
+     "lin_vel_x": (lo, hi), "lin_vel_y": (lo, hi), "ang_vel_z": (lo, hi),
+     "push_scale": float}              # multiplier on the base force ranges
+  The active stage is the last one whose "step" <= common_step_counter,
+  unless params["fixed_stage"] is not None, in which case that index is
+  forced (used by play to pin a stage).
+
+  Mutates live cfgs each call, like mjlab's reward_curriculum:
+    * command ranges: env.command_manager.get_term(command_name).cfg.ranges
+    * push force: the event terms' params["force_range"]
+  ASSUMED, not verified: get_term(...).cfg.ranges is the live object the
+  command sampler reads on resample (mjlab's own commands_vel presumably
+  does this, but I haven't read its source), and that Ranges is mutable.
+  Ranges only take effect at the NEXT command resample (once per episode,
+  resampling_time_range = EPISODE_LENGTH_S), so a stage change reaches
+  each env at its next reset, not instantly.
+  """
+
+  def __init__(self, cfg, env: ManagerBasedRlEnv):
+    p = cfg.params
+    self._stages = p["stages"]
+    self._fixed = p.get("fixed_stage")
+    self._cmd_cfg = env.command_manager.get_term(p["command_name"]).cfg
+    self._push_cfgs = [env.event_manager.get_term_cfg(n) for n in p["push_event_names"]]
+    # Base (full-strength) force ranges, captured once from the cfg.
+    self._base_force = [c.params["force_range"] for c in self._push_cfgs]
+    self._last = None
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    env_ids,
+    command_name: str,
+    push_event_names: list[str],
+    stages: list[dict],
+    fixed_stage: int | None = None,
+  ) -> dict[str, torch.Tensor]:
+    del env_ids, command_name, push_event_names, stages, fixed_stage
+    if self._fixed is not None:
+      idx = int(self._fixed)
+    else:
+      idx = 0
+      for i, s in enumerate(self._stages):
+        if env.common_step_counter >= s["step"]:
+          idx = i
+    if idx != self._last:
+      s = self._stages[idx]
+      r = self._cmd_cfg.ranges
+      r.lin_vel_x = s["lin_vel_x"]
+      r.lin_vel_y = s["lin_vel_y"]
+      r.ang_vel_z = s["ang_vel_z"]
+      k = float(s["push_scale"])
+      for c, (lo, hi) in zip(self._push_cfgs, self._base_force):
+        c.params["force_range"] = (lo * k, hi * k)
+      self._last = idx
+    return {"stage": torch.tensor(float(idx))}
