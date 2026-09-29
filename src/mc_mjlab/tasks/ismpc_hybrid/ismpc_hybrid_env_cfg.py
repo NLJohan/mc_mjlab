@@ -15,6 +15,7 @@ from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationT
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.rl import RslRlModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 from mjlab.scene import SceneCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
@@ -58,11 +59,26 @@ TERRAIN_PATCH_SIZE_M = (8.0, 8.0)
 # Curriculum stages. "step" is env.common_step_counter (1 iteration = 512).
 CURRICULUM_STAGES = [
   {"step": 0,          "lin_vel_x": (-0.15, 0.15), "lin_vel_y": (-0.03, 0.03), "ang_vel_z": (-0.05, 0.05), "push_scale": 0.0},
-  {"step": 250 * 512,  "lin_vel_x": (-0.3, 0.3),   "lin_vel_y": (-0.06, 0.06),   "ang_vel_z": (-0.1, 0.1),   "push_scale": 0.0},
-  {"step": 500 * 512,  "lin_vel_x": (-0.3, 0.3),   "lin_vel_y": (-0.06, 0.06),   "ang_vel_z": (-0.1, 0.1),   "push_scale": 0.5},
-  {"step": 750 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
+  {"step": 200 * 512,  "lin_vel_x": (-0.3, 0.3),   "lin_vel_y": (-0.06, 0.06),   "ang_vel_z": (-0.1, 0.1),   "push_scale": 0.0},
+  {"step": 400 * 512,  "lin_vel_x": (-0.3, 0.3),   "lin_vel_y": (-0.06, 0.06),   "ang_vel_z": (-0.1, 0.1),   "push_scale": 0.5},
+  {"step": 600 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
+  {"step": 800 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
 ]
-PLAY_CURRICULUM_STAGE = 3  # last stage: full task. Change to inspect another.
+PLAY_CURRICULUM_STAGE = 4
+
+# Tutor reward (twist_tutor) weight decay. Boundaries match CURRICULUM_STAGES
+# (iterations); each factor multiplies the reward's base weight below.
+TUTOR_STAGE_ITERS = (0, 200, 400, 600, 800)
+TUTOR_WEIGHT_FACTORS = (1.0, 0.75, 0.5, 0.25, 0.1)
+
+
+def _tutor_weight_stages(base: float) -> list[dict]:
+  """reward_curriculum stages: 1 iteration = 512 env steps."""
+  return [
+    {"step": it * 512, "weight": base * f}
+    for it, f in zip(TUTOR_STAGE_ITERS, TUTOR_WEIGHT_FACTORS)
+  ]
+
 
 def _make_terrain_cfg() -> TerrainEntityCfg:
   """Build the scene's TerrainEntityCfg, gated on ENABLE_UNEVEN_TERRAIN.
@@ -116,6 +132,9 @@ def _make_env_cfg(
       num_workers=num_workers,
       pd_gains_path=str(robot.pd_gains_path),
       console_output=console_output,
+      # raw +/-1 -> Ts in [0.4, 1.8] s (was 0.35 -> [0.75, 1.45]); at the old
+      # value the policy could not reach the low Ts that high speeds need.
+      ts_scale=0.7,
     )
   }
 
@@ -182,10 +201,27 @@ def _make_env_cfg(
         weight=1.0,
         params={"command_name": "twist", "axis": 2, "angular": True, "std": 0.07, "window_s": 1.1},
     ),
+    # --- Tutor terms: dense guidance on the policy's own twist output; base
+    # weights decay via the tutor_* curriculum entries below.
+    "tutor_vel_x": RewardTermCfg(
+      func=ismpc_mdp.twist_tutor,
+      weight=1.0,
+      params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 0, "std": 0.15},
+    ),
+    "tutor_vel_y": RewardTermCfg(
+      func=ismpc_mdp.twist_tutor,
+      weight=0.1,
+      params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 1, "std": 0.05},
+    ),
+    "tutor_omega": RewardTermCfg(
+      func=ismpc_mdp.twist_tutor,
+      weight=0.3,
+      params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 2, "std": 0.07},
+    ),
     "sine_position_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_position_continuity,
-      weight=0.1,
-      params={"action_name": "ismpc_sine", "sigma" : 0.003},
+      weight=1.0,
+      params={"action_name": "ismpc_sine", "sigma" : 0.01},
     ),
     "sine_velocity_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_velocity_continuity,
@@ -197,6 +233,10 @@ def _make_env_cfg(
       func=ismpc_mdp.debug_target_height,
       weight=0.0,
       params={"action_name": "ismpc_sine"},
+    ),
+    "debug_base_height": RewardTermCfg(
+      func=ismpc_mdp.debug_base_height,
+      weight=0.0,
     ),
     "debug_step_timing": RewardTermCfg(
       func=ismpc_mdp.debug_step_timing,
@@ -353,6 +393,64 @@ def _make_env_cfg(
     ),
   }
 
+  curriculum = {
+    "stages": CurriculumTermCfg(
+      func=ismpc_mdp.stage_curriculum,
+      params={
+        "command_name": "twist",
+        "push_event_names": ["push_torso", "push_right_hand", "push_left_hand"],
+        "stages": CURRICULUM_STAGES,
+        "fixed_stage": None,
+      },
+    ),
+    "target_vel_x_std": CurriculumTermCfg(
+      func=envs_mdp.reward_curriculum,
+      params={
+        "reward_name": "target_vel_x",
+        "stages": [
+          {"step": 0,          "params": {"std": 0.10}},
+          {"step": 250 * 512,  "params": {"std": 0.10}},
+          {"step": 500 * 512,  "params": {"std": 0.05}},
+        ],
+      },
+    ),
+    "target_vel_y_std": CurriculumTermCfg(
+      func=envs_mdp.reward_curriculum,
+      params={
+        "reward_name": "target_vel_y",
+        "stages": [
+          {"step": 0,          "params": {"std": 0.05}},
+          {"step": 250 * 512,  "params": {"std": 0.05}},
+          {"step": 500 * 512,  "params": {"std": 0.05}},
+        ],
+      },
+    ),
+    "target_omega_std": CurriculumTermCfg(
+      func=envs_mdp.reward_curriculum,
+      params={
+        "reward_name": "target_omega",
+        "stages": [
+          {"step": 0,          "params": {"std": 0.07}},
+          {"step": 250 * 512,  "params": {"std": 0.07}},
+          {"step": 500 * 512,  "params": {"std": 0.07}},
+        ],
+      },
+    ),
+    "tutor_vel_x_weight": CurriculumTermCfg(
+      func=envs_mdp.reward_curriculum,
+      params={"reward_name": "tutor_vel_x", "stages": _tutor_weight_stages(1.0)},
+    ),
+    "tutor_vel_y_weight": CurriculumTermCfg(
+      func=envs_mdp.reward_curriculum,
+      params={"reward_name": "tutor_vel_y", "stages": _tutor_weight_stages(0.1)},
+    ),
+    "tutor_omega_weight": CurriculumTermCfg(
+      func=envs_mdp.reward_curriculum,
+      params={"reward_name": "tutor_omega", "stages": _tutor_weight_stages(0.3)},
+    ),
+  }
+  
+
   return ManagerBasedRlEnvCfg(
     scene=SceneCfg(
       num_envs=num_envs,
@@ -364,6 +462,7 @@ def _make_env_cfg(
     rewards=rewards,
     terminations=terminations,
     events=events,
+    curriculum=curriculum,
     commands=commands,
     decimation=FRAMESKIP,
     episode_length_s=EPISODE_LENGTH_S,
@@ -384,7 +483,7 @@ def _make_env_cfg(
 
 def _apply_play_overrides(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
   cfg.scene.num_envs = PLAY_NUM_ENVS
-  for name in (
+  debug_names = (
     "debug_target_height",
     "debug_step_timing",
     "debug_is_walking",
@@ -398,9 +497,22 @@ def _apply_play_overrides(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
     "debug_target_omega",
     "debug_output_omega",
     "debug_base_omega",
-  ):
+    "debug_base_height",
+  )
+  for name in debug_names:
     cfg.rewards[name].weight = 1.0
-    cfg.curriculum["stages"].params["fixed_stage"] = PLAY_CURRICULUM_STAGE
+  cfg.rewards = {k: v for k, v in cfg.rewards.items() if k in debug_names}
+  # Drop curriculum entries that target a reward no longer present in play
+  # (reward_curriculum's __init__ calls get_term_cfg(reward_name) and raises
+  # if it's missing -- this cfg is built at import time, so a stale entry
+  # here breaks every `uv run` command, not just play).
+  cfg.curriculum = {
+    name: term
+    for name, term in cfg.curriculum.items()
+    if term.params.get("reward_name", None) is None
+    or term.params["reward_name"] in cfg.rewards
+  }
+  cfg.curriculum["stages"].params["fixed_stage"] = PLAY_CURRICULUM_STAGE
   return cfg
 
 
@@ -433,10 +545,10 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       value_loss_coef=1.0,
       use_clipped_value_loss=True,
       clip_param=0.2,
-      entropy_coef=0.0,
+      entropy_coef=0.003,
       num_learning_epochs=5,
       num_mini_batches=4,
-      learning_rate=1.0e-3,
+      learning_rate=3.0e-4,
       schedule="adaptive",
       gamma=0.99,
       lam=0.95,

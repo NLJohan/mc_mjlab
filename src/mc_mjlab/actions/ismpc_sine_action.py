@@ -314,7 +314,12 @@ class IsmpcSineAction(McRtcActionBase):
     sin_amp_raw = raw_sin_amp * self.cfg.amplitude_scale
     cos_amp_raw = raw_cos_amp * self.cfg.amplitude_scale
     radius = torch.sqrt(sin_amp_raw * sin_amp_raw + cos_amp_raw * cos_amp_raw)
-    amplitude_ratio = offset / torch.maximum(radius, offset)
+    # Cap the radius so both offset-radius and offset+radius stay within
+    # [OFFSET_MIN, OFFSET_MAX], not just the trough >= 0 as before.
+    max_radius = torch.minimum(offset - OFFSET_MIN, OFFSET_MAX - offset).clamp(min=0.0)
+    amplitude_ratio = torch.where(
+      radius > max_radius, max_radius / torch.clamp(radius, min=1e-8), torch.ones_like(radius)
+    )
     sin_amp = sin_amp_raw * amplitude_ratio
     cos_amp = cos_amp_raw * amplitude_ratio
 
@@ -413,7 +418,7 @@ class IsmpcSineAction(McRtcActionBase):
     now = self._env.episode_length_buf.to(
       dtype=torch.get_default_dtype()
     ) * self._env.step_dt
-    t_in_period = now - self._period_t0
+    t_in_period = now
     omega = 2.0 * torch.pi * self._physical_curr["frequency"]
     phase = omega * t_in_period
     h = (

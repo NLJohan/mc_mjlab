@@ -218,6 +218,36 @@ class target_vel_window:
     avg = (self._buf * valid).sum(dim=1) / self._count
 
     return torch.exp(-torch.square(cmd - avg) / std**2)
+
+
+def twist_tutor(
+  env: ManagerBasedRlEnv,
+  action_name: str,
+  command_name: str,
+  axis: int,
+  std: float = 0.1,
+) -> torch.Tensor:
+  """Dense guidance ("tutor") term: exp(-(policy twist output - command)^2 / std^2)
+  on one axis (0=vx, 1=vy, 2=omega).
+
+  Reads action_term.last_twist_action -- the physical, rate-limited twist
+  actually written to ismpc_walking::set_rl_ref_vel -- so it rewards the
+  policy's own twist output (raw[6:9]) directly, with no gait lag and no
+  gait ripple, unlike target_vel_window, which scores the ACHIEVED velocity
+  averaged over a window. It is meant to carry a DECAYING weight (see the
+  tutor_* reward_curriculum entries in ismpc_hybrid_env_cfg.py): strong
+  early, to give the network a dense signal linking the target_twist
+  observation to raw[6:9]; weak late, so the policy is free to deviate from
+  the command when that pays off (e.g. to recover from a push). Keep the
+  achieved-velocity terms in the reward: a policy can satisfy this term
+  perfectly while the robot does not actually achieve the velocity.
+  """
+  action_term = env.action_manager.get_term(action_name)
+  out = action_term.last_twist_action[:, axis]
+  cmd = env.command_manager.get_command(command_name)[:, axis]
+  return torch.exp(-torch.square(out - cmd) / std**2)
+
+
 class target_linear_vel_avg:
   """Windowed-average version of target_linear_vel.
 
@@ -575,6 +605,13 @@ def debug_target_height(env: ManagerBasedRlEnv, action_name: str) -> torch.Tenso
   action_term = env.action_manager.get_term(action_name)
   return action_term.target_height_obs.squeeze(-1)
 
+def debug_base_height(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+  ) -> torch.Tensor:
+    """PLOTTING ONLY (weight=0.0) -- achieved root-link height (m)."""
+    asset = env.scene[asset_cfg.name]
+    return asset.data.root_link_pos_w[:, 2]
 
 def debug_step_timing(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   """PLOTTING ONLY (weight=0.0) -- current commanded Ts (s), for the play

@@ -24,7 +24,7 @@ ACTION_NAME = "ismpc_sine"
 # OUTPUT of the mapping, not raw policy actions.
 WALK = True                 # walk gate
 TS = 1.1                    # step timing, s        (action term clamps to [0.4, 2.0])
-VX, VY, OMEGA = 0.0, 0.0, 0.0   # twist target, m/s, m/s, rad/s (rate-limited by twist_max_delta)
+VX, VY, OMEGA = 0.1, 0.0, 0.0   # twist target, m/s, m/s, rad/s (rate-limited by twist_max_delta)
 COM_OFFSET = 0.9            # CoM height sine offset, m   (clamped 0.4..1.05)
 COM_FREQ = 1.0              # sine frequency, Hz          (clamped 0.1..8.0)
 COM_SIN_AMP = 0.0           # m
