@@ -144,19 +144,13 @@ def last_twist_action(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   return action_term.last_twist_action
 
 
-def last_user_ref_vel(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
-  """Human/joystick reference-velocity intent (vx, vy, omega), as an
-  observation -- read live from Walking_controller::user_reference_velocity
-  regardless of whether the controller-side rlVelocityControl toggle is
-  currently on. Lets the policy condition on what a human is asking for
-  (via the GUI "User reference velocity" ArrayInput or a connected
-  joystick) even while its own twist (last_twist_action) is the one
-  actually driving the footstep planner -- e.g. so a future policy variant
-  could learn to track or defer to human intent rather than being blind to
-  it. Zero when no human input is active (GUI default, or no joystick
-  connected)."""
+def estimated_com_lin_vel(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """CoM linear velocity (vx, vy, vz) in base axes, as ESTIMATED by the
+  controller (ismpc_walking::get_com_lin_vel ->
+  Walking_controller::estimatedComLinVel). Replaces MuJoCo ground-truth
+  envs_mdp.base_lin_vel so training and deployment read the same signal."""
   action_term = env.action_manager.get_term(action_name)
-  return action_term.last_user_ref_vel_obs
+  return action_term.com_lin_vel_est_obs
 
 
 class target_vel_window:
@@ -699,6 +693,22 @@ def debug_base_vel_y(
   component (m/s), body frame. See debug_base_vel_x."""
   asset = env.scene[asset_cfg.name]
   return asset.data.root_link_lin_vel_b[:, 1]
+
+
+def debug_est_com_vel_x(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """PLOTTING ONLY (weight=0.0) -- controller-ESTIMATED CoM linear velocity,
+  x (m/s, base axes). Compare with debug_base_vel_x (root link, ground truth):
+  same sign and scale on average, not stuck at zero. Not identical: the CoM
+  oscillates around the base velocity while walking."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.com_lin_vel_est_obs[:, 0]
+
+
+def debug_est_com_vel_y(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """PLOTTING ONLY (weight=0.0) -- estimated CoM linear velocity, y (m/s,
+  base axes). See debug_est_com_vel_x."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.com_lin_vel_est_obs[:, 1]
 
 
 class settle_gated_apply_body_impulse:

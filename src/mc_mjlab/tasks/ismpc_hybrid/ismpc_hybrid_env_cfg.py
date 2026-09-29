@@ -29,15 +29,15 @@ from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 400
+NUM_ENVS = 700
 PLAY_NUM_ENVS = 1
 
-EPISODE_LENGTH_S = 8.0
+EPISODE_LENGTH_S = 6.0
 
-FRAMESKIP = 2
+FRAMESKIP = 5
 
 # --- Push disturbances (mjlab.envs.mdp.events.apply_body_impulse). ---
-PUSH_SETTLE_TICKS = 20
+PUSH_SETTLE_TICKS = 8
 PUSH_FORCE_TORSO_N = (-50.0, 50.0)
 PUSH_FORCE_HAND_N = (-100.0, 100.0)
 PUSH_DURATION_S = (0.1, 0.6)
@@ -58,10 +58,10 @@ TERRAIN_PATCH_SIZE_M = (8.0, 8.0)
 
 # Curriculum stages. "step" is env.common_step_counter (1 iteration = 512).
 CURRICULUM_STAGES = [
-  {"step": 0,          "lin_vel_x": (-0.15, 0.15), "lin_vel_y": (-0.03, 0.03), "ang_vel_z": (-0.05, 0.05), "push_scale": 0.0},
-  {"step": 200 * 512,  "lin_vel_x": (-0.3, 0.3),   "lin_vel_y": (-0.06, 0.06),   "ang_vel_z": (-0.1, 0.1),   "push_scale": 0.0},
-  {"step": 400 * 512,  "lin_vel_x": (-0.3, 0.3),   "lin_vel_y": (-0.06, 0.06),   "ang_vel_z": (-0.1, 0.1),   "push_scale": 0.5},
-  {"step": 600 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
+  {"step": 0,          "lin_vel_x": (-0.5, 0.5), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.2, 0.2), "push_scale": 0.3},
+  {"step": 200 * 512,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
+  {"step": 400 * 512,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
+  {"step": 600 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
   {"step": 800 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
 ]
 PLAY_CURRICULUM_STAGE = 4
@@ -139,7 +139,9 @@ def _make_env_cfg(
   }
 
   actor_terms = {
-    "base_lin_vel": ObservationTermCfg(func=envs_mdp.base_lin_vel),
+    "com_lin_vel": ObservationTermCfg(
+      func=ismpc_mdp.estimated_com_lin_vel, params={"action_name": "ismpc_sine"}
+    ),
     "base_ang_vel": ObservationTermCfg(func=envs_mdp.base_ang_vel),
     "projected_gravity": ObservationTermCfg(func=envs_mdp.projected_gravity),
     "joint_pos": ObservationTermCfg(func=envs_mdp.joint_pos_rel),
@@ -155,9 +157,6 @@ def _make_env_cfg(
     ),
     "last_twist_action": ObservationTermCfg(
       func=ismpc_mdp.last_twist_action, params={"action_name": "ismpc_sine"}
-    ),
-    "last_user_ref_vel": ObservationTermCfg(
-      func=ismpc_mdp.last_user_ref_vel, params={"action_name": "ismpc_sine"}
     ),
     "ismpc_wants_stop": ObservationTermCfg(
       func=ismpc_mdp.ismpc_wants_stop, params={"action_name": "ismpc_sine"}
@@ -175,31 +174,31 @@ def _make_env_cfg(
   rewards = {
     "is_alive": RewardTermCfg(
       func=ismpc_mdp.is_alive, 
-      weight=1.0),
+      weight=3.0),
     "not_walking_penalty": RewardTermCfg(
       func=ismpc_mdp.not_walking_penalty, 
-      weight=-0.5, 
+      weight=-1.0, 
       params={"action_name": "ismpc_sine"}
     ),
     "joint_torque": RewardTermCfg(
       func=ismpc_mdp.joint_torque_reward, 
       weight=2.0,
-      params={"sigma": 100},
+      params={"sigma": 300},
     ),
     "target_vel_x": RewardTermCfg(
         func=ismpc_mdp.target_vel_window,
         weight=4.0,
-        params={"command_name": "twist", "axis": 0, "std": 0.05, "window_s": 1.1},
+        params={"command_name": "twist", "axis": 0, "std": 0.15, "window_s": 1.1},
     ),
     "target_vel_y": RewardTermCfg(
         func=ismpc_mdp.target_vel_window,
         weight=0.1,
-        params={"command_name": "twist", "axis": 1, "std": 0.05, "window_s": 1.1},
+        params={"command_name": "twist", "axis": 1, "std": 0.1, "window_s": 1.1},
     ),
     "target_omega": RewardTermCfg(
         func=ismpc_mdp.target_vel_window,
         weight=1.0,
-        params={"command_name": "twist", "axis": 2, "angular": True, "std": 0.07, "window_s": 1.1},
+        params={"command_name": "twist", "axis": 2, "angular": True, "std": 0.1, "window_s": 1.1},
     ),
     # --- Tutor terms: dense guidance on the policy's own twist output; base
     # weights decay via the tutor_* curriculum entries below.
@@ -221,7 +220,7 @@ def _make_env_cfg(
     "sine_position_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_position_continuity,
       weight=1.0,
-      params={"action_name": "ismpc_sine", "sigma" : 0.01},
+      params={"action_name": "ismpc_sine", "sigma" : 0.02},
     ),
     "sine_velocity_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_velocity_continuity,
@@ -280,6 +279,16 @@ def _make_env_cfg(
       func=ismpc_mdp.debug_base_vel_y,
       weight=0.0,
     ),
+    "debug_est_com_vel_x": RewardTermCfg(
+      func=ismpc_mdp.debug_est_com_vel_x,
+      weight=0.0,
+      params={"action_name": "ismpc_sine"},
+    ),
+    "debug_est_com_vel_y": RewardTermCfg(
+      func=ismpc_mdp.debug_est_com_vel_y,
+      weight=0.0,
+      params={"action_name": "ismpc_sine"},
+    ),
     "debug_target_omega": RewardTermCfg(
       func=ismpc_mdp.debug_target_omega,
       weight=0.0,
@@ -316,7 +325,7 @@ def _make_env_cfg(
       func=envs_mdp.reset_joints_by_offset,
       mode="reset",
       params={
-        "position_range": (-0.02, 0.02),  # rad
+        "position_range": (-0.01, 0.01),  # rad
         "velocity_range": (-0.01, 0.01),  # rad/s
         "asset_cfg": SceneEntityCfg("robot"),
       },
@@ -403,51 +412,51 @@ def _make_env_cfg(
         "fixed_stage": None,
       },
     ),
-    "target_vel_x_std": CurriculumTermCfg(
-      func=envs_mdp.reward_curriculum,
-      params={
-        "reward_name": "target_vel_x",
-        "stages": [
-          {"step": 0,          "params": {"std": 0.10}},
-          {"step": 250 * 512,  "params": {"std": 0.10}},
-          {"step": 500 * 512,  "params": {"std": 0.05}},
-        ],
-      },
-    ),
-    "target_vel_y_std": CurriculumTermCfg(
-      func=envs_mdp.reward_curriculum,
-      params={
-        "reward_name": "target_vel_y",
-        "stages": [
-          {"step": 0,          "params": {"std": 0.05}},
-          {"step": 250 * 512,  "params": {"std": 0.05}},
-          {"step": 500 * 512,  "params": {"std": 0.05}},
-        ],
-      },
-    ),
-    "target_omega_std": CurriculumTermCfg(
-      func=envs_mdp.reward_curriculum,
-      params={
-        "reward_name": "target_omega",
-        "stages": [
-          {"step": 0,          "params": {"std": 0.07}},
-          {"step": 250 * 512,  "params": {"std": 0.07}},
-          {"step": 500 * 512,  "params": {"std": 0.07}},
-        ],
-      },
-    ),
-    "tutor_vel_x_weight": CurriculumTermCfg(
-      func=envs_mdp.reward_curriculum,
-      params={"reward_name": "tutor_vel_x", "stages": _tutor_weight_stages(1.0)},
-    ),
-    "tutor_vel_y_weight": CurriculumTermCfg(
-      func=envs_mdp.reward_curriculum,
-      params={"reward_name": "tutor_vel_y", "stages": _tutor_weight_stages(0.1)},
-    ),
-    "tutor_omega_weight": CurriculumTermCfg(
-      func=envs_mdp.reward_curriculum,
-      params={"reward_name": "tutor_omega", "stages": _tutor_weight_stages(0.3)},
-    ),
+    # "target_vel_x_std": CurriculumTermCfg(
+    #   func=envs_mdp.reward_curriculum,
+    #   params={
+    #     "reward_name": "target_vel_x",
+    #     "stages": [
+    #       {"step": 0,          "params": {"std": 0.15}},
+    #       {"step": 250 * 512,  "params": {"std": 0.15}},
+    #       {"step": 500 * 512,  "params": {"std": 0.10}},
+    #     ],
+    #   },
+    # ),
+    # "target_vel_y_std": CurriculumTermCfg(
+    #   func=envs_mdp.reward_curriculum,
+    #   params={
+    #     "reward_name": "target_vel_y",
+    #     "stages": [
+    #       {"step": 0,          "params": {"std": 0.05}},
+    #       {"step": 250 * 512,  "params": {"std": 0.05}},
+    #       {"step": 500 * 512,  "params": {"std": 0.05}},
+    #     ],
+    #   },
+    # ),
+    # "target_omega_std": CurriculumTermCfg(
+    #   func=envs_mdp.reward_curriculum,
+    #   params={
+    #     "reward_name": "target_omega",
+    #     "stages": [
+    #       {"step": 0,          "params": {"std": 0.07}},
+    #       {"step": 250 * 512,  "params": {"std": 0.07}},
+    #       {"step": 500 * 512,  "params": {"std": 0.07}},
+    #     ],
+    #   },
+    # ),
+  #   "tutor_vel_x_weight": CurriculumTermCfg(
+  #     func=envs_mdp.reward_curriculum,
+  #     params={"reward_name": "tutor_vel_x", "stages": _tutor_weight_stages(1.0)},
+  #   ),
+  #   "tutor_vel_y_weight": CurriculumTermCfg(
+  #     func=envs_mdp.reward_curriculum,
+  #     params={"reward_name": "tutor_vel_y", "stages": _tutor_weight_stages(0.1)},
+  #   ),
+  #   "tutor_omega_weight": CurriculumTermCfg(
+  #     func=envs_mdp.reward_curriculum,
+  #     params={"reward_name": "tutor_omega", "stages": _tutor_weight_stages(0.3)},
+  #   ),
   }
   
 
@@ -494,6 +503,8 @@ def _apply_play_overrides(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
     "debug_target_vel_y",
     "debug_output_vel_y",
     "debug_base_vel_y",
+    "debug_est_com_vel_x",
+    "debug_est_com_vel_y",
     "debug_target_omega",
     "debug_output_omega",
     "debug_base_omega",
@@ -537,7 +548,7 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       },
     ),
     critic=RslRlModelCfg(
-      hidden_dims=(512, 256, 128),
+      hidden_dims=(1024, 512, 256),
       activation="elu",
       obs_normalization=True,
     ),
@@ -548,7 +559,7 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       entropy_coef=0.003,
       num_learning_epochs=5,
       num_mini_batches=4,
-      learning_rate=3.0e-4,
+      learning_rate=1.0e-3,
       schedule="adaptive",
       gamma=0.99,
       lam=0.95,
@@ -556,7 +567,7 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       max_grad_norm=1.0,
     ),
     experiment_name="mc_rtc_ismpc_hybrid",
-    save_interval=50,
+    save_interval=100,
     num_steps_per_env=512,
     max_iterations=max_iterations,
     logger="wandb",

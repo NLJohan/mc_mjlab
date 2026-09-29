@@ -22,11 +22,9 @@ Walking_controller.h/.cpp). When that toggle is off, this class's writes to
 SET_RL_REF_VEL are harmless but inert: the controller's own mux
 (Walking_controller::updateReferenceVelocity()) ignores rl_reference_velocity
 and follows user_reference_velocity (GUI/joystick) instead. The controller
-also exposes user_reference_velocity read-only via SET_RL_REF_VEL's sibling
-getter (ismpc_walking::get_user_ref_vel, read as a datastore_vectors_outputs
-entry -- see last_user_ref_vel_obs) so the policy can observe human/joystick
-intent as context even while its own twist is the one actually driving the
-planner.
+exposes its estimated CoM velocity (base axes) via ismpc_walking::get_com_lin_vel,
+read as a datastore_vectors_outputs entry -- see com_lin_vel_est_obs -- which is
+the policy's "com_lin_vel" observation.
 
 Joint actuation itself is unchanged from the old file: mc_rtc's own q/alpha
 output drives the joints directly. There is no joint-space residual in this
@@ -73,11 +71,10 @@ GET_ROBOT_WALKING = "ismpc_walking::robot_walking_d"
 # Vector3d (datastore_vectors_inputs/outputs), unlike the scalars above.
 # set_rl_ref_vel writes Walking_controller::rl_reference_velocity only --
 # inert unless the controller-side rlVelocityControl toggle is on (see the
-# module docstring). get_user_ref_vel reads Walking_controller::
-# user_reference_velocity (GUI/joystick intent), read-only, always live
-# regardless of rlVelocityControl.
+# module docstring). get_com_lin_vel reads Walking_controller::
+# estimatedComLinVel() (realRobot CoM velocity rotated into base axes).
 SET_RL_REF_VEL = "ismpc_walking::set_rl_ref_vel"
-GET_USER_REF_VEL = "ismpc_walking::get_user_ref_vel"
+GET_COM_LIN_VEL = "ismpc_walking::get_com_lin_vel"
 
 
 @dataclass(kw_only=True)
@@ -202,7 +199,7 @@ class IsmpcSineAction(McRtcActionBase):
       dict.fromkeys((*cfg.datastore_vectors_inputs, SET_RL_REF_VEL))
     )
     cfg.datastore_vectors_outputs = tuple(
-      dict.fromkeys((*cfg.datastore_vectors_outputs, GET_USER_REF_VEL))
+      dict.fromkeys((*cfg.datastore_vectors_outputs, GET_COM_LIN_VEL))
     )
 
     # `BaseAction.__init__` (via McRtcActionBase's own super().__init__())
@@ -234,12 +231,21 @@ class IsmpcSineAction(McRtcActionBase):
     # Sine-param update cadence, in units of controller-dispatch ticks (not
     # physics substeps). See cfg.sine_param_frequency_hz's docstring for why
     # this is kept separate from frameskip.
-    controller_hz = 1.0 / (self._env.step_dt / cfg.frameskip)
+    # Real controller period = frameskip physics substeps = step_dt * frameskip
+    # / decimation (the old step_dt / frameskip gave the physics rate, not the
+    # controller rate, so the latch was frameskip-dependent and too slow).
+    controller_dt = self._env.step_dt * cfg.frameskip / self._env.cfg.decimation
+    controller_hz = 1.0 / controller_dt
     self._sine_param_period_ticks = max(
       1, round(controller_hz / cfg.sine_param_frequency_hz)
     )
     self._dispatch_ticks_since_sine_update = torch.zeros(
       self.num_envs, dtype=torch.long, device=self.device
+    )
+    print(
+      f"[IsmpcSineAction] controller_dt={controller_dt * 1e3:.3f} ms, "
+      f"latch every {self._sine_param_period_ticks} controller steps "
+      f"({self._sine_param_period_ticks * controller_dt * 1e3:.1f} ms)"
     )
 
     # --- Continuity bookkeeping. ---
@@ -399,17 +405,12 @@ class IsmpcSineAction(McRtcActionBase):
     return self._twist_curr
 
   @property
-  def last_user_ref_vel_obs(self) -> torch.Tensor:
-    """Human/joystick reference-velocity intent (vx, vy, omega),
-    (num_envs, 3), read live from Walking_controller::user_reference_velocity
-    via the GET_USER_REF_VEL datastore output. Populated every control
-    period by the base's generic datastore-output collection
-    (McRtcActionBase._collect_controller_output), same mechanism as
-    ismpc_wants_stop_obs/is_walking_obs below -- always live regardless of
-    whether the controller-side rlVelocityControl toggle is on, so the
-    policy can condition on human intent as context even while its own
-    twist (last_twist_action) is the one actually driving the planner."""
-    return self.datastore_vector_output(GET_USER_REF_VEL)
+  def com_lin_vel_est_obs(self) -> torch.Tensor:
+    """Controller-estimated CoM linear velocity (vx, vy, vz), (num_envs, 3),
+    m/s, in base axes, read via the GET_COM_LIN_VEL datastore output
+    (Walking_controller::estimatedComLinVel). Collected every control period
+    by McRtcActionBase's generic datastore-output mechanism."""
+    return self.datastore_vector_output(GET_COM_LIN_VEL)
 
   @property
   def target_height_obs(self) -> torch.Tensor:
@@ -576,19 +577,12 @@ class IsmpcSineAction(McRtcActionBase):
         self._ts_curr,
       )
 
-      # Twist: same cadence, but additionally rate-limited (unlike offset/
-      # frequency/sin_amp/cos_amp/Ts, which snap directly to their mapped
-      # target every due tick) -- see cfg.twist_max_delta's docstring for
-      # why. due_for_sine_update is (num_envs,); unsqueeze to broadcast
-      # against the (num_envs, 3) twist tensors.
+      # Twist: same cadence and same direct snap to the mapped target as the
+      # other channels (no rate limit). due_for_sine_update is (num_envs,);
+      # unsqueeze to broadcast against the (num_envs, 3) twist tensors.
       target_twist = self._map_twist(self._processed_actions[:, 6:9])
-      max_delta = torch.tensor(
-        self.cfg.twist_max_delta, device=self.device, dtype=target_twist.dtype
-      )
-      delta = torch.clamp(target_twist - self._twist_curr, -max_delta, max_delta)
-      rate_limited_twist = self._twist_curr + delta
       self._twist_curr = torch.where(
-        due_for_sine_update.unsqueeze(-1), rate_limited_twist, self._twist_curr
+        due_for_sine_update.unsqueeze(-1), target_twist, self._twist_curr
       )
 
     self._dispatch_ticks_since_sine_update = (
