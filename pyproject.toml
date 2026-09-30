@@ -23,6 +23,8 @@ dependencies = [
     "numpy<2",
     "nanobind>=3.0.1",
     "torch",
+    "onnx",
+    "onnxruntime",
 ]
 
 [dependency-groups]

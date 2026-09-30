@@ -8,6 +8,7 @@ control mode and a single task id -- no position/torque split.
 from pathlib import Path
 
 from mjlab.tasks.registry import register_mjlab_task
+from mc_mjlab.tasks.ismpc_hybrid.runner import IsmpcHybridOnPolicyRunner
 
 from mc_mjlab.tasks.ismpc_hybrid.ismpc_hybrid_env_cfg import (
   ismpc_hybrid_env_cfg,
@@ -21,5 +22,6 @@ register_mjlab_task(
   task_id=get_task_name(TASK_DIR),
   env_cfg=ismpc_hybrid_env_cfg(),
   play_env_cfg=ismpc_hybrid_env_cfg(play=True),
-  rl_cfg=ismpc_hybrid_ppo_cfg(max_iterations=1000),
+  rl_cfg=ismpc_hybrid_ppo_cfg(max_iterations=10),
+  runner_cls=IsmpcHybridOnPolicyRunner,
 )
