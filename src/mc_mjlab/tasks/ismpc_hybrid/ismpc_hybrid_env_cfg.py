@@ -29,7 +29,7 @@ from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 700
+NUM_ENVS = 400
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 6.0
@@ -494,21 +494,21 @@ def _apply_play_overrides(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
   cfg.scene.num_envs = PLAY_NUM_ENVS
   debug_names = (
     "debug_target_height",
+    # "debug_base_height",
     "debug_step_timing",
-    "debug_is_walking",
+    # "debug_is_walking",
     "debug_joint_torque_raw",
     "debug_target_vel_x",
     "debug_output_vel_x",
     "debug_base_vel_x",
-    "debug_target_vel_y",
-    "debug_output_vel_y",
-    "debug_base_vel_y",
-    "debug_est_com_vel_x",
-    "debug_est_com_vel_y",
+    # "debug_target_vel_y",
+    # "debug_output_vel_y",
+    # "debug_base_vel_y",
+    # "debug_est_com_vel_x",
+    # "debug_est_com_vel_y",
     "debug_target_omega",
     "debug_output_omega",
     "debug_base_omega",
-    "debug_base_height",
   )
   for name in debug_names:
     cfg.rewards[name].weight = 1.0
@@ -556,7 +556,7 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       value_loss_coef=1.0,
       use_clipped_value_loss=True,
       clip_param=0.2,
-      entropy_coef=0.003,
+      entropy_coef=0.002,
       num_learning_epochs=5,
       num_mini_batches=4,
       learning_rate=1.0e-3,
@@ -567,7 +567,7 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       max_grad_norm=1.0,
     ),
     experiment_name="mc_rtc_ismpc_hybrid",
-    save_interval=100,
+    save_interval=5,
     num_steps_per_env=512,
     max_iterations=max_iterations,
     logger="wandb",

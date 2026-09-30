@@ -276,8 +276,7 @@ class IsmpcSineAction(McRtcActionBase):
 
     # --- Twist (reference velocity: vx, vy, omega). ---
     # Defaults to zero -- matches Walking_controller::reset()'s own
-    # rl_reference_velocity.setZero(). Rate-limited toward the mapped target
-    # in _advance_sine_period via cfg.twist_max_delta.
+    # rl_reference_velocity.setZero().
     self._twist_curr = torch.zeros(self.num_envs, 3, device=self.device)
 
   # ---- Required ActionTerm properties/methods. ----
@@ -363,10 +362,7 @@ class IsmpcSineAction(McRtcActionBase):
     Simple clamp-and-scale (not tanh): keeps raw=0 mapping exactly to
     physical=0, matching the convention used by _map_step_timing, so a
     freshly-initialized policy's near-zero output reproduces "no commanded
-    motion" rather than some arbitrary offset. Rate limiting toward this
-    target happens separately in _advance_sine_period (cfg.twist_max_delta)
-    -- this method only computes the instantaneous target, not the
-    rate-limited value actually written to the datastore.
+    motion" rather than some arbitrary offset.
     """
     scale = torch.tensor(self.cfg.twist_scale, device=raw.device, dtype=raw.dtype)
     return torch.clamp(raw, -1.0, 1.0) * scale
@@ -400,8 +396,7 @@ class IsmpcSineAction(McRtcActionBase):
   @property
   def last_twist_action(self) -> torch.Tensor:
     """The policy's current (vx, vy, omega) twist command, (num_envs, 3),
-    m/s and rad/s -- the rate-limited value actually written to
-    SET_RL_REF_VEL this period, not the raw per-tick target."""
+    m/s and rad/s"""
     return self._twist_curr
 
   @property
