@@ -367,6 +367,29 @@ def ismpc_wants_stop(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   return action_term.ismpc_wants_stop_obs
 
 
+def filt_perturbation(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """ISMPC's perturbation estimate |w_.xy| (m), low-passed inside the controller, (num_envs, 1).
+
+  Datastore getter ismpc_walking::get_filt_perturbation. The filter lives in the controller (not here), so
+  training and deployment see the same signal; its cutoff period is recorded in the exported contract."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.filt_perturbation_obs
+
+
+def filt_zmp_error(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """|measured ZMP - MPC planned ZMP|.xy (m), low-passed inside the controller, (num_envs, 1).
+  Datastore getter ismpc_walking::get_filt_zmp_error. See filt_perturbation."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.filt_zmp_error_obs
+
+
+def filt_dcm_bias(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """|DCM bias| (m), low-passed inside the controller, (num_envs, 1).
+  Datastore getter ismpc_walking::get_filt_dcm_bias. See filt_perturbation."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.filt_dcm_bias_obs
+
+
 def controller_failed(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   """True for envs whose mc_rtc controller's QP gave up last step.
 
@@ -462,6 +485,27 @@ LOWER_BODY_JOINT_NAMES = (
   "LCY", "LCR", "LCP", "LKP", "LAP", "LAR",
   "WP", "WR", "WY",
 )
+
+
+# Joints the policy does NOT observe (joint_pos / joint_vel of the actor and critic).
+# The 18 finger joints are not driven by mc_rtc and sit at a different posture in mc_mujoco than in training;
+# the two head joints (HY/HP) carry no locomotion information. Everything else (legs, waist, arms) stays, in the
+# robot's own joint order. Observation only: the robot, its actuation and the action term are unchanged.
+ACTOR_EXCLUDED_JOINT_NAMES = (
+  "HY", "HP",
+  "RIMP", "RIPIP", "RIDIP", "RMMP", "RMPIP", "RMDIP", "RTMP", "RTPIP", "RTDIP",
+  "LIMP", "LIPIP", "LIDIP", "LMMP", "LMPIP", "LMDIP", "LTMP", "LTPIP", "LTDIP",
+)
+
+
+def observed_joint_cfg() -> SceneEntityCfg:
+  """asset_cfg of the joint_pos / joint_vel observation terms: every joint except ACTOR_EXCLUDED_JOINT_NAMES.
+
+  One regex (matched with re.fullmatch by mjlab). It must be passed through the term's ``params`` so that the
+  ObservationManager resolves it (a function default is never resolved). A fresh object per call.
+  """
+  regex = "(?!(?:" + "|".join(ACTOR_EXCLUDED_JOINT_NAMES) + ")$).+"
+  return SceneEntityCfg("robot", joint_names=(regex,))
 
 
 def _resolve_lower_body_joint_ids(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> None:

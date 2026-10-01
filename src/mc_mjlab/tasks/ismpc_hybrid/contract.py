@@ -22,11 +22,16 @@ import numpy as np
 import torch
 
 from mc_mjlab.actions import ismpc_sine_action as act
+from mc_mjlab.tasks.ismpc_hybrid import mdp
 
 CONTRACT_VERSION = 1
 ACTOR_GROUP = "actor"
 ACTION_NAME = "ismpc_sine"
 COMMAND_NAME = "twist"
+
+# Observation terms whose value is low-passed INSIDE the controller. When any is in the actor group the contract
+# carries a `filters` block with the cutoff period they were trained with.
+FILTERED_TERMS = ("filt_perturbation", "filt_zmp_error", "filt_dcm_bias")
 
 # IsmpcSineAction._advance_sine_period currently snaps the twist straight to
 # its mapped target (no rate limit), even though cfg.twist_max_delta exists.
@@ -192,11 +197,41 @@ def _timing_section(env: Any, term: Any) -> tuple[float, int]:
   return controller_dt, int(latch)
 
 
+def _observed_joint_ids(env: Any) -> list[int]:
+  """Robot joint indices of joint_pos / joint_vel, in observation order, read from the RESOLVED actor terms.
+
+  This is the single source of truth: whatever the env cfg selected is what the contract lists. Raises when the
+  two terms disagree, or when an ACTOR_EXCLUDED_JOINT_NAMES entry is not a joint of the robot (a typo would
+  silently keep that joint in the observation).
+  """
+  om = env.observation_manager
+  robot = env.scene["robot"]
+  n = len(robot.joint_names)
+  ids: dict[str, list[int]] = {}
+  for term in ("joint_pos", "joint_vel"):
+    asset_cfg = om.get_term_cfg(ACTOR_GROUP, term).params.get("asset_cfg")
+    if asset_cfg is None:
+      raise ContractError(f"actor term '{term}' has no asset_cfg: its joints cannot be read from the env")
+    sel = asset_cfg.joint_ids
+    ids[term] = list(range(n)) if isinstance(sel, slice) else [int(i) for i in sel]
+  if ids["joint_pos"] != ids["joint_vel"]:
+    raise ContractError("actor terms joint_pos and joint_vel observe different joints (or in a different order)")
+  missing = [j for j in mdp.ACTOR_EXCLUDED_JOINT_NAMES if j not in robot.joint_names]
+  if missing:
+    raise ContractError(f"ACTOR_EXCLUDED_JOINT_NAMES not found on the robot: {missing}")
+  leaked = [robot.joint_names[i] for i in ids["joint_pos"] if robot.joint_names[i] in mdp.ACTOR_EXCLUDED_JOINT_NAMES]
+  if leaked:
+    raise ContractError(f"excluded joints are still observed: {leaked}")
+  return ids["joint_pos"]
+
+
 def _joints_section(env: Any) -> dict:
   robot = env.scene["robot"]
+  ids = _observed_joint_ids(env)
+  default = robot.data.default_joint_pos[0].detach().cpu()
   return {
-    "names": list(robot.joint_names),
-    "default_pos": robot.data.default_joint_pos[0].detach().cpu().tolist(),
+    "names": [robot.joint_names[i] for i in ids],
+    "default_pos": default[ids].tolist(),
   }
 
 
@@ -206,6 +241,25 @@ def _command_section(env: Any) -> dict:
   for key in ("lin_vel_x", "lin_vel_y", "ang_vel_z"):
     ranges[key] = list(getattr(cmd_cfg, key))
   return {"names": list(env.command_manager.active_terms), "ranges": ranges}
+
+
+def _filters_section(term: Any, obs: dict) -> dict | None:
+  """Cutoff period (s) of the controller-side observation filters, read from the LIVE controllers.
+
+  None when no filtered term is observed. Envs that were just reset read 0 until their first collect, so only
+  the positive entries count; they must all agree (the cutoff is a controller constant, one YAML key)."""
+  if not any(t["name"] in FILTERED_TERMS for t in obs["terms"]):
+    return None
+  vals = term.datastore_scalar_output(act.GET_OBS_FILTER_CUTOFF_T).detach().cpu().flatten()
+  pos = vals[vals > 0]
+  if pos.numel() == 0:
+    raise ContractError(
+      "filtered observation terms are present but no controller reports its obs_filter_cutoff_T yet "
+      "(all readouts are 0); the next save will retry"
+    )
+  if not torch.allclose(pos, pos[0].expand_as(pos)):
+    raise ContractError(f"controllers disagree on obs_filter_cutoff_T: {sorted(set(pos.tolist()))}")
+  return {"obs_filter_cutoff_T": float(pos[0])}
 
 
 def _git_info() -> dict:
@@ -233,6 +287,7 @@ def build_contract(
   obs = _obs_section(env)
   action = _action_section(env, term)
   controller_dt, latch_ticks = _timing_section(env, term)
+  filters = _filters_section(term, obs)
   norm = _normalizer_section(policy)
   if norm is not None and "mean" in norm:
     obs["normalizer"] = norm
@@ -257,6 +312,7 @@ def build_contract(
       "actions_used": "only the action computed on a latch step",
     },
     "obs": obs,
+    **({"filters": filters} if filters is not None else {}),
     "action": action,
     "joints": _joints_section(env),
     "command": _command_section(env),

@@ -75,6 +75,12 @@ GET_ROBOT_WALKING = "ismpc_walking::robot_walking_d"
 # estimatedComLinVel() (realRobot CoM velocity rotated into base axes).
 SET_RL_REF_VEL = "ismpc_walking::set_rl_ref_vel"
 GET_COM_LIN_VEL = "ismpc_walking::get_com_lin_vel"
+# Scalar getters (datastore_scalar_outputs): the three low-passed ISMPC signals (norms, metres) as left by the
+# controller's last run(), and the cutoff period (s) of that filter, which the exporter records in the contract.
+GET_FILT_PERTURBATION = "ismpc_walking::get_filt_perturbation"
+GET_FILT_ZMP_ERROR = "ismpc_walking::get_filt_zmp_error"
+GET_FILT_DCM_BIAS = "ismpc_walking::get_filt_dcm_bias"
+GET_OBS_FILTER_CUTOFF_T = "ismpc_walking::get_obs_filter_cutoff_T"
 
 
 @dataclass(kw_only=True)
@@ -190,7 +196,10 @@ class IsmpcSineAction(McRtcActionBase):
       )
     )
     cfg.datastore_scalar_outputs = tuple(
-      dict.fromkeys((*cfg.datastore_scalar_outputs, GET_WANTS_STOP, GET_ROBOT_WALKING))
+      dict.fromkeys(
+        (*cfg.datastore_scalar_outputs, GET_WANTS_STOP, GET_ROBOT_WALKING,
+         GET_FILT_PERTURBATION, GET_FILT_ZMP_ERROR, GET_FILT_DCM_BIAS, GET_OBS_FILTER_CUTOFF_T)
+      )
     )
     # Vector3d counterparts of the above, same declare-before-super() pattern
     # and same (num_envs, 3)-shaped transport (set_datastore_vector_input /
@@ -431,6 +440,22 @@ class IsmpcSineAction(McRtcActionBase):
     base's generic datastore-output machinery -- replaces the old file's
     manual ControllerIoBinding readback."""
     return self.datastore_scalar_output(GET_WANTS_STOP).unsqueeze(-1)
+
+  @property
+  def filt_perturbation_obs(self) -> torch.Tensor:
+    """Low-passed ISMPC perturbation |w_.xy| (m), (num_envs, 1). Filtered inside the controller (cutoff period
+    walking_controller.obs_filter_cutoff_T), read through the generic datastore-output machinery."""
+    return self.datastore_scalar_output(GET_FILT_PERTURBATION).unsqueeze(-1)
+
+  @property
+  def filt_zmp_error_obs(self) -> torch.Tensor:
+    """Low-passed |measured ZMP - MPC planned ZMP|.xy (m), (num_envs, 1). See filt_perturbation_obs."""
+    return self.datastore_scalar_output(GET_FILT_ZMP_ERROR).unsqueeze(-1)
+
+  @property
+  def filt_dcm_bias_obs(self) -> torch.Tensor:
+    """Low-passed |DCM bias| (m), (num_envs, 1). See filt_perturbation_obs."""
+    return self.datastore_scalar_output(GET_FILT_DCM_BIAS).unsqueeze(-1)
 
   @property
   def is_walking_obs(self) -> torch.Tensor:

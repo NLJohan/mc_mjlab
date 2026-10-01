@@ -29,10 +29,10 @@ from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 400
+NUM_ENVS = 700
 PLAY_NUM_ENVS = 1
 
-EPISODE_LENGTH_S = 6.0
+EPISODE_LENGTH_S = 15.0
 
 FRAMESKIP = 5
 
@@ -40,9 +40,9 @@ FRAMESKIP = 5
 PUSH_SETTLE_TICKS = 8
 PUSH_FORCE_TORSO_N = (-50.0, 50.0)
 PUSH_FORCE_HAND_N = (-100.0, 100.0)
-PUSH_DURATION_S = (0.1, 0.6)
-PUSH_COOLDOWN_TORSO_S = (3.0, 15.0)
-PUSH_COOLDOWN_HAND_S = (3.0, 15.0)
+PUSH_DURATION_S = (0.1, 0.4)
+PUSH_COOLDOWN_TORSO_S = (3.0, 30.0)
+PUSH_COOLDOWN_HAND_S = (3.0, 30.0)
 
 # --- Mass/inertia domain randomization. ---
 BODY_MASS_ALPHA_RANGE = (-0.05, 0.05)
@@ -60,9 +60,9 @@ TERRAIN_PATCH_SIZE_M = (8.0, 8.0)
 CURRICULUM_STAGES = [
   {"step": 0,          "lin_vel_x": (-0.5, 0.5), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.2, 0.2), "push_scale": 0.3},
   {"step": 200 * 512,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
-  {"step": 400 * 512,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
-  {"step": 600 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
-  {"step": 800 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
+  {"step": 400 * 512,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
+  {"step": 600 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
+  {"step": 800 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
 ]
 PLAY_CURRICULUM_STAGE = 4
 
@@ -144,8 +144,12 @@ def _make_env_cfg(
     ),
     "base_ang_vel": ObservationTermCfg(func=envs_mdp.base_ang_vel),
     "projected_gravity": ObservationTermCfg(func=envs_mdp.projected_gravity),
-    "joint_pos": ObservationTermCfg(func=envs_mdp.joint_pos_rel),
-    "joint_vel": ObservationTermCfg(func=envs_mdp.joint_vel_rel),
+    "joint_pos": ObservationTermCfg(
+      func=envs_mdp.joint_pos_rel, params={"asset_cfg": ismpc_mdp.observed_joint_cfg()}
+    ),
+    "joint_vel": ObservationTermCfg(
+      func=envs_mdp.joint_vel_rel, params={"asset_cfg": ismpc_mdp.observed_joint_cfg()}
+    ),
     "last_sine_params": ObservationTermCfg(
       func=ismpc_mdp.last_sine_params, params={"action_name": "ismpc_sine"}
     ),
@@ -160,6 +164,16 @@ def _make_env_cfg(
     ),
     "ismpc_wants_stop": ObservationTermCfg(
       func=ismpc_mdp.ismpc_wants_stop, params={"action_name": "ismpc_sine"}
+    ),
+    # Low-passed ISMPC signals (filter in the controller, cutoff recorded in the contract).
+    "filt_perturbation": ObservationTermCfg(
+      func=ismpc_mdp.filt_perturbation, params={"action_name": "ismpc_sine"}
+    ),
+    "filt_zmp_error": ObservationTermCfg(
+      func=ismpc_mdp.filt_zmp_error, params={"action_name": "ismpc_sine"}
+    ),
+    "filt_dcm_bias": ObservationTermCfg(
+      func=ismpc_mdp.filt_dcm_bias, params={"action_name": "ismpc_sine"}
     ),
     "target_twist": ObservationTermCfg(
       func=ismpc_mdp.target_twist, params={"command_name": "twist"}
@@ -325,7 +339,7 @@ def _make_env_cfg(
       func=envs_mdp.reset_joints_by_offset,
       mode="reset",
       params={
-        "position_range": (-0.01, 0.01),  # rad
+        "position_range": (-0.02, 0.02),  # rad
         "velocity_range": (-0.01, 0.01),  # rad/s
         "asset_cfg": SceneEntityCfg("robot"),
       },
@@ -567,8 +581,8 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       max_grad_norm=1.0,
     ),
     experiment_name="mc_rtc_ismpc_hybrid",
-    save_interval=5,
-    num_steps_per_env=512,
+    save_interval=100,
+    num_steps_per_env=256,
     max_iterations=max_iterations,
     logger="wandb",
   )
