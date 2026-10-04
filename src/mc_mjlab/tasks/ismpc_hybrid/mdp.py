@@ -214,6 +214,17 @@ class target_vel_window:
     return torch.exp(-torch.square(cmd - avg) / std**2)
 
 
+def _policy_wants_walk(action_term) -> torch.Tensor:
+  """(num_envs,) bool: the policy's current walk/stop decision (True = walk).
+
+  Reads action_term.last_walk_action (1.0 = walk, 0.0 = stop), the same signal exposed to the policy as the
+  last_walk_action observation. This is the policy's own command, not the controller's ground-truth
+  is_walking_obs, so the reward follows the decision taken this step with no controller lag.
+  """
+  walk = action_term.last_walk_action
+  return walk.reshape(walk.shape[0], -1)[:, 0] > 0.5
+
+
 def twist_tutor(
   env: ManagerBasedRlEnv,
   action_name: str,
@@ -235,11 +246,16 @@ def twist_tutor(
   the command when that pays off (e.g. to recover from a push). Keep the
   achieved-velocity terms in the reward: a policy can satisfy this term
   perfectly while the robot does not actually achieve the velocity.
+
+  GATED on the policy's walk decision: returns 0 for envs whose policy currently commands "stop"
+  (last_walk_action < 0.5), and the value above otherwise.
   """
   action_term = env.action_manager.get_term(action_name)
   out = action_term.last_twist_action[:, axis]
   cmd = env.command_manager.get_command(command_name)[:, axis]
-  return torch.exp(-torch.square(out - cmd) / std**2)
+  reward = torch.exp(-torch.square(out - cmd) / std**2)
+  # Gated on the policy's walk decision: no tutoring while it chooses to stop.
+  return reward * _policy_wants_walk(action_term).to(dtype=reward.dtype)
 
 
 class target_linear_vel_avg:

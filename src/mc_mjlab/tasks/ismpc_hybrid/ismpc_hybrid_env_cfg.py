@@ -32,7 +32,7 @@ from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 NUM_ENVS = 700
 PLAY_NUM_ENVS = 1
 
-EPISODE_LENGTH_S = 15.0
+EPISODE_LENGTH_S = 60.0
 
 FRAMESKIP = 5
 
@@ -41,8 +41,8 @@ PUSH_SETTLE_TICKS = 8
 PUSH_FORCE_TORSO_N = (-50.0, 50.0)
 PUSH_FORCE_HAND_N = (-100.0, 100.0)
 PUSH_DURATION_S = (0.1, 0.4)
-PUSH_COOLDOWN_TORSO_S = (3.0, 30.0)
-PUSH_COOLDOWN_HAND_S = (3.0, 30.0)
+PUSH_COOLDOWN_TORSO_S = (5.0, 90.0)
+PUSH_COOLDOWN_HAND_S = (5.0, 90.0)
 
 # --- Mass/inertia domain randomization. ---
 BODY_MASS_ALPHA_RANGE = (-0.05, 0.05)
@@ -59,10 +59,10 @@ TERRAIN_PATCH_SIZE_M = (8.0, 8.0)
 # Curriculum stages. "step" is env.common_step_counter (1 iteration = 512).
 CURRICULUM_STAGES = [
   {"step": 0,          "lin_vel_x": (-0.5, 0.5), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.2, 0.2), "push_scale": 0.3},
-  {"step": 200 * 512,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
-  {"step": 400 * 512,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
-  {"step": 600 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
-  {"step": 800 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
+  {"step": 600 * 512,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
+  {"step": 800 * 512,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
+  {"step": 1000 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.8},
+  {"step": 1200 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.8},
 ]
 PLAY_CURRICULUM_STAGE = 4
 
@@ -191,7 +191,7 @@ def _make_env_cfg(
       weight=3.0),
     "not_walking_penalty": RewardTermCfg(
       func=ismpc_mdp.not_walking_penalty, 
-      weight=-1.0, 
+      weight=0.0, # Now tutor velocity rewards are gated on walking status.
       params={"action_name": "ismpc_sine"}
     ),
     "joint_torque": RewardTermCfg(
@@ -214,8 +214,6 @@ def _make_env_cfg(
         weight=1.0,
         params={"command_name": "twist", "axis": 2, "angular": True, "std": 0.1, "window_s": 1.1},
     ),
-    # --- Tutor terms: dense guidance on the policy's own twist output; base
-    # weights decay via the tutor_* curriculum entries below.
     "tutor_vel_x": RewardTermCfg(
       func=ismpc_mdp.twist_tutor,
       weight=1.0,
