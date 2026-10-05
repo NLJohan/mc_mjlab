@@ -6,6 +6,11 @@ Edit the constants below, no CLI args.
 Reads the CSVs written by push_benchmark.py (one file = one run = one policy, one push
 duration, one target twist). Binning happens here, never in the benchmark.
 
+Any number of CSVs can be given (e.g. one per policy from a push_benchmark.py queue):
+direction and magnitude curves overlay all of them. The 2D maps and the 3D surface show
+one dataset per row with 1 or 2 CSVs (plus the difference panels for 2), and ONE dataset
+picked by the radio box with 3 or more.
+
 Panels (one window, laid out on a 4-column grid):
   per dataset   recovery rate, mean time-to-fall (recovered trial = recovery timeout, both
                 from the push start) and trial count, over the (Fx, Fy) plane
@@ -34,6 +39,8 @@ import numpy as np
 # difference figure is A (first) minus B (second), e.g. [trained_csv, constant_csv].
 DATASETS: list[str] = []
 CSV_DIR = "logs/push_benchmark"
+LAST_N = 5          # when DATASETS is empty: plot the LAST_N most recent CSVs of CSV_DIR
+                    # (names sort chronologically, so a night's queue of 4 policies -> LAST_N = 4)
 
 # Start values of the live sliders:
 BIN_N = 10.0        # N, side of a force-plane bin
@@ -115,7 +122,7 @@ def resolve_paths() -> list[Path]:
     files = sorted(Path(CSV_DIR).glob("push_benchmark_*.csv"))
     if not files:
       raise FileNotFoundError(f"no push_benchmark_*.csv in {CSV_DIR}")
-    paths = [files[-1]]  # timestamped names sort chronologically
+    paths = files[-max(LAST_N, 1):]  # timestamped names sort chronologically
   for p in paths:
     if not p.exists():
       raise FileNotFoundError(p)
@@ -183,6 +190,8 @@ class Viewer:
 
     self.ds = datasets
     self.out_prefix = out_prefix
+    self.multi = len(datasets) > 2   # 3+ CSVs: maps/3D show one dataset chosen by the radio box
+    self.focus = 0
     self.lim_of = lambda bin_n: math.ceil(max(d.f_max for d in datasets) / bin_n) * bin_n
 
     # difference only when run settings match
@@ -195,11 +204,11 @@ class Viewer:
       else:
         self.diff = True
     elif len(datasets) > 2:
-      print("[info] difference panels need exactly 2 datasets: skipped")
+      print("[info] 3+ datasets: no difference panels; maps and 3D show the dataset picked by the radio box")
 
     # panel list, filled row by row on a N_COLS grid
     panels = []
-    for i in range(len(datasets)):
+    for i in range(1 if self.multi else len(datasets)):
       panels += [("rate", i), ("ttf", i), ("count", i)]
     if self.diff:
       panels += [("drate", None), ("dttf", None)]
@@ -239,7 +248,7 @@ class Viewer:
     self.radio = None
     if len(self.surf_options) > 1:
       rax = f.add_axes([0.775, 0.03, 0.13, 0.12])
-      rax.set_title("3D shows", fontsize=8)
+      rax.set_title("maps + 3D show" if self.multi else "3D shows", fontsize=8)
       self.radio = RadioButtons(rax, self.surf_options)
       self.radio.on_clicked(self._on_radio)
     bax = f.add_axes([0.92, 0.06, 0.06, 0.04])
@@ -256,7 +265,11 @@ class Viewer:
   # --- callbacks -------------------------------------------------------------
   def _on_radio(self, label):
     self.surf_sel = label
-    self._after(surface=True)
+    if self.multi:
+      self.focus = self.surf_options.index(label)
+      self._after(maps=True, surface=True)
+    else:
+      self._after(surface=True)
 
   def _after(self, maps=False, surface=False, direction=False, magnitude=False):
     if maps or surface:
@@ -277,11 +290,15 @@ class Viewer:
     print(f"[plot] saved {out}")
 
   # --- planes ----------------------------------------------------------------
+  def shown(self) -> list[Data]:
+    """Datasets that get map panels: all of them with 1-2 CSVs, the radio's pick with 3+."""
+    return [self.ds[self.focus]] if self.multi else self.ds
+
   def planes(self):
     if getattr(self, "_planes_cache", None) is None:
       bin_n, mc = float(self.s_bin.val), int(self.s_min.val)
       lim = self.lim_of(bin_n)
-      self._planes_cache = (lim, [Plane(d, lim, bin_n, mc) for d in self.ds])
+      self._planes_cache = (lim, [Plane(d, lim, bin_n, mc) for d in self.shown()])
     return self._planes_cache
 
   # --- 2D maps ---------------------------------------------------------------
@@ -316,7 +333,7 @@ class Viewer:
   def draw_maps(self):
     lim, planes = self.planes()
     mc = int(self.s_min.val)
-    for i, (d, p) in enumerate(zip(self.ds, planes)):
+    for i, (d, p) in enumerate(zip(self.shown(), planes)):
       self._map(("rate", i), p.rate, lim, f"{d.label}: recovery rate (n>={mc})", "RdYlGn", 0, 1,
                 "recovered / trials", p.count, d, p.centres)
       self._map(("ttf", i), p.ttf, lim,
@@ -342,11 +359,14 @@ class Viewer:
     ax.clear()
     ax.view_init(elev, azim)
     k = self.surf_options.index(self.surf_sel)
+    if self.multi:
+      k = 0  # planes() holds only the focused dataset
+    shown = self.shown()
     t0 = self.ds[0].timeout_s
-    if k < len(self.ds):
-      Z, cmap, lo, hi, zl = planes[k].ttf, "viridis", 0.0, self.ds[k].timeout_s, (0.0, self.ds[k].timeout_s)
+    if k < len(shown):
+      Z, cmap, lo, hi, zl = planes[k].ttf, "viridis", 0.0, shown[k].timeout_s, (0.0, shown[k].timeout_s)
       centres = planes[k].centres
-      title = f"{self.ds[k].label}: mean time-to-fall"
+      title = f"{shown[k].label}: mean time-to-fall"
     else:
       Z = planes[0].ttf - planes[1].ttf
       cmap, lo, hi, zl = "RdBu", -t0, t0, (-t0, t0)
@@ -368,16 +388,13 @@ class Viewer:
     ns = int(self.s_sec.val)
     for k, d in enumerate(self.ds):
       w, n, r = _sector_stats(d, ns)
-      lo, hi = wilson(r, n)
       rate = np.where(n > 0, r / np.maximum(n, 1), np.nan)
       ctr = np.arange(ns) * w
-      off = (k - (len(self.ds) - 1) / 2) * w * 0.18
-      ax.errorbar(ctr + off, rate, yerr=[np.clip(rate - lo, 0, None), np.clip(hi - rate, 0, None)],
-                  fmt="o", ms=4, color=f"C{k}", capsize=2, label=f"{d.label} (n={d.n})")
-      for x, y, c in zip(ctr + off, rate, n):
-        if c > 0 and ns <= 12:
+      ax.plot(ctr, rate, "-o", ms=4, color=f"C{k % 10}", label=f"{d.label} (n={d.n})")
+      for x, y, c in zip(ctr, rate, n):
+        if c > 0 and ns <= 12 and len(self.ds) <= 2:
           ax.annotate(str(c), (x, y), textcoords="offset points", xytext=(0, 6),
-                      ha="center", fontsize=5.5, color=f"C{k}")
+                      ha="center", fontsize=5.5, color=f"C{k % 10}")
     w = 360.0 / ns
     ax.set_xticks(np.arange(ns) * w)
     ax.set_xticklabels([f"{x:g}" for x in np.arange(ns) * w], fontsize=6, rotation=45)
@@ -406,8 +423,8 @@ class Viewer:
         drawn = True
         x = 0.5 * (edges[:-1] + edges[1:])
         lo, hi = wilson(r, n)
-        ax.plot(x[ok], (r / np.maximum(n, 1))[ok], "-o", ms=4, color=f"C{k}", label=d.label)
-        ax.fill_between(x[ok], lo[ok], hi[ok], color=f"C{k}", alpha=0.2)
+        ax.plot(x[ok], (r / np.maximum(n, 1))[ok], "-o", ms=4, color=f"C{k % 10}", label=d.label)
+        ax.fill_between(x[ok], lo[ok], hi[ok], color=f"C{k % 10}", alpha=0.2)
     ax.tick_params(labelsize=7)
     ax.set_xlabel("push magnitude [N]", fontsize=8)
     ax.set_ylabel("recovery rate", fontsize=8)
@@ -424,6 +441,15 @@ class Viewer:
 def main():
   paths = resolve_paths()
   datasets = [Data(p) for p in paths]
+  labels = [d.label for d in datasets]
+  for i, d in enumerate(datasets):  # identical labels would make the legends unreadable
+    if labels.count(d.label) > 1:
+      d.label = f"{d.label} [{i + 1}]"
+  if len(datasets) >= 2:
+    for key in RUN_KEYS:
+      if len({d.meta[key] for d in datasets}) > 1:
+        print(f"[warn] the datasets differ in {key}: {[d.meta[key] for d in datasets]} "
+              "(curves of different conditions are overlaid; the plan keeps them separate)")
   viewer = Viewer(datasets, paths[0].with_suffix(""))
   if SAVE_PNG:
     viewer.save("view")

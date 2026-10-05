@@ -3,6 +3,9 @@
 Run: uv run python scripts/push_benchmark.py
 Edit the constants below, no CLI args.
 
+POLICIES is a queue: the script runs one full benchmark per entry, in list order, and writes
+one CSV per entry (fresh env per policy, same SEED, so every policy sees the same push draws).
+
 Works for any NUM_ENVS (1 to hundreds). Each env runs its own trial lifecycle:
 
     spawn -> walk -> push appears at a random time in PUSH_START_RANGE_S
@@ -40,26 +43,35 @@ TASK_ID = "Mc-Mjlab-Ismpc-Hybrid-Ismpc-Walking-Hrp5P"
 ACTION_NAME = "ismpc_sine"
 TORSO_BODY = "Body"
 
-# Policy under test. "" -> constant (zero) policy built from the physical values below.
-# A .pt path loads that checkpoint. A .onnx path loads the sibling .pt with the same stem
-# (the benchmark runs the training-side policy, not the deployed ONNX graph).
-POLICY = ""
-RUN_LABEL = ""            # name stored in the CSV and its file name; "" -> "constant" or the checkpoint stem
+# Policies to benchmark, run one after the other in this order, one CSV each.
+# Each entry is a path string or a (path, label) tuple:
+#   ""              -> constant (zero) policy built from the CONST_* physical values below
+#   "x/model_N.pt"  -> that checkpoint
+#   "x/model_N.onnx"-> the sibling .pt with the same stem (the benchmark runs the training-side
+#                      policy, not the deployed ONNX graph)
+#   (path, label)   -> same, with an explicit name stored in the CSV and its file name
+# Default label: "constant" or the checkpoint stem. All paths are checked before the queue starts.
+POLICIES = [
+  # "",
+  ("/home/noahluc/workspace/mc_mjlab/logs/rsl_rl/mc_rtc_ismpc_hybrid/2026-10-04_21-05-27/model_500.pt", "model_500"),
+  ("logs/rsl_rl/mc_rtc_ismpc_hybrid/2026-10-03_17-40-52/model_800.pt", "model_800"),
+]
+STOP_ON_ERROR = False     # False: a failing policy is reported and the queue goes on with the next one
 
-NUM_ENVS = 200
-N_TRIALS = 1000              # total trials issued; the run ends when all of them are resolved
+NUM_ENVS = 400
+N_TRIALS = 5000              # total trials issued; the run ends when all of them are resolved
 SEED = 42
 SHOW_VIEWER = False       # MuJoCo viewer (real-time pacing); for NUM_ENVS=1 debugging
 
 TARGET_TWIST = (0.0, 0.0, 0.0)   # vx, vy, omega pinned as the command
-PUSH_DURATION_S = 0.6           # fixed per run
-F_MIN, F_MAX = 0., 200.0         # N, push sampled uniformly by AREA in the annulus F_MIN <= |F| <= F_MAX
+PUSH_DURATION_S = 0.8            # fixed per run
+F_MIN, F_MAX = 0., 140.0         # N, push sampled uniformly by AREA in the annulus F_MIN <= |F| <= F_MAX
                                  # (disk point picking; F_MIN=0 gives the full disk, F_MIN=F_MAX a ring)
 PUSH_START_RANGE_S = (3.0, 6.0)  # push start, seconds after episode start, uniform
 RECOVERY_TIMEOUT_S = 8.0         # survive this long after the push START to count as recovered
 DR_TRAIN = False                 # True keeps the training mass / payload randomization
 
-# Constant-policy physical values (what reaches the controller). Used only when POLICY == "".
+# Constant-policy physical values (what reaches the controller). Used for "" entries of POLICIES.
 CONST_WALK = True
 CONST_TS = 1.1
 CONST_COM_OFFSET = 0.9
@@ -183,19 +195,45 @@ def _check_contract(contract_path: Path, term, venv) -> dict | None:
   return c
 
 
-def load_policy(venv, agent_cfg, device):
-  """Returns (policy, label, path_str, iteration, extra_info_dict)."""
+def _parse_spec(spec) -> tuple[str, str]:
+  """POLICIES entry -> (path string, user label). "" path means the constant policy."""
+  if isinstance(spec, (tuple, list)):
+    assert len(spec) == 2, f"POLICIES tuple entries are (path, label), got {spec!r}"
+    return str(spec[0]), str(spec[1])
+  return str(spec), ""
+
+
+def _checkpoint_path(raw_path: str) -> Path:
+  path = Path(raw_path).expanduser()
+  return path.with_suffix(".pt") if path.suffix == ".onnx" else path
+
+
+def validate_policies() -> None:
+  """Fail fast, before hours of running: every non-constant entry must point to a file."""
+  assert len(POLICIES) >= 1, "POLICIES is empty"
+  missing = []
+  for spec in POLICIES:
+    raw, _ = _parse_spec(spec)
+    if raw and not _checkpoint_path(raw).exists():
+      missing.append(str(_checkpoint_path(raw)))
+  if missing:
+    raise FileNotFoundError("checkpoint(s) not found:\n- " + "\n- ".join(missing))
+
+
+def load_policy(venv, agent_cfg, device, spec):
+  """Returns (policy, label, path_str, iteration, extra_info_dict) for one POLICIES entry."""
   term = venv.unwrapped.action_manager.get_term(ACTION_NAME)
-  if not POLICY:
+  raw_path, user_label = _parse_spec(spec)
+  if not raw_path:
     _patch_mappings(term)
     policy = ConstantPolicy(venv.unwrapped.action_space.shape, venv.unwrapped.device)
     params = dict(
       walk=CONST_WALK, ts=CONST_TS, com_offset=CONST_COM_OFFSET, com_freq=CONST_COM_FREQ,
       com_sin_amp=CONST_COM_SIN_AMP, com_cos_amp=CONST_COM_COS_AMP, twist=list(TARGET_TWIST),
     )
-    return policy, (RUN_LABEL or "constant"), "", None, params
+    return policy, (user_label or "constant"), "", None, params
 
-  path = Path(POLICY).expanduser()
+  path = Path(raw_path).expanduser()
   if path.suffix == ".onnx":
     pt = path.with_suffix(".pt")
     print(f"[info] {path.name} is ONNX: benchmarking the training-side checkpoint {pt.name}")
@@ -217,7 +255,7 @@ def load_policy(venv, agent_cfg, device):
       iteration = int(path.stem.split("_")[1])
     except (IndexError, ValueError):
       pass
-  return policy, (RUN_LABEL or path.stem), str(path), iteration, {}
+  return policy, (user_label or path.stem), str(path), iteration, {}
 
 
 # ----------------------------------------------------------------------------
@@ -243,6 +281,10 @@ class CsvLog:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in label)
     self.path = d / f"push_benchmark_{stamp}_{safe}.csv"
+    k = 2
+    while self.path.exists():  # two runs in the same second with the same label
+      self.path = d / f"push_benchmark_{stamp}_{safe}_{k}.csv"
+      k += 1
     self._run_vals = list(run_cols.values())
     self._f = open(self.path, "w", newline="")
     self._w = csv.writer(self._f)
@@ -595,15 +637,22 @@ class _EnvProxy:
 
 
 # ----------------------------------------------------------------------------
-def main():
-  assert NUM_ENVS >= 1 and N_TRIALS >= 1
+def run_one(spec) -> dict:
+  """One full benchmark (fresh env, N_TRIALS trials, one CSV) for one POLICIES entry."""
   venv, cfg, agent_cfg, device = build_env()
+  try:
+    return _run_with_env(venv, agent_cfg, device, spec)
+  finally:
+    venv.close()  # also when setup (policy load, contract check) failed
+
+
+def _run_with_env(venv, agent_cfg, device, spec) -> dict:
   uw = venv.unwrapped
   term = uw.action_manager.get_term(ACTION_NAME)
   body_ids, body_names = uw.scene["robot"].find_bodies(TORSO_BODY)
   assert len(body_ids) == 1, f"{TORSO_BODY!r} matched {body_names}"
 
-  policy, label, ckpt_path, iteration, const_params = load_policy(venv, agent_cfg, device)
+  policy, label, ckpt_path, iteration, const_params = load_policy(venv, agent_cfg, device, spec)
 
   run_cols = dict(
     started_local=datetime.now().isoformat(timespec="seconds"),
@@ -626,6 +675,7 @@ def main():
   # register the benchmark as a debug visualizer (env.update_visualizers iterates this dict).
   uw.manager_visualizers["push_benchmark"] = bench
   t_start = time.perf_counter()
+  interrupted = False
   try:
     with torch.no_grad():
       if SHOW_VIEWER:
@@ -647,13 +697,72 @@ def main():
           actions = policy(obs)
           obs = bench.step(actions)[0]
   except KeyboardInterrupt:
+    interrupted = True
     print("\n[bench] interrupted")
   finally:
     print(bench.summary())
     print(f"[bench] finished={bench.finished}, {time.perf_counter() - t_start:.0f} s wall")
     print(f"[bench] results in {log.path}")
     log.close()
-    venv.close()
+  valid = bench.n_fell + bench.n_recovered
+  return dict(
+    label=label, csv=str(log.path), finished=bench.finished, interrupted=interrupted,
+    resolved=bench.resolved, recovery=(bench.n_recovered / valid if valid else None),
+    pre_push=bench.pre_push, wall_s=time.perf_counter() - t_start,
+  )
+
+
+def _free_gpu() -> None:
+  import gc
+
+  gc.collect()
+  if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+
+def main():
+  assert NUM_ENVS >= 1 and N_TRIALS >= 1
+  validate_policies()
+  if SHOW_VIEWER and len(POLICIES) > 1:
+    print("[note] SHOW_VIEWER=True with several policies: each run waits for its viewer to close.")
+  results = []
+  t_all = time.perf_counter()
+  for k, spec in enumerate(POLICIES):
+    raw, user_label = _parse_spec(spec)
+    name = user_label or (Path(raw).stem if raw else "constant")
+    print(f"\n{'=' * 78}\n[queue] {k + 1}/{len(POLICIES)}: {name}\n{'=' * 78}")
+    try:
+      res = run_one(spec)
+    except Exception as e:  # noqa: BLE001  (one bad policy must not kill the whole night)
+      import traceback
+
+      traceback.print_exc()
+      print(f"[queue] policy '{name}' FAILED: {type(e).__name__}: {e}")
+      results.append(dict(label=name, csv="", finished=False, interrupted=False, error=str(e)))
+      _free_gpu()
+      if STOP_ON_ERROR:
+        break
+      continue
+    results.append(res)
+    _free_gpu()
+    if res["interrupted"]:
+      print("[queue] Ctrl+C: the remaining policies are not run")
+      break
+
+  print(f"\n{'=' * 78}\n[queue] summary ({time.perf_counter() - t_all:.0f} s total)\n{'=' * 78}")
+  for r in results:
+    if "error" in r:
+      status = f"FAILED ({r['error']})"
+    else:
+      rate = f"{100 * r['recovery']:.1f} %" if r["recovery"] is not None else "n/a"
+      status = (
+        f"{'done' if r['finished'] else 'INCOMPLETE'}, {r['resolved']}/{N_TRIALS} trials, "
+        f"recovery {rate}, pre-push failures {r['pre_push']}, {r['wall_s']:.0f} s"
+      )
+    print(f"  {r['label']:<24} {status}\n    {r['csv']}")
+  skipped = len(POLICIES) - len(results)
+  if skipped:
+    print(f"  ({skipped} policy/policies not run)")
 
 
 if __name__ == "__main__":
