@@ -26,6 +26,7 @@ manager_base.py/reward_manager.py read if this errors on first run.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -231,6 +232,7 @@ def twist_tutor(
   command_name: str,
   axis: int,
   std: float = 0.1,
+  deadzone: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> torch.Tensor:
   """Dense guidance ("tutor") term: exp(-(policy twist output - command)^2 / std^2)
   on one axis (0=vx, 1=vy, 2=omega).
@@ -247,15 +249,22 @@ def twist_tutor(
   achieved-velocity terms in the reward: a policy can satisfy this term
   perfectly while the robot does not actually achieve the velocity.
 
-  GATED on the policy's walk decision: returns 0 for envs whose policy currently commands "stop"
-  (last_walk_action < 0.5), and the value above otherwise.
+  GATED on the policy's walk decision: the term is 0 while the policy commands "stop" (last_walk_action < 0.5),
+  EXCEPT when the whole sampled command lies inside the deadzone, i.e. |cmd_x| < deadzone[0] and
+  |cmd_y| < deadzone[1] and |cmd_omega| < deadzone[2] (all three at once, strict). There stopping is a legitimate
+  answer, so the tutor stays on (and is neutral between walking and standing). The default (0, 0, 0) is an empty
+  deadzone, i.e. a pure walk gate. The command is constant within an episode, so the deadzone does not switch
+  mid-episode.
   """
   action_term = env.action_manager.get_term(action_name)
   out = action_term.last_twist_action[:, axis]
-  cmd = env.command_manager.get_command(command_name)[:, axis]
+  command = env.command_manager.get_command(command_name)
+  cmd = command[:, axis]
   reward = torch.exp(-torch.square(out - cmd) / std**2)
-  # Gated on the policy's walk decision: no tutoring while it chooses to stop.
-  return reward * _policy_wants_walk(action_term).to(dtype=reward.dtype)
+  eps = torch.as_tensor(deadzone, dtype=command.dtype, device=command.device)
+  in_deadzone = torch.all(command[:, :3].abs() < eps, dim=-1)
+  active = _policy_wants_walk(action_term) | in_deadzone
+  return reward * active.to(dtype=reward.dtype)
 
 
 class target_linear_vel_avg:
@@ -771,6 +780,183 @@ def debug_est_com_vel_y(env: ManagerBasedRlEnv, action_name: str) -> torch.Tenso
   return action_term.com_lin_vel_est_obs[:, 1]
 
 
+def _solve_exp_rate(lo: float, hi: float, split: float, p_before: float) -> float:
+  """Rate lam of an exponential, shifted to start at ``lo`` and truncated to
+  [lo, hi], such that P(T < split) == p_before. Bisection on the truncated CDF
+  F(s) = expm1(-lam*(s-lo)) / expm1(-lam*(hi-lo)), which is increasing in lam.
+  The uniform law on [lo, hi] is the lam -> 0 limit and has F(split) =
+  (split-lo)/(hi-lo), so p_before must lie strictly above that value."""
+  span, s = hi - lo, split - lo
+  if not (hi > lo and 0.0 < s < span):
+    raise ValueError(f"need lo < split < hi, got lo={lo} split={split} hi={hi}")
+  p_uniform = s / span
+  if not (p_uniform < p_before < 1.0):
+    raise ValueError(
+      f"p_before={p_before} must be in ({p_uniform:.4f}, 1): an exponential "
+      f"cannot put LESS mass before the split than the uniform law does"
+    )
+  a, b = 1e-9, 1e3
+  for _ in range(200):
+    lam = 0.5 * (a + b)
+    cdf = math.expm1(-lam * s) / math.expm1(-lam * span)
+    if cdf < p_before:
+      a = lam
+    else:
+      b = lam
+  return 0.5 * (a + b)
+
+
+class _DiskBodyImpulse(apply_body_impulse):
+  """apply_body_impulse with (1) horizontal forces uniform over a DISK,
+  (2) a truncated-exponential cooldown, (3) an explicit per-env reset, and
+  (4) privileged push-state getters for the critic.
+
+  * Force: direction uniform, magnitude R*sqrt(u) (uniform by AREA), fz = 0,
+    where R = max(|lo|, |hi|) of ``force_range`` read at EVERY call, so the
+    push_scale curriculum (which rewrites params["force_range"]) still works.
+  * Cooldown (gap between the END of a push and the START of the next):
+    lo + truncated exponential on [lo, hi] = ``cooldown_s``, with the rate
+    chosen so that P(gap < cooldown_split_s) = cooldown_p_before_split.
+    The first cooldown of an episode uses the same law.
+  * The gap is drawn at trigger time and stored, so the critic can be told the
+    exact time until the next push even while a push is active.
+  * reset(): clears active state and redraws the cooldown for the reset envs
+    (stock reset only zeroes the wrench).
+  """
+
+  def __init__(self, cfg, env: ManagerBasedRlEnv):
+    p = cfg.params
+    if p.get("body_point_offset") is not None:
+      raise ValueError("_DiskBodyImpulse ignores body_point_offset; remove it")
+    if any(abs(float(t)) > 0.0 for t in p.get("torque_range", (0.0, 0.0))):
+      raise ValueError("_DiskBodyImpulse ignores torque_range; it must be (0, 0)")
+    lo, hi = p["cooldown_s"]
+    self._cd_lo, self._cd_hi = float(lo), float(hi)
+    self._cd_rate = _solve_exp_rate(
+      self._cd_lo,
+      self._cd_hi,
+      float(p["cooldown_split_s"]),
+      float(p["cooldown_p_before_split"]),
+    )
+    super().__init__(cfg, env)  # calls self._sample_cooldown
+    n, dev = self._num_envs, self._device
+    self._next_gap = torch.zeros(n, device=dev)
+    self._force_w = torch.zeros(n, 2, device=dev)
+    self._since_push = torch.full((n,), self._cd_hi, device=dev)
+
+  def _sample_cooldown(self, n: int) -> torch.Tensor:
+    u = torch.rand(n, device=self._device)
+    span = self._cd_hi - self._cd_lo
+    trunc = -math.expm1(-self._cd_rate * span)  # 1 - exp(-lam*span)
+    return self._cd_lo - torch.log1p(-u * trunc) / self._cd_rate
+
+  def __call__(
+    self,
+    env,
+    env_ids,
+    force_range,
+    torque_range=None,
+    duration_s=(0.1, 0.4),
+    cooldown_s=None,
+    asset_cfg=None,
+    body_point_offset=None,
+    **_unused,
+  ) -> None:
+    del env, env_ids, torque_range, cooldown_s, asset_cfg, body_point_offset
+    dt = self._step_dt
+    self._since_push.add_(dt).clamp_(max=self._cd_hi)
+    self._time_remaining[self._active] -= dt
+
+    expired = self._active & (self._time_remaining <= 0)
+    if expired.any():
+      ids = expired.nonzero(as_tuple=False).squeeze(-1)
+      zeros = torch.zeros((len(ids), self._num_bodies, 3), device=self._device)
+      self._asset.write_external_wrench_to_sim(
+        zeros, zeros, env_ids=ids, body_ids=self._body_ids
+      )
+      self._active[ids] = False
+      self._time_remaining[ids] = 0.0
+      self._force_w[ids] = 0.0
+      self._interval_time_left[ids] = self._next_gap[ids]
+
+    self._interval_time_left -= dt
+    eligible = (~self._active) & (self._interval_time_left <= 0)
+    if not eligible.any():
+      return
+    ids = eligible.nonzero(as_tuple=False).squeeze(-1)
+    n = len(ids)
+
+    r_max = max(abs(float(force_range[0])), abs(float(force_range[1])))
+    ang = 2.0 * math.pi * torch.rand(n, self._num_bodies, device=self._device)
+    mag = r_max * torch.sqrt(torch.rand(n, self._num_bodies, device=self._device))
+    forces = torch.zeros((n, self._num_bodies, 3), device=self._device)
+    forces[..., 0] = mag * torch.cos(ang)
+    forces[..., 1] = mag * torch.sin(ang)
+    self._asset.write_external_wrench_to_sim(
+      forces, torch.zeros_like(forces), env_ids=ids, body_ids=self._body_ids
+    )
+
+    lo, hi = duration_s
+    self._time_remaining[ids] = torch.rand(n, device=self._device) * (hi - lo) + lo
+    self._active[ids] = True
+    self._force_w[ids] = forces[:, 0, :2]
+    self._since_push[ids] = 0.0
+    self._next_gap[ids] = self._sample_cooldown(n)
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    super().reset(env_ids)  # zeroes the wrench of active envs
+    n = self._num_envs if isinstance(env_ids, slice) else len(env_ids)
+    if n == 0:
+      return
+    self._active[env_ids] = False
+    self._time_remaining[env_ids] = 0.0
+    self._force_w[env_ids] = 0.0
+    self._since_push[env_ids] = self._cd_hi
+    self._interval_time_left[env_ids] = self._sample_cooldown(n)
+
+  def push_state(self, force_scale: float, time_cap_s: float) -> torch.Tensor:
+    """(N, 5): [active, fx_yaw/scale, fy_yaw/scale, s_until_next, s_since_last].
+    Force is in the robot's yaw frame, zero when no push is active. Times are
+    in seconds, clipped to [0, time_cap_s]; 'since last' counts from the START
+    of the last push in this episode (time_cap_s if none yet)."""
+    w, x, y, z = self._asset.data.root_link_quat_w.unbind(-1)
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    c, s = torch.cos(yaw), torch.sin(yaw)
+    fx, fy = self._force_w[:, 0], self._force_w[:, 1]
+    fx_b = (c * fx + s * fy) / force_scale
+    fy_b = (-s * fx + c * fy) / force_scale
+    until = torch.where(
+      self._active,
+      self._time_remaining + self._next_gap,
+      self._interval_time_left.clamp(min=0.0),
+    ).clamp(max=time_cap_s)
+    since = self._since_push.clamp(max=time_cap_s)
+    return torch.stack([self._active.float(), fx_b, fy_b, until, since], dim=-1)
+
+
+def push_state(
+  env: ManagerBasedRlEnv,
+  event_name: str,
+  force_scale: float = 100.0,
+  time_cap_s: float = 50.0,
+) -> torch.Tensor:
+  """CRITIC-ONLY privileged observation (5 values) of one push event: active,
+  push force x/y in the robot yaw frame (/force_scale), time until the next
+  push, time since the last one. Zeros if the event isn't registered yet."""
+  zeros = torch.zeros(env.num_envs, 5, device=env.device)
+  em = getattr(env, "event_manager", None)
+  if em is None:
+    return zeros
+  try:
+    term = em.get_term_cfg(event_name).func
+  except ValueError:
+    return zeros
+  fn = getattr(term, "push_state", None)
+  return zeros if fn is None else fn(force_scale, time_cap_s)
+
+
 class settle_gated_apply_body_impulse:
   """Wraps mjlab.envs.mdp.events.apply_body_impulse so it cannot trigger a
   push during the first ``settle_ticks`` steps of an episode.
@@ -806,9 +992,11 @@ class settle_gated_apply_body_impulse:
   state is corrected BEFORE its trigger logic runs, so no impulse is ever
   computed or written for a settling env in the first place.
 
-  cfg.params must include everything apply_body_impulse itself needs
-  (asset_cfg, force_range, torque_range, duration_s, cooldown_s), PLUS
-  settle_ticks (int, number of env steps after reset during which pushes
+  The inner term is _DiskBodyImpulse (disk-uniform pushes, truncated-
+  exponential cooldown, privileged push_state getter); see its docstring.
+  cfg.params must include asset_cfg, force_range, torque_range (must be
+  (0, 0)), duration_s, cooldown_s, cooldown_split_s,
+  cooldown_p_before_split, PLUS settle_ticks (int, number of env steps after reset during which pushes
   are suppressed for that env).
   """
 
@@ -823,7 +1011,7 @@ class settle_gated_apply_body_impulse:
     class _InnerCfg:
       params = inner_params
 
-    self._inner = apply_body_impulse(_InnerCfg(), env)
+    self._inner = _DiskBodyImpulse(_InnerCfg(), env)
 
   def __call__(
     self,
@@ -845,6 +1033,9 @@ class settle_gated_apply_body_impulse:
         still_settling, torch.clamp(current, min=floor_s), current
       )
     self._inner(env, None, **inner_kwargs)
+
+  def push_state(self, force_scale: float, time_cap_s: float) -> torch.Tensor:
+    return self._inner.push_state(force_scale, time_cap_s)
 
   def debug_vis(self, visualizer) -> None:
     if hasattr(self._inner, "debug_vis"):

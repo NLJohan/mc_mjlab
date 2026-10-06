@@ -24,6 +24,7 @@ import json
 import csv
 import math
 import time
+from collections import Counter
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,14 +53,12 @@ TORSO_BODY = "Body"
 #   (path, label)   -> same, with an explicit name stored in the CSV and its file name
 # Default label: "constant" or the checkpoint stem. All paths are checked before the queue starts.
 POLICIES = [
-  # "",
-  ("/home/noahluc/workspace/mc_mjlab/logs/rsl_rl/mc_rtc_ismpc_hybrid/2026-10-04_21-05-27/model_500.pt", "model_500"),
-  ("logs/rsl_rl/mc_rtc_ismpc_hybrid/2026-10-03_17-40-52/model_800.pt", "model_800"),
+  "/home/noahluc/workspace/mc_mjlab/logs/rsl_rl/mc_rtc_ismpc_hybrid/2026-10-04_21-05-27/model_500.pt",
 ]
 STOP_ON_ERROR = False     # False: a failing policy is reported and the queue goes on with the next one
 
 NUM_ENVS = 400
-N_TRIALS = 5000              # total trials issued; the run ends when all of them are resolved
+N_TRIALS = 600            # total trials issued; the run ends when all of them are resolved
 SEED = 42
 SHOW_VIEWER = False       # MuJoCo viewer (real-time pacing); for NUM_ENVS=1 debugging
 
@@ -90,6 +89,13 @@ PROGRESS_EVERY_S = 30.0   # progress line period (wall seconds); 0 disables
 MAX_PREPUSH_PRINTS = 10   # print the first few pre-push failures with their cause
 # ========================================================================
 
+# --- debugging the pre-push failures -------------------------------------------------
+DEBUG_WRENCH = "normal"   # "normal" | "zero_force" (wrench writes happen but with 0 N: tests the write
+                          # path alone) | "no_writes" (no wrench write at all: tests everything else)
+CHECK_WRENCH = True       # every step: compare the real xfrc_applied of the torso with what the
+                          # benchmark intends (0 outside the push), print the first mismatches
+STARTUP_STEPS = 20        # pre-push failures during the first steps (controller startup) are counted apart
+MAX_WRENCH_WARNINGS = 10
 FAULT_TERMS = ("fell_over", "collapsed", "controller_failed")  # failure = any of these
 REMOVED_EVENTS = ("push_torso", "push_right_hand", "push_left_hand")
 DR_EVENTS = ("randomize_body_density", "randomize_hand_payload")
@@ -389,7 +395,18 @@ class PushBenchmark:
     self.issued = 0
     self.resolved = 0
     self.n_fell = self.n_recovered = self.n_worker_failed = 0
-    self.pre_push = 0
+    self.pre_push = 0          # before the push, startup excluded
+    self.startup_fail = 0      # before the push, in the first STARTUP_STEPS steps
+    self.wrench_bad_steps = 0
+    self.wrench_bad_envs = 0
+    # how each env's previous episode ended, to see whether pre-push failures follow falls
+    self.prev_outcome = ["start"] * self.n
+    self.prev_mag = [0.0] * self.n
+    self.ep_started = Counter()      # episodes ended, by previous outcome
+    self.pre_after = Counter()       # ... of which ended before the push
+    self.ep_after_fall = Counter()   # same, only after a 'fell' episode, by previous push size bucket
+    self.pre_after_fall = Counter()
+    self._pre_log = None
     self.anomalies = 0
     self.total_steps = 0
     self.finished = False
@@ -435,6 +452,10 @@ class PushBenchmark:
 
   # --- wrench --------------------------------------------------------------
   def _write_wrench(self, ids, fx, fy):
+    if DEBUG_WRENCH == "no_writes":
+      return
+    if DEBUG_WRENCH == "zero_force":
+      fx, fy = torch.zeros_like(fx), torch.zeros_like(fy)
     f = torch.zeros(len(ids), 1, 3, device=self.dev)
     f[:, 0, 0] = fx
     f[:, 0, 1] = fy
@@ -445,6 +466,28 @@ class PushBenchmark:
   def _zero_wrench(self, ids):
     z = torch.zeros(len(ids), device=self.dev)
     self._write_wrench(ids, z, z)
+
+  def _check_wrench(self, t, step_no):
+    """The torso xfrc_applied must equal the intended push: (fx, fy, 0) while t in [start, end)
+    for an active env, zero everywhere else (also right after resets)."""
+    acting = self.active & (t >= self.start) & (t < self.end)
+    exp = torch.zeros(self.n, 3, device=self.dev)
+    exp[:, 0] = torch.where(acting, self.fx, torch.zeros_like(self.fx))
+    exp[:, 1] = torch.where(acting, self.fy, torch.zeros_like(self.fy))
+    got = self.robot.data.body_external_wrench[:, self.body_id, :3]
+    bad = (got - exp).abs().amax(dim=-1) > 1e-3
+    nb = int(bad.sum())
+    if nb == 0:
+      return
+    self.wrench_bad_steps += 1
+    self.wrench_bad_envs += nb
+    if self.wrench_bad_steps <= MAX_WRENCH_WARNINGS:
+      for env in bad.nonzero(as_tuple=False).squeeze(-1).tolist()[:3]:
+        print(
+          f"[WRENCH MISMATCH] step {step_no}: env {env} t={int(t[env])} start={int(self.start[env])} "
+          f"active={bool(self.active[env])} expected {exp[env].tolist()} actual {got[env].tolist()} "
+          f"({nb} env(s) mismatched this step)"
+        )
 
   # --- stepping ------------------------------------------------------------
   def step(self, actions):
@@ -457,6 +500,10 @@ class PushBenchmark:
       self._write_wrench(ids, self.fx[ids], self.fy[ids])
     if bool(off.any()):
       self._zero_wrench(off.nonzero(as_tuple=False).squeeze(-1))
+
+    if CHECK_WRENCH and DEBUG_WRENCH == "normal":
+      self._check_wrench(t, self.total_steps)
+    acting_now = int((self.active & (t >= self.start) & (t < self.end)).sum())
 
     obs, rew, dones, extras = self.venv.step(actions)
     self.total_steps += 1
@@ -485,7 +532,9 @@ class PushBenchmark:
         self._record(resolved_mask, fell, wfail, t_after, flags)
       redo = pre | anom
       if bool(redo.any()):
-        self._note_redo(redo, pre, t_after, flags)
+        self._note_redo(redo, pre, t_after, flags, acting_now, int(to_reset.sum()))
+
+      self._track_episode_outcomes(to_reset, fell, recov, wfail, pre, anom)
 
       ids = to_reset.nonzero(as_tuple=False).squeeze(-1)
       obs_dict, _ = uw.reset(env_ids=ids)
@@ -577,21 +626,102 @@ class PushBenchmark:
         )
     self.log.add_trials(rows)
 
-  def _note_redo(self, redo, pre, t_after, flags):
+  MAG_BUCKETS = (35.0, 70.0, 105.0)
+
+  def _mag_bucket(self, mag: float) -> str:
+    lo = 0.0
+    for hi in self.MAG_BUCKETS:
+      if mag < hi:
+        return f"{lo:g}-{hi:g} N"
+      lo = hi
+    return f">={lo:g} N"
+
+  def _track_episode_outcomes(self, to_reset, fell, recov, wfail, pre, anom):
+    """Called before the reset: classify how each ending episode ended, count it under how the
+    env's PREVIOUS episode ended, then remember the new outcome."""
+    startup = self.total_steps <= STARTUP_STEPS
+    for e in to_reset.nonzero(as_tuple=False).squeeze(-1).tolist():
+      if not bool(self.active[e]):
+        continue
+      if bool(wfail[e]):
+        outcome = "worker_failed"
+      elif bool(fell[e]):
+        outcome = "fell"
+      elif bool(recov[e]):
+        outcome = "recovered"
+      elif bool(pre[e]):
+        outcome = "startup" if startup else "pre"
+      elif bool(anom[e]):
+        outcome = "anomaly"
+      else:
+        continue
+      if outcome != "startup":
+        prev = self.prev_outcome[e]
+        self.ep_started[prev] += 1
+        if outcome == "pre":
+          self.pre_after[prev] += 1
+        if prev == "fell":
+          b = self._mag_bucket(self.prev_mag[e])
+          self.ep_after_fall[b] += 1
+          if outcome == "pre":
+            self.pre_after_fall[b] += 1
+      self.prev_outcome[e] = outcome
+      self.prev_mag[e] = (
+        math.hypot(float(self.fx[e]), float(self.fy[e])) if outcome in ("fell", "recovered") else 0.0
+      )
+
+  def prev_table(self) -> str:
+    def row(label, n, k):
+      return f"  {label:<26} {k:5d}/{n:<6d} = {100.0 * k / max(n, 1):5.1f} %"
+
+    lines = ["[pre-push failures by how the env's previous episode ended (startup episodes excluded)]"]
+    for prev in ("start", "startup", "recovered", "fell", "pre", "worker_failed", "anomaly"):
+      if self.ep_started[prev]:
+        lines.append(row(f"after {prev}", self.ep_started[prev], self.pre_after[prev]))
+    if self.ep_after_fall:
+      lines.append("  after a fall, by size of the push of that previous trial:")
+      for b in sorted(self.ep_after_fall, key=lambda x: float(x.lstrip(">=").split("-")[0].split(" ")[0])):
+        lines.append(row("  " + b, self.ep_after_fall[b], self.pre_after_fall[b]))
+    return "\n".join(lines)
+
+  def _note_redo(self, redo, pre, t_after, flags, acting_now, n_reset):
     ids = redo.nonzero(as_tuple=False).squeeze(-1).tolist()
     for env in ids:
       if bool(pre[env]):
+        if self.total_steps <= STARTUP_STEPS:
+          self.startup_fail += 1
+          continue
         self.pre_push += 1
+        cause = "+".join(nm for nm in FAULT_TERMS if bool(flags[nm][env])) or "unknown"
+        w = self.robot.data.body_external_wrench[env, self.body_id, :3].tolist()
+        self._log_prepush(env, cause, int(t_after[env]), int(self.start[env]), w, acting_now, n_reset)
         if self.pre_push <= MAX_PREPUSH_PRINTS:
-          cause = "+".join(nm for nm in FAULT_TERMS if bool(flags[nm][env])) or "unknown"
           print(
             f"[warn] env {env}: terminated BEFORE its push ({cause}) at tick "
-            f"{int(t_after[env])} / push tick {int(self.start[env])}; trial redrawn "
+            f"{int(t_after[env])} / push tick {int(self.start[env])}, torso wrench now "
+            f"({w[0]:.1f}, {w[1]:.1f}, {w[2]:.1f}) N; trial redrawn "
             f"(pre-push failures so far: {self.pre_push})"
           )
       else:
         self.anomalies += 1
         print(f"[warn] env {env}: time_out mid-trial (anomaly); trial redrawn")
+
+  def _log_prepush(self, env, cause, tick, start, w, acting_now, n_reset):
+    """One row per pre-push failure (startup excluded) in <csv stem>_prepush.csv."""
+    if self._pre_log is None:
+      path = self.log.path.with_name(self.log.path.stem + "_prepush.csv")
+      self._pre_log = open(path, "w", newline="")
+      self._pre_w = csv.writer(self._pre_log)
+      self._pre_w.writerow([
+        "step", "env", "tick", "push_start_tick", "cause", "wrench_x", "wrench_y", "wrench_z",
+        "envs_being_pushed_now", "envs_reset_this_step", "prev_outcome", "prev_push_N",
+      ])
+      print(f"[bench] pre-push failure details -> {path}")
+    self._pre_w.writerow([
+      self.total_steps, env, tick, start, cause, *w, acting_now, n_reset,
+      self.prev_outcome[env], f"{self.prev_mag[env]:.1f}",
+    ])
+    self._pre_log.flush()
 
   def _maybe_progress(self):
     if PROGRESS_EVERY_S <= 0:
@@ -613,7 +743,8 @@ class PushBenchmark:
     return (
       f"[summary] {self.resolved}/{N_TRIALS} trials: recovered {self.n_recovered}, fell "
       f"{self.n_fell}, worker-failed {self.n_worker_failed} | recovery rate {rate} | "
-      f"pre-push failures {self.pre_push}, anomalies {self.anomalies} | "
+      f"pre-push failures {self.pre_push} (+{self.startup_fail} at startup), anomalies "
+      f"{self.anomalies}, wrench mismatches {self.wrench_bad_steps} steps / {self.wrench_bad_envs} envs | "
       f"{self.total_steps} steps in {time.perf_counter() - self._t0:.0f} s"
     )
 
@@ -701,9 +832,12 @@ def _run_with_env(venv, agent_cfg, device, spec) -> dict:
     print("\n[bench] interrupted")
   finally:
     print(bench.summary())
+    print(bench.prev_table())
     print(f"[bench] finished={bench.finished}, {time.perf_counter() - t_start:.0f} s wall")
     print(f"[bench] results in {log.path}")
     log.close()
+    if bench._pre_log is not None:
+      bench._pre_log.close()
   valid = bench.n_fell + bench.n_recovered
   return dict(
     label=label, csv=str(log.path), finished=bench.finished, interrupted=interrupted,

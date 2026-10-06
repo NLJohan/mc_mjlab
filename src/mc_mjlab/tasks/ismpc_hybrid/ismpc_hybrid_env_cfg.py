@@ -29,20 +29,36 @@ from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 700
+NUM_ENVS = 400
 PLAY_NUM_ENVS = 1
 
-EPISODE_LENGTH_S = 60.0
+EPISODE_LENGTH_S = 40.0
+
+# Tutor rewards are zeroed while the policy commands "stop", unless the whole sampled command is inside this
+# deadzone: |vx| < DZ[0] (m/s), |vy| < DZ[1] (m/s), |wz| < DZ[2] (rad/s), all three at once. Inside it, stopping
+# is a legitimate answer, so the tutor is not gated. (0, 0, 0) = no deadzone (pure walk gate).
+TUTOR_DEADZONE = (0.04, 0.1, 0.1)
+# # Fraction of envs whose sampled twist command is forced to zero (mjlab UniformVelocityCommandCfg.rel_standing_envs).
+# # Gives the policy episodes where standing still is the right answer, so the stop decision can be learned.
+STANDING_ENVS_FRAC = 0.15
+
 
 FRAMESKIP = 5
 
 # --- Push disturbances (mjlab.envs.mdp.events.apply_body_impulse). ---
 PUSH_SETTLE_TICKS = 8
-PUSH_FORCE_TORSO_N = (-50.0, 50.0)
-PUSH_FORCE_HAND_N = (-100.0, 100.0)
+PUSH_FORCE_TORSO_N = (-120.0, 120.0)
+PUSH_FORCE_HAND_N = (-200.0, 200.0)
 PUSH_DURATION_S = (0.1, 0.4)
-PUSH_COOLDOWN_TORSO_S = (5.0, 90.0)
-PUSH_COOLDOWN_HAND_S = (5.0, 90.0)
+PUSH_COOLDOWN_TORSO_S = (2.0, 50.0)
+PUSH_COOLDOWN_HAND_S = (2.0, 50.0)
+# Cooldown law: shifted exponential truncated to the ranges above, with the rate
+# solved so that P(cooldown < SPLIT) = P_BEFORE_SPLIT.
+PUSH_COOLDOWN_SPLIT_S = 10.0
+PUSH_COOLDOWN_P_BEFORE_SPLIT = 0.5
+# Critic-only push_state observation scaling.
+PUSH_STATE_FORCE_SCALE_N = 100.0
+PUSH_STATE_TIME_CAP_S = 50.0
 
 # --- Mass/inertia domain randomization. ---
 BODY_MASS_ALPHA_RANGE = (-0.05, 0.05)
@@ -58,11 +74,11 @@ TERRAIN_PATCH_SIZE_M = (8.0, 8.0)
 
 # Curriculum stages. "step" is env.common_step_counter (1 iteration = 512).
 CURRICULUM_STAGES = [
-  {"step": 0,          "lin_vel_x": (-0.5, 0.5), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.2, 0.2), "push_scale": 0.3},
-  {"step": 600 * 512,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
-  {"step": 800 * 512,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
-  {"step": 1000 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.8},
-  {"step": 1200 * 512, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.8},
+  {"step": 0,          "lin_vel_x": (-0.5, 0.5), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.2, 0.2), "push_scale": 0.5},
+  {"step": 150 * 256,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.75},
+  {"step": 300 * 256,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
+  {"step": 450 * 256, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
+  {"step": 600 * 256, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
 ]
 PLAY_CURRICULUM_STAGE = 4
 
@@ -180,9 +196,21 @@ def _make_env_cfg(
     ),
   }
 
+  # Critic = actor obs + privileged push state (5 values per push event).
+  critic_terms = dict(actor_terms)
+  for _name in ("push_torso", "push_right_hand", "push_left_hand"):
+    critic_terms[f"{_name}_state"] = ObservationTermCfg(
+      func=ismpc_mdp.push_state,
+      params={
+        "event_name": _name,
+        "force_scale": PUSH_STATE_FORCE_SCALE_N,
+        "time_cap_s": PUSH_STATE_TIME_CAP_S,
+      },
+    )
+
   observations = {
     "actor": ObservationGroupCfg(terms=dict(actor_terms), concatenate_terms=True),
-    "critic": ObservationGroupCfg(terms=dict(actor_terms), concatenate_terms=True),
+    "critic": ObservationGroupCfg(terms=critic_terms, concatenate_terms=True),
   }
 
   rewards = {
@@ -196,38 +224,38 @@ def _make_env_cfg(
     ),
     "joint_torque": RewardTermCfg(
       func=ismpc_mdp.joint_torque_reward, 
-      weight=2.0,
+      weight=1.0,
       params={"sigma": 300},
     ),
     "target_vel_x": RewardTermCfg(
         func=ismpc_mdp.target_vel_window,
         weight=4.0,
-        params={"command_name": "twist", "axis": 0, "std": 0.15, "window_s": 1.1},
+        params={"command_name": "twist", "axis": 0, "std": 0.15, "window_s": 2.2},
     ),
     "target_vel_y": RewardTermCfg(
         func=ismpc_mdp.target_vel_window,
-        weight=0.1,
-        params={"command_name": "twist", "axis": 1, "std": 0.1, "window_s": 1.1},
+        weight=4.0,
+        params={"command_name": "twist", "axis": 1, "std": 0.05, "window_s": 2.2},
     ),
     "target_omega": RewardTermCfg(
         func=ismpc_mdp.target_vel_window,
-        weight=1.0,
-        params={"command_name": "twist", "axis": 2, "angular": True, "std": 0.1, "window_s": 1.1},
+        weight=4.0,
+        params={"command_name": "twist", "axis": 2, "angular": True, "std": 0.05, "window_s": 2.2},
     ),
     "tutor_vel_x": RewardTermCfg(
       func=ismpc_mdp.twist_tutor,
       weight=1.0,
-      params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 0, "std": 0.15},
+      params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 0, "std": 0.07, "deadzone": TUTOR_DEADZONE},
     ),
     "tutor_vel_y": RewardTermCfg(
       func=ismpc_mdp.twist_tutor,
-      weight=0.1,
-      params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 1, "std": 0.05},
+      weight=0.5,
+      params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 1, "std": 0.03, "deadzone": TUTOR_DEADZONE},
     ),
     "tutor_omega": RewardTermCfg(
       func=ismpc_mdp.twist_tutor,
-      weight=0.3,
-      params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 2, "std": 0.07},
+      weight=0.5,
+      params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 2, "std": 0.05, "deadzone": TUTOR_DEADZONE},
     ),
     "sine_position_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_position_continuity,
@@ -337,8 +365,8 @@ def _make_env_cfg(
       func=envs_mdp.reset_joints_by_offset,
       mode="reset",
       params={
-        "position_range": (-0.02, 0.02),  # rad
-        "velocity_range": (-0.01, 0.01),  # rad/s
+        "position_range": (-0.01, 0.01),  # rad
+        "velocity_range": (-0.005, 0.005),  # rad/s
         "asset_cfg": SceneEntityCfg("robot"),
       },
     ),
@@ -351,6 +379,8 @@ def _make_env_cfg(
         "torque_range": (0.0, 0.0),
         "duration_s": PUSH_DURATION_S,
         "cooldown_s": PUSH_COOLDOWN_TORSO_S,
+        "cooldown_split_s": PUSH_COOLDOWN_SPLIT_S,
+        "cooldown_p_before_split": PUSH_COOLDOWN_P_BEFORE_SPLIT,
         "settle_ticks": PUSH_SETTLE_TICKS,
       },
     ),
@@ -363,6 +393,8 @@ def _make_env_cfg(
         "torque_range": (0.0, 0.0),
         "duration_s": PUSH_DURATION_S,
         "cooldown_s": PUSH_COOLDOWN_HAND_S,
+        "cooldown_split_s": PUSH_COOLDOWN_SPLIT_S,
+        "cooldown_p_before_split": PUSH_COOLDOWN_P_BEFORE_SPLIT,
         "settle_ticks": PUSH_SETTLE_TICKS,
       },
     ),
@@ -375,6 +407,8 @@ def _make_env_cfg(
         "torque_range": (0.0, 0.0),
         "duration_s": PUSH_DURATION_S,
         "cooldown_s": PUSH_COOLDOWN_HAND_S,
+        "cooldown_split_s": PUSH_COOLDOWN_SPLIT_S,
+        "cooldown_p_before_split": PUSH_COOLDOWN_P_BEFORE_SPLIT,
         "settle_ticks": PUSH_SETTLE_TICKS,
       },
     ),
@@ -406,6 +440,7 @@ def _make_env_cfg(
     "twist": UniformVelocityCommandCfg(
       entity_name="robot",
       resampling_time_range=(EPISODE_LENGTH_S, EPISODE_LENGTH_S),
+      rel_standing_envs=STANDING_ENVS_FRAC,
       ranges=UniformVelocityCommandCfg.Ranges(
         lin_vel_x=(-0.5, 0.5),
         lin_vel_y=(-0.1, 0.1),
@@ -550,7 +585,8 @@ def ismpc_hybrid_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
   return RslRlOnPolicyRunnerCfg(
     actor=RslRlModelCfg(
-      hidden_dims=(512, 256, 128),
+      # hidden_dims=(512, 256, 128),
+      hidden_dims=(1024, 512, 256),
       activation="elu",
       obs_normalization=True,
       distribution_cfg={
@@ -560,7 +596,7 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       },
     ),
     critic=RslRlModelCfg(
-      hidden_dims=(1024, 512, 256),
+      hidden_dims=(2048, 1024, 512),
       activation="elu",
       obs_normalization=True,
     ),
@@ -568,12 +604,12 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       value_loss_coef=1.0,
       use_clipped_value_loss=True,
       clip_param=0.2,
-      entropy_coef=0.002,
+      # entropy_coef=0.002,
       num_learning_epochs=5,
       num_mini_batches=4,
       learning_rate=1.0e-3,
       schedule="adaptive",
-      gamma=0.99,
+      gamma=0.998,
       lam=0.95,
       desired_kl=0.01,
       max_grad_norm=1.0,
