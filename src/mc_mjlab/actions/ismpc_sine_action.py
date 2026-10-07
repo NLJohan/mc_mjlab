@@ -522,9 +522,37 @@ class IsmpcSineAction(McRtcActionBase):
     # Walking_controller::reset()'s rl_reference_velocity.setZero().
     self._twist_curr[rows] = 0.0
 
-    # So the very next control period is treated as "due" for a sine
-    # update, same as the old Cython-bridge file's own convention.
-    self._dispatch_ticks_since_sine_update[rows] = 1
+    # Counter 0 = "due". With decimation = 10 * frameskip the latch fires on
+    # the first controller tick of every env step, so the policy output
+    # sampled from an observation is latched with no delay. The first env
+    # step after a reset is skipped by the episode_length_buf gate in
+    # _advance_sine_period (settle guard: the controller reset is still
+    # being serviced).
+    self._dispatch_ticks_since_sine_update[rows] = 0
+
+    # The datastore input feed is only refreshed at the END of _advance_sine_period, i.e. AFTER the
+    # dispatch of that period has already read it. So the first dispatch of a new episode (the one
+    # carrying the native reset flag) would send the PREVIOUS episode's last values (CoM-height sine
+    # params, walk gate, Ts, twist) and the controller's first solve would consume them. Overwrite the
+    # reset rows of the feed with the same neutral values the mirrors above were just reset to.
+    scalar_feed = self._datastore_scalar_input_feed
+    scalar_cols = self._datastore_scalar_input_columns
+    for setter, values in (
+      (SET_OFFSET, self._physical_curr["offset"]),
+      (SET_FREQUENCY, self._physical_curr["frequency"]),
+      (SET_SIN_AMP, self._physical_curr["sin_amp"]),
+      (SET_COS_AMP, self._physical_curr["cos_amp"]),
+      (SET_POLICY_WANTS_WALK, self._walk_enabled.to(dtype=scalar_feed.dtype)),
+      (SET_TS, self._ts_curr),
+    ):
+      index = self._datastore_input_index(scalar_cols, setter, "scalar")
+      scalar_feed[rows, index] = values[rows].to(dtype=scalar_feed.dtype)
+    vector_index = self._datastore_input_index(
+      self._datastore_vector_input_columns, SET_RL_REF_VEL, "vectors"
+    )
+    self._datastore_vector_input_feed[rows, vector_index] = self._twist_curr[rows].to(
+      dtype=self._datastore_vector_input_feed.dtype
+    )
 
   def apply_actions(self) -> None:
     """Advance the control period on its first substep, then write
@@ -565,7 +593,11 @@ class IsmpcSineAction(McRtcActionBase):
     """
     super()._advance_control_period()
 
-    due_for_sine_update = self._dispatch_ticks_since_sine_update == 0
+    # episode_length_buf is incremented after the physics loop, so it is 0
+    # during the first env step after a reset: no latch in that window.
+    due_for_sine_update = (self._dispatch_ticks_since_sine_update == 0) & (
+      self._env.episode_length_buf > 0
+    )
 
     if bool(due_for_sine_update.any()):
       physical = self._map_to_physical(self._processed_actions)
