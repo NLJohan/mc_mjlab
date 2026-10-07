@@ -29,40 +29,50 @@ from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 400
+NUM_ENVS = 700
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 40.0
 
 # Tutor rewards are zeroed while the policy commands "stop", unless the whole sampled command is inside this
-# deadzone: |vx| < DZ[0] (m/s), |vy| < DZ[1] (m/s), |wz| < DZ[2] (rad/s), all three at once. Inside it, stopping
+# deadzone (the not_walking_penalty is also disabled inside it, standing is never penalized there): |vx| < DZ[0] (m/s), |vy| < DZ[1] (m/s), |wz| < DZ[2] (rad/s), all three at once. Inside it, stopping
 # is a legitimate answer, so the tutor is not gated. (0, 0, 0) = no deadzone (pure walk gate).
 TUTOR_DEADZONE = (0.04, 0.1, 0.1)
 # # Fraction of envs whose sampled twist command is forced to zero (mjlab UniformVelocityCommandCfg.rel_standing_envs).
 # # Gives the policy episodes where standing still is the right answer, so the stop decision can be learned.
-STANDING_ENVS_FRAC = 0.15
+STANDING_ENVS_FRAC = 0.1
 
 
-FRAMESKIP = 5
+FRAMESKIP = 5  # physics substeps per controller dispatch: 5 ms -> 200 Hz
+# Physics substeps per ENV step = per policy inference = per PPO sample: 50 ms -> 20 Hz,
+# the same rate as the sine/walk/Ts/twist latch (IsmpcSineActionCfg.sine_param_frequency_hz).
+# Must be a multiple of FRAMESKIP; the controller is dispatched DECIMATION / FRAMESKIP times per env step.
+DECIMATION = 5
+# rsl_rl env steps per iteration (= policy decisions per env per iteration, 32 * 50 ms = 1.6 s).
+NUM_STEPS_PER_ENV = 256
 
 # --- Push disturbances (mjlab.envs.mdp.events.apply_body_impulse). ---
-PUSH_SETTLE_TICKS = 8
-PUSH_FORCE_TORSO_N = (-120.0, 120.0)
-PUSH_FORCE_HAND_N = (-200.0, 200.0)
+PUSH_SETTLE_TICKS = 8  # env steps (50 ms each)
+PUSH_FORCE_TORSO_N = (-100.0, 100.0)
+PUSH_FORCE_HAND_N = (-150.0, 150.0)
 PUSH_DURATION_S = (0.1, 0.4)
 PUSH_COOLDOWN_TORSO_S = (2.0, 50.0)
 PUSH_COOLDOWN_HAND_S = (2.0, 50.0)
-# Cooldown law: shifted exponential truncated to the ranges above, with the rate
-# solved so that P(cooldown < SPLIT) = P_BEFORE_SPLIT.
+# Cooldown law (gap between the end of a push and the start of the next): shifted
+# exponential truncated to the ranges above, rate solved so that
+# P(cooldown < SPLIT) = P_BEFORE_SPLIT.
 PUSH_COOLDOWN_SPLIT_S = 10.0
-PUSH_COOLDOWN_P_BEFORE_SPLIT = 0.5
-# Critic-only push_state observation scaling.
+PUSH_COOLDOWN_P_BEFORE_SPLIT = 0.30
+# Critic-only push_state observation: 1 value per push event = expected impulse (N*s) in the next
+# PUSH_STATE_WINDOW_S seconds, P(push in window | time since last push) * E[magnitude] * E[duration],
+# divided by PUSH_STATE_FORCE_SCALE_N (N*s per 1 s). Rule of thumb for the window: the value horizon,
+# step_dt / (1 - gamma) = 2.5 s at gamma 0.98.
 PUSH_STATE_FORCE_SCALE_N = 100.0
-PUSH_STATE_TIME_CAP_S = 50.0
+PUSH_STATE_WINDOW_S = 2.0
 
 # --- Mass/inertia domain randomization. ---
 BODY_MASS_ALPHA_RANGE = (-0.05, 0.05)
-HAND_PAYLOAD_MASS_RANGE_KG = (0.0, 3.0)
+HAND_PAYLOAD_MASS_RANGE_KG = (0.0, 0.0)
 
 # --- Uneven terrain (mjlab.terrains, HfRandomUniformTerrainCfg). ---
 ENABLE_UNEVEN_TERRAIN = False
@@ -72,13 +82,13 @@ TERRAIN_NOISE_RANGE_M = (-0.005, 0.005)
 TERRAIN_PATCH_SIZE_M = (8.0, 8.0)
 
 
-# Curriculum stages. "step" is env.common_step_counter (1 iteration = 512).
+# Curriculum stages. "step" is env.common_step_counter, counted in ENV steps: iteration * NUM_STEPS_PER_ENV.
 CURRICULUM_STAGES = [
-  {"step": 0,          "lin_vel_x": (-0.5, 0.5), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.2, 0.2), "push_scale": 0.5},
-  {"step": 150 * 256,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.75},
-  {"step": 300 * 256,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
-  {"step": 450 * 256, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
-  {"step": 600 * 256, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
+  {"step": 0,          "lin_vel_x": (-0.5, 0.5), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.2, 0.2), "push_scale": 0.0},
+  {"step": 300 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.2},
+  {"step": 600 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
+  {"step": 1000 * NUM_STEPS_PER_ENV, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.8},
+  {"step": 1500 * NUM_STEPS_PER_ENV, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
 ]
 PLAY_CURRICULUM_STAGE = 4
 
@@ -89,12 +99,11 @@ TUTOR_WEIGHT_FACTORS = (1.0, 0.75, 0.5, 0.25, 0.1)
 
 
 def _tutor_weight_stages(base: float) -> list[dict]:
-  """reward_curriculum stages: 1 iteration = 512 env steps."""
+  """reward_curriculum stages, in env steps (TUTOR_STEPS_PER_ITER per listed iteration)."""
   return [
-    {"step": it * 512, "weight": base * f}
+    {"step": it * NUM_STEPS_PER_ENV, "weight": base * f}
     for it, f in zip(TUTOR_STAGE_ITERS, TUTOR_WEIGHT_FACTORS)
   ]
-
 
 def _make_terrain_cfg() -> TerrainEntityCfg:
   """Build the scene's TerrainEntityCfg, gated on ENABLE_UNEVEN_TERRAIN.
@@ -196,7 +205,7 @@ def _make_env_cfg(
     ),
   }
 
-  # Critic = actor obs + privileged push state (5 values per push event).
+  # Critic = actor obs + privileged push state (1 expected-impulse value per push event, 3 total).
   critic_terms = dict(actor_terms)
   for _name in ("push_torso", "push_right_hand", "push_left_hand"):
     critic_terms[f"{_name}_state"] = ObservationTermCfg(
@@ -204,7 +213,7 @@ def _make_env_cfg(
       params={
         "event_name": _name,
         "force_scale": PUSH_STATE_FORCE_SCALE_N,
-        "time_cap_s": PUSH_STATE_TIME_CAP_S,
+        "window_s": PUSH_STATE_WINDOW_S,
       },
     )
 
@@ -219,43 +228,43 @@ def _make_env_cfg(
       weight=3.0),
     "not_walking_penalty": RewardTermCfg(
       func=ismpc_mdp.not_walking_penalty, 
-      weight=0.0, # Now tutor velocity rewards are gated on walking status.
-      params={"action_name": "ismpc_sine"}
+      weight=-0.5, # Now tutor velocity rewards are gated on walking status.
+      params={"action_name": "ismpc_sine", "command_name": "twist", "deadzone": TUTOR_DEADZONE},
     ),
     "joint_torque": RewardTermCfg(
       func=ismpc_mdp.joint_torque_reward, 
-      weight=1.0,
+      weight=2.0,
       params={"sigma": 300},
     ),
     "target_vel_x": RewardTermCfg(
         func=ismpc_mdp.target_vel_window,
         weight=4.0,
-        params={"command_name": "twist", "axis": 0, "std": 0.15, "window_s": 2.2},
+        params={"command_name": "twist", "axis": 0, "std": 0.15, "window_s": 1.1},
     ),
     "target_vel_y": RewardTermCfg(
         func=ismpc_mdp.target_vel_window,
-        weight=4.0,
-        params={"command_name": "twist", "axis": 1, "std": 0.05, "window_s": 2.2},
+        weight=0.1,
+        params={"command_name": "twist", "axis": 1, "std": 0.05, "window_s": 1.1},
     ),
     "target_omega": RewardTermCfg(
         func=ismpc_mdp.target_vel_window,
-        weight=4.0,
-        params={"command_name": "twist", "axis": 2, "angular": True, "std": 0.05, "window_s": 2.2},
+        weight=1.0,
+        params={"command_name": "twist", "axis": 2, "angular": True, "std": 0.05, "window_s": 1.1},
     ),
     "tutor_vel_x": RewardTermCfg(
       func=ismpc_mdp.twist_tutor,
       weight=1.0,
-      params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 0, "std": 0.07, "deadzone": TUTOR_DEADZONE},
+      params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 0, "std": 0.1, "deadzone": TUTOR_DEADZONE},
     ),
     "tutor_vel_y": RewardTermCfg(
       func=ismpc_mdp.twist_tutor,
-      weight=0.5,
-      params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 1, "std": 0.03, "deadzone": TUTOR_DEADZONE},
+      weight=0.1,
+      params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 1, "std": 0.02, "deadzone": TUTOR_DEADZONE},
     ),
     "tutor_omega": RewardTermCfg(
       func=ismpc_mdp.twist_tutor,
-      weight=0.5,
-      params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 2, "std": 0.05, "deadzone": TUTOR_DEADZONE},
+      weight=0.6,
+      params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 2, "std": 0.07, "deadzone": TUTOR_DEADZONE},
     ),
     "sine_position_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_position_continuity,
@@ -520,7 +529,7 @@ def _make_env_cfg(
     events=events,
     curriculum=curriculum,
     commands=commands,
-    decimation=FRAMESKIP,
+    decimation=DECIMATION,
     episode_length_s=EPISODE_LENGTH_S,
     sim=SimulationCfg(
       njmax=1500,
@@ -585,8 +594,8 @@ def ismpc_hybrid_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
   return RslRlOnPolicyRunnerCfg(
     actor=RslRlModelCfg(
-      # hidden_dims=(512, 256, 128),
-      hidden_dims=(1024, 512, 256),
+      hidden_dims=(512, 256, 128),
+      # hidden_dims=(1024, 512, 256),
       activation="elu",
       obs_normalization=True,
       distribution_cfg={
@@ -596,7 +605,8 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       },
     ),
     critic=RslRlModelCfg(
-      hidden_dims=(2048, 1024, 512),
+      hidden_dims=(1024, 512, 256),
+      # hidden_dims=(2048, 1024, 512),
       activation="elu",
       obs_normalization=True,
     ),
@@ -604,19 +614,19 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       value_loss_coef=1.0,
       use_clipped_value_loss=True,
       clip_param=0.2,
-      # entropy_coef=0.002,
+      entropy_coef=0.002,
       num_learning_epochs=5,
       num_mini_batches=4,
       learning_rate=1.0e-3,
       schedule="adaptive",
-      gamma=0.998,
+      gamma=0.99,  
       lam=0.95,
       desired_kl=0.01,
       max_grad_norm=1.0,
     ),
     experiment_name="mc_rtc_ismpc_hybrid",
     save_interval=100,
-    num_steps_per_env=256,
+    num_steps_per_env=NUM_STEPS_PER_ENV,
     max_iterations=max_iterations,
     logger="wandb",
   )

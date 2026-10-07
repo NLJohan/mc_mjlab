@@ -37,9 +37,20 @@ import numpy as np
 # =============================== EDIT ME ===============================
 # CSV files to plot. [] -> the most recent CSV in CSV_DIR. With two entries the
 # difference figure is A (first) minus B (second), e.g. [trained_csv, constant_csv].
-DATASETS: list[str] = []
+DATASETS: list[str] = [
+  # "logs/push_benchmark/push_benchmark_20261005_122300_model_1999.csv",
+  # "logs/push_benchmark/push_benchmark_20261005_124025_model_1499.csv",
+  # "logs/push_benchmark/push_benchmark_20261005_135207_model_500.csv",
+  # "logs/push_benchmark/push_benchmark_20261005_141117_model_800.csv",
+  # "logs/push_benchmark/push_benchmark_20261005_120417_constant.csv",
+  "logs/push_benchmark/push_benchmark_20261007_115036_constant.csv",
+  # "logs/push_benchmark/push_benchmark_20261007_144420_model_500.csv",
+  # "logs/push_benchmark/push_benchmark_20261007_144734_model_1499.csv",
+  "logs/push_benchmark/push_benchmark_20261007_152155_model_1499.csv",
+  "logs/push_benchmark/push_benchmark_20261007_151156_model_500.csv",
+  ]
 CSV_DIR = "logs/push_benchmark"
-LAST_N = 5          # when DATASETS is empty: plot the LAST_N most recent CSVs of CSV_DIR
+LAST_N = 2          # when DATASETS is empty: plot the LAST_N most recent CSVs of CSV_DIR
                     # (names sort chronologically, so a night's queue of 4 policies -> LAST_N = 4)
 
 # Start values of the live sliders:

@@ -823,8 +823,7 @@ def _solve_exp_rate(lo: float, hi: float, split: float, p_before: float) -> floa
 class _DiskBodyImpulse(apply_body_impulse):
   """apply_body_impulse with (1) horizontal forces uniform over a DISK,
   (2) a truncated-exponential cooldown, (3) a pre-drawn schedule, (4) an
-  explicit per-env reset, and (5) a privileged push_state getter for the critic
-  (an EXPECTED impulse over a window, not the drawn future: see push_state).
+  explicit per-env reset, and (5) a privileged push_state getter for the critic.
 
   * Force: direction uniform, magnitude R*sqrt(u) (uniform by AREA), fz = 0,
     R = max(|lo|, |hi|) of ``force_range`` read at EVERY call, so the
@@ -835,8 +834,8 @@ class _DiskBodyImpulse(apply_body_impulse):
     ``cooldown_s[0]`` + exponential truncated to ``cooldown_s``, rate solved so
     that P(gap < cooldown_split_s) = cooldown_p_before_split.
   * Schedule: the NEXT push (disk sample, duration) is drawn in advance, at
-    reset and each time a push fires. It is NOT shown to the critic. The gap is
-    drawn at reset and at push expiry.
+    reset and each time a push fires, so the critic can be told exactly what is
+    coming. The gap is drawn at reset and at push expiry.
   * reset(): clears active state and redraws the schedule for the reset envs
     (stock reset only zeroes the wrench).
   """
@@ -865,9 +864,6 @@ class _DiskBodyImpulse(apply_body_impulse):
     self._next_ang = torch.zeros(n, device=dev)
     self._next_dur = torch.zeros(n, device=dev)
     self._cur_mag = torch.zeros(n, device=dev)  # N, 0 while idle
-    # Seconds since the last push ended (or since reset), 0 while a push is active.
-    # Independent of _interval_time_left (which the settle gate may push around).
-    self._idle_time = torch.zeros(n, device=dev)
     self._draw_schedule(slice(None), n)
 
   def _sample_cooldown(self, n: int) -> torch.Tensor:
@@ -912,10 +908,8 @@ class _DiskBodyImpulse(apply_body_impulse):
       self._active[ids] = False
       self._time_remaining[ids] = 0.0
       self._cur_mag[ids] = 0.0
-      self._idle_time[ids] = 0.0
       self._interval_time_left[ids] = self._sample_cooldown(len(ids))
 
-    self._idle_time += dt * (~self._active).to(self._idle_time.dtype)
     self._interval_time_left -= dt
     eligible = (~self._active) & (self._interval_time_left <= 0)
     if not eligible.any():
@@ -948,59 +942,36 @@ class _DiskBodyImpulse(apply_body_impulse):
     self._active[env_ids] = False
     self._time_remaining[env_ids] = 0.0
     self._cur_mag[env_ids] = 0.0
-    self._idle_time[env_ids] = 0.0
     self._draw_schedule(env_ids, n)
     self._interval_time_left[env_ids] = self._sample_cooldown(n)
 
-  def push_state(self, force_scale: float, window_s: float) -> torch.Tensor:
-    """(N, 1): expected impulse (N*s, divided by ``force_scale`` * 1 s) this push
-    point delivers during the next ``window_s`` seconds, from what the critic may
-    legitimately know (no drawn future):
-
-        P(next push starts within window_s | t since the last push ended)
-          * E[magnitude] * E[duration]
-        + (active only) current magnitude * min(remaining duration, window_s)
-
-    Gap law: G = lo + X, X ~ Exp(lam) truncated to [0, S], S = hi - lo, so
-    F(g) = (1 - exp(-lam (g - lo))) / (1 - exp(-lam S)) on [lo, hi], 0 below, 1 above.
-    With a = clamp(t - lo, 0, S) and b = clamp(t + window_s - lo, 0, S):
-
-        P = (F(t + window) - F(t)) / (1 - F(t)) = (e^-lam a - e^-lam b) / (e^-lam a - e^-lam S)
-
-    (t >= hi: P = 1.) While a push is active the next gap has not started, so t = -remaining
-    duration (the window then reaches window_s - remaining past the push end).
-    E[magnitude] = 2/3 * R (uniform by area on a disk of the CURRENT radius R), E[duration]
-    = mean of duration_s. Approximations: a push starting near the window edge is counted
-    in full, and a second push inside the window is ignored."""
-    lo, span, lam = self._cd_lo, self._cd_hi - self._cd_lo, self._cd_rate
-    t = torch.where(self._active, -self._time_remaining, self._idle_time)
-    a = (t - lo).clamp(min=0.0, max=span)
-    b = (t + window_s - lo).clamp(min=0.0, max=span)
-    ea, eb = torch.exp(-lam * a), torch.exp(-lam * b)
-    e_span = math.exp(-lam * span)
-    denom = (ea - e_span).clamp(min=1e-12)
-    p = torch.where(a >= span, torch.ones_like(a), (ea - eb) / denom)
-    e_mag = (2.0 / 3.0) * self._r_max
-    e_dur = 0.5 * (self._dur_lo + self._dur_hi)
-    impulse = p * e_mag * e_dur
-    remaining = torch.minimum(self._time_remaining, torch.full_like(a, window_s))
-    impulse = impulse + torch.where(
-      self._active, self._cur_mag * remaining, torch.zeros_like(impulse)
+  def push_state(self, force_scale: float, time_cap_s: float) -> torch.Tensor:
+    """(N, 3): [force magnitude / force_scale, seconds until the push starts,
+    push duration in seconds]. Idle: the NEXT push (magnitude at the current
+    curriculum R, time until it fires, its duration). Active: the CURRENT push
+    (its magnitude, 0, its remaining duration)."""
+    nxt_mag = self._r_max * self._next_rad
+    mag = torch.where(self._active, self._cur_mag, nxt_mag) / force_scale
+    until = torch.where(
+      self._active,
+      torch.zeros_like(self._interval_time_left),
+      self._interval_time_left.clamp(min=0.0, max=time_cap_s),
     )
-    return (impulse / force_scale).unsqueeze(-1)
+    dur = torch.where(self._active, self._time_remaining, self._next_dur)
+    return torch.stack([mag, until, dur], dim=-1)
 
 
 def push_state(
   env: ManagerBasedRlEnv,
   event_name: str,
   force_scale: float = 100.0,
-  window_s: float = 5.0,
+  time_cap_s: float = 50.0,
 ) -> torch.Tensor:
-  """CRITIC-ONLY privileged observation (1 value) of one push event: the expected
-  impulse (N*s, / force_scale) delivered during the next window_s seconds, given the
-  time since the last push ended (see _DiskBodyImpulse.push_state for the maths).
-  Zeros if the event isn't registered yet."""
-  zeros = torch.zeros(env.num_envs, 1, device=env.device)
+  """CRITIC-ONLY privileged observation (3 values) of one push event:
+  force magnitude (/force_scale), time until the push starts, push duration.
+  Idle = the upcoming push; active = the current one (see
+  _DiskBodyImpulse.push_state). Zeros if the event isn't registered yet."""
+  zeros = torch.zeros(env.num_envs, 3, device=env.device)
   em = getattr(env, "event_manager", None)
   if em is None:
     return zeros
@@ -1009,7 +980,7 @@ def push_state(
   except ValueError:
     return zeros
   fn = getattr(term, "push_state", None)
-  return zeros if fn is None else fn(force_scale, window_s)
+  return zeros if fn is None else fn(force_scale, time_cap_s)
 
 
 class settle_gated_apply_body_impulse:
@@ -1048,7 +1019,7 @@ class settle_gated_apply_body_impulse:
   computed or written for a settling env in the first place.
 
   The inner term is _DiskBodyImpulse (disk-uniform pushes, truncated-
-  exponential cooldown, pre-drawn schedule, expected-impulse push_state getter for the critic).
+  exponential cooldown, pre-drawn schedule, push_state getter for the critic).
   cfg.params must include asset_cfg, force_range, torque_range (must be
   (0, 0)), duration_s, cooldown_s, cooldown_split_s,
   cooldown_p_before_split, PLUS settle_ticks (int, number of env steps after reset during which pushes
@@ -1089,8 +1060,8 @@ class settle_gated_apply_body_impulse:
       )
     self._inner(env, None, **inner_kwargs)
 
-  def push_state(self, force_scale: float, window_s: float) -> torch.Tensor:
-    return self._inner.push_state(force_scale, window_s)
+  def push_state(self, force_scale: float, time_cap_s: float) -> torch.Tensor:
+    return self._inner.push_state(force_scale, time_cap_s)
 
   def debug_vis(self, visualizer) -> None:
     if hasattr(self._inner, "debug_vis"):

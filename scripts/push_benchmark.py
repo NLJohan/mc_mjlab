@@ -53,18 +53,19 @@ TORSO_BODY = "Body"
 #   (path, label)   -> same, with an explicit name stored in the CSV and its file name
 # Default label: "constant" or the checkpoint stem. All paths are checked before the queue starts.
 POLICIES = [
-  "/home/noahluc/workspace/mc_mjlab/logs/rsl_rl/mc_rtc_ismpc_hybrid/2026-10-04_21-05-27/model_500.pt",
+  "logs/rsl_rl/mc_rtc_ismpc_hybrid/2026-10-06_19-57-16/model_500.pt",
+  "logs/rsl_rl/mc_rtc_ismpc_hybrid/2026-10-01_18-56-31/model_1499.pt",
 ]
 STOP_ON_ERROR = False     # False: a failing policy is reported and the queue goes on with the next one
 
-NUM_ENVS = 400
-N_TRIALS = 600            # total trials issued; the run ends when all of them are resolved
+NUM_ENVS = 100
+N_TRIALS = 2000          # total trials issued; the run ends when all of them are resolved
 SEED = 42
 SHOW_VIEWER = False       # MuJoCo viewer (real-time pacing); for NUM_ENVS=1 debugging
 
 TARGET_TWIST = (0.0, 0.0, 0.0)   # vx, vy, omega pinned as the command
-PUSH_DURATION_S = 0.8            # fixed per run
-F_MIN, F_MAX = 0., 140.0         # N, push sampled uniformly by AREA in the annulus F_MIN <= |F| <= F_MAX
+PUSH_DURATION_S = 0.3            # fixed per run
+F_MIN, F_MAX = 0., 220.0         # N, push sampled uniformly by AREA in the annulus F_MIN <= |F| <= F_MAX
                                  # (disk point picking; F_MIN=0 gives the full disk, F_MIN=F_MAX a ring)
 PUSH_START_RANGE_S = (3.0, 6.0)  # push start, seconds after episode start, uniform
 RECOVERY_TIMEOUT_S = 8.0         # survive this long after the push START to count as recovered
@@ -94,7 +95,7 @@ DEBUG_WRENCH = "normal"   # "normal" | "zero_force" (wrench writes happen but wi
                           # path alone) | "no_writes" (no wrench write at all: tests everything else)
 CHECK_WRENCH = True       # every step: compare the real xfrc_applied of the torso with what the
                           # benchmark intends (0 outside the push), print the first mismatches
-STARTUP_STEPS = 20        # pre-push failures during the first steps (controller startup) are counted apart
+STARTUP_STEPS = 2         # pre-push failures during the first steps (controller startup) are counted apart
 MAX_WRENCH_WARNINGS = 10
 FAULT_TERMS = ("fell_over", "collapsed", "controller_failed")  # failure = any of these
 REMOVED_EVENTS = ("push_torso", "push_right_hand", "push_left_hand")
