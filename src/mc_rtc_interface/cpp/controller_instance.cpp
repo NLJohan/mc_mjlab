@@ -62,19 +62,7 @@ void ControllerInstance::reset(IoInput input, IoOutput output)
     }
 
     const auto pose = prepare_reset(input);
-
-    if (!m_first_reset_done)
-    {
-        m_first_reset_done = true;
-        const auto name = m_controller->controller().robot().name();
-        m_controller->reset({{name, m_q}}, {{name, pose}});
-        finish_reset(input, pose);
-        apply_output(output);
-        m_failed = false;
-        return;
-    }
-
-    // Soft reset: re-run MCGlobalController::init() on the live controller.
+    // Every reset after initialize() is a soft reset: re-run MCGlobalController::init() on the live controller.
     const Eigen::Vector3d zero = Eigen::Vector3d::Zero();
 
     if (!m_layout.input.body_sensors.empty() &&
