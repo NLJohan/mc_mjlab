@@ -53,9 +53,9 @@ NUM_STEPS_PER_ENV = 256
 
 # --- Push disturbances (mjlab.envs.mdp.events.apply_body_impulse). ---
 PUSH_SETTLE_TICKS = 8  # env steps (50 ms each)
-PUSH_FORCE_TORSO_N = (-100.0, 100.0)
+PUSH_FORCE_TORSO_N = (-60.0, 60.0)
 PUSH_FORCE_HAND_N = (-150.0, 150.0)
-PUSH_DURATION_S = (0.1, 0.4)
+PUSH_DURATION_S = (0.1, 0.3)
 PUSH_COOLDOWN_TORSO_S = (2.0, 50.0)
 PUSH_COOLDOWN_HAND_S = (2.0, 50.0)
 # Cooldown law (gap between the end of a push and the start of the next): shifted
@@ -84,7 +84,7 @@ TERRAIN_PATCH_SIZE_M = (8.0, 8.0)
 
 # Curriculum stages. "step" is env.common_step_counter, counted in ENV steps: iteration * NUM_STEPS_PER_ENV.
 CURRICULUM_STAGES = [
-  {"step": 0,          "lin_vel_x": (-0.5, 0.5), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.2, 0.2), "push_scale": 0.0},
+  {"step": 0,          "lin_vel_x": (-0.5, 0.5), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.2, 0.2), "push_scale": 0.2},
   {"step": 300 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.2},
   {"step": 600 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
   {"step": 1000 * NUM_STEPS_PER_ENV, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.8},
@@ -448,7 +448,7 @@ def _make_env_cfg(
   commands = {
     "twist": UniformVelocityCommandCfg(
       entity_name="robot",
-      resampling_time_range=(EPISODE_LENGTH_S, EPISODE_LENGTH_S),
+      resampling_time_range=(1.0, 20.0),
       rel_standing_envs=STANDING_ENVS_FRAC,
       ranges=UniformVelocityCommandCfg.Ranges(
         lin_vel_x=(-0.5, 0.5),
