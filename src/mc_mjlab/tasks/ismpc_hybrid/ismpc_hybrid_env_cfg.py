@@ -47,12 +47,12 @@ FRAMESKIP = 5  # physics substeps per controller dispatch: 5 ms -> 200 Hz
 # Physics substeps per ENV step = per policy inference = per PPO sample: 50 ms -> 20 Hz,
 # the same rate as the sine/walk/Ts/twist latch (IsmpcSineActionCfg.sine_param_frequency_hz).
 # Must be a multiple of FRAMESKIP; the controller is dispatched DECIMATION / FRAMESKIP times per env step.
-DECIMATION = 5
+DECIMATION = 50
 # rsl_rl env steps per iteration (= policy decisions per env per iteration, 32 * 50 ms = 1.6 s).
 NUM_STEPS_PER_ENV = 256
 
 # --- Push disturbances (mjlab.envs.mdp.events.apply_body_impulse). ---
-PUSH_SETTLE_TICKS = 8  # env steps (50 ms each)
+PUSH_SETTLE_TICKS = 25  # env steps (50 ms each)
 PUSH_FORCE_TORSO_N = (-60.0, 60.0)
 PUSH_FORCE_HAND_N = (-150.0, 150.0)
 PUSH_DURATION_S = (0.1, 0.3)
@@ -448,7 +448,7 @@ def _make_env_cfg(
   commands = {
     "twist": UniformVelocityCommandCfg(
       entity_name="robot",
-      resampling_time_range=(1.0, 20.0),
+      resampling_time_range=(1.0, 30.0),
       rel_standing_envs=STANDING_ENVS_FRAC,
       ranges=UniformVelocityCommandCfg.Ranges(
         lin_vel_x=(-0.5, 0.5),
