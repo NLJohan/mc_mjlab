@@ -33,6 +33,8 @@ import torch
 from mjlab.envs.mdp.events import apply_body_impulse
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
+from mc_mjlab.actions.ismpc_sine_action import COM_HEIGHT_NOMINAL
+
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
@@ -167,6 +169,26 @@ def estimated_com_lin_vel(env: ManagerBasedRlEnv, action_name: str) -> torch.Ten
   envs_mdp.base_lin_vel so training and deployment read the same signal."""
   action_term = env.action_manager.get_term(action_name)
   return action_term.com_lin_vel_est_obs
+
+
+def rl_phase_sincos(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """(sin, cos) of the controller's integrated CoM-height phase, (num_envs, 2).
+
+  Datastore getters ismpc_walking::get_rl_phase_sin/cos: phase of the RlSine reference the controller is playing.
+  With the phase observed, the policy can compute the active reference height
+  offset + a sin(phase) + b cos(phase) from last_sine_params, and a change of the frequency no longer moves it.
+  The phase lives in the controller (reset to 0 with the episode), so training and deployment read the same signal."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.rl_phase_sincos_obs
+
+
+def estimated_com_height(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """Controller-estimated CoM height relative to COM_HEIGHT_NOMINAL (m), (num_envs, 1).
+
+  Datastore getter ismpc_walking::get_com_height_est (realRobot CoM z minus the support-foot z), not MuJoCo
+  ground truth, so training and deployment read the same signal."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.com_height_est_obs - COM_HEIGHT_NOMINAL
 
 
 class target_vel_window:
@@ -440,18 +462,18 @@ def controller_failed(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   return action_term.controller_failed
 
 
-def _target_height_pos(p: dict[str, torch.Tensor], t: torch.Tensor) -> torch.Tensor:
-  """CoM-height reference of the sine defined by physical params p, at time t."""
-  omega = 2.0 * torch.pi * p["frequency"]
-  phase = omega * t
+def _target_height_pos(p: dict[str, torch.Tensor], phase: torch.Tensor) -> torch.Tensor:
+  """CoM-height reference of the sine defined by physical params p, at controller phase `phase` (rad).
+
+  The controller integrates the phase (a frequency change only changes its rate), so two parameter sets are
+  compared at the SAME phase, not at the same absolute time."""
   return p["offset"] + p["sin_amp"] * torch.sin(phase) + p["cos_amp"] * torch.cos(phase)
 
 
-def _target_height_vel(p: dict[str, torch.Tensor], t: torch.Tensor) -> torch.Tensor:
-  """Time-derivative of _sine_height_at, at time t."""
+def _target_height_vel(p: dict[str, torch.Tensor], phase: torch.Tensor) -> torch.Tensor:
+  """Time-derivative of _target_height_pos at phase `phase`: omega (a cos - b sin), omega = 2 pi f of p."""
   omega = 2.0 * torch.pi * p["frequency"]
-  phase = omega * t
-  return p["sin_amp"] * omega * torch.cos(phase) - p["cos_amp"] * omega * torch.sin(phase)
+  return omega * (p["sin_amp"] * torch.cos(phase) - p["cos_amp"] * torch.sin(phase))
 
 
 def sine_position_continuity(
@@ -459,7 +481,7 @@ def sine_position_continuity(
 ) -> torch.Tensor:
   """Gaussian-kernel reward for CoM-height reference continuity across the
   period splice: exp(-(h_curr - h_prev)^2 / (2*sigma^2)), evaluated at the
-  instant the switch took effect (action_term._period_t0).
+  instant the switch took effect (action_term._period_phi).
 
   Deliberately NOT a penalty on the raw or physical *parameters* changing
   (e.g. ||params_t - params_{t-1}||^2): two different (offset, frequency,
@@ -479,8 +501,8 @@ def sine_position_continuity(
   it; revisit once you can see logged jump magnitudes during training.
   """
   action_term = env.action_manager.get_term(action_name)
-  h_prev = _target_height_pos(action_term._physical_prev, action_term._period_t0)
-  h_curr = _target_height_pos(action_term._physical_curr, action_term._period_t0)
+  h_prev = _target_height_pos(action_term._physical_prev, action_term._period_phi)
+  h_curr = _target_height_pos(action_term._physical_curr, action_term._period_phi)
   return torch.exp(-(h_curr - h_prev) ** 2 / (2.0 * sigma**2))
 
 
@@ -508,8 +530,8 @@ def sine_velocity_continuity(
   -- tunable, same rationale as sine_position_continuity's sigma.
   """
   action_term = env.action_manager.get_term(action_name)
-  v_prev = _target_height_vel(action_term._physical_prev, action_term._period_t0)
-  v_curr = _target_height_vel(action_term._physical_curr, action_term._period_t0)
+  v_prev = _target_height_vel(action_term._physical_prev, action_term._period_phi)
+  v_curr = _target_height_vel(action_term._physical_curr, action_term._period_phi)
   return torch.exp(-(v_curr - v_prev) ** 2 / (2.0 * sigma**2))
 
 

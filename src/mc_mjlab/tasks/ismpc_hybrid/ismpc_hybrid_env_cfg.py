@@ -182,6 +182,15 @@ def _make_env_cfg(
     "last_sine_params": ObservationTermCfg(
       func=ismpc_mdp.last_sine_params, params={"action_name": "ismpc_sine"}
     ),
+    # Phase of the CoM-height reference the controller is playing (sin, cos; integrated in the controller, reset
+    # with the episode) and the controller-estimated CoM height relative to the nominal height. With last_sine_params
+    # these let the policy compute the active reference height. Critic inherits both (critic_terms copies actor_terms).
+    "rl_phase_sincos": ObservationTermCfg(
+      func=ismpc_mdp.rl_phase_sincos, params={"action_name": "ismpc_sine"}
+    ),
+    "com_height": ObservationTermCfg(
+      func=ismpc_mdp.estimated_com_height, params={"action_name": "ismpc_sine"}
+    ),
     "last_walk_action": ObservationTermCfg(
       func=ismpc_mdp.last_walk_action, params={"action_name": "ismpc_sine"}
     ),
@@ -635,8 +644,8 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       num_mini_batches=4,
       learning_rate=1.0e-3,
       schedule="adaptive",
-      gamma=0.999,  
-      # gamma=0.99, # decimation 50  
+      gamma=0.99,  
+      # gamma=0.999, # decimation 50  
       lam=0.95,
       # lam=0.995,  # decimation 50
       desired_kl=0.01,

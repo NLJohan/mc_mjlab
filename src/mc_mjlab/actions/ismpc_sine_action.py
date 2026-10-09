@@ -81,6 +81,15 @@ GET_FILT_PERTURBATION = "ismpc_walking::get_filt_perturbation"
 GET_FILT_ZMP_ERROR = "ismpc_walking::get_filt_zmp_error"
 GET_FILT_DCM_BIAS = "ismpc_walking::get_filt_dcm_bias"
 GET_OBS_FILTER_CUTOFF_T = "ismpc_walking::get_obs_filter_cutoff_T"
+# Phase of the RlSine CoM-height reference being played (sin/cos of the controller's integrated phase, see
+# MoveCoM's m_rl_phase_applied_) and the controller-estimated CoM height above the support foot (m).
+GET_RL_PHASE_SIN = "ismpc_walking::get_rl_phase_sin"
+GET_RL_PHASE_COS = "ismpc_walking::get_rl_phase_cos"
+GET_COM_HEIGHT_EST = "ismpc_walking::get_com_height_est"
+# Nominal CoM height (m) the height observation is expressed relative to: Walking_controller's stab_config.comHeight /
+# ISMPC_Solver CoM_height_avg (0.95 in the controller as of this change -- keep in sync). Also the value the height
+# output is seeded with at reset (see reset()).
+COM_HEIGHT_NOMINAL = 0.95
 
 
 @dataclass(kw_only=True)
@@ -198,7 +207,8 @@ class IsmpcSineAction(McRtcActionBase):
     cfg.datastore_scalar_outputs = tuple(
       dict.fromkeys(
         (*cfg.datastore_scalar_outputs, GET_WANTS_STOP, GET_ROBOT_WALKING,
-         GET_FILT_PERTURBATION, GET_FILT_ZMP_ERROR, GET_FILT_DCM_BIAS, GET_OBS_FILTER_CUTOFF_T)
+         GET_FILT_PERTURBATION, GET_FILT_ZMP_ERROR, GET_FILT_DCM_BIAS, GET_OBS_FILTER_CUTOFF_T,
+         GET_RL_PHASE_SIN, GET_RL_PHASE_COS, GET_COM_HEIGHT_EST)
       )
     )
     # Vector3d counterparts of the above, same declare-before-super() pattern
@@ -272,6 +282,10 @@ class IsmpcSineAction(McRtcActionBase):
     }
     self._physical_curr = {k: v.clone() for k, v in self._physical_prev.items()}
     self._period_t0 = zeros.clone()
+    # Controller phase (rad) of the CoM-height reference at the instant the current period's params took effect.
+    # Both sines of the continuity rewards are evaluated at this SAME phase: the controller integrates the phase,
+    # so a frequency change only changes its rate and cannot move the reference.
+    self._period_phi = zeros.clone()
 
     # --- Walk/stop gate. ---
     # Defaults to False (not walking) -- matches Walking_controller::reset()'s
@@ -420,16 +434,12 @@ class IsmpcSineAction(McRtcActionBase):
   def target_height_obs(self) -> torch.Tensor:
     """Live CoM-height reference (m), evaluated now, as a (num_envs, 1)
     tensor. Debugging/visualization only -- not the C++-side ground truth."""
-    now = self._env.episode_length_buf.to(
-      dtype=torch.get_default_dtype()
-    ) * self._env.step_dt
-    t_in_period = now
-    omega = 2.0 * torch.pi * self._physical_curr["frequency"]
-    phase = omega * t_in_period
+    sin_phase = self.datastore_scalar_output(GET_RL_PHASE_SIN)
+    cos_phase = self.datastore_scalar_output(GET_RL_PHASE_COS)
     h = (
       self._physical_curr["offset"]
-      + self._physical_curr["sin_amp"] * torch.sin(phase)
-      + self._physical_curr["cos_amp"] * torch.cos(phase)
+      + self._physical_curr["sin_amp"] * sin_phase
+      + self._physical_curr["cos_amp"] * cos_phase
     )
     return h.unsqueeze(-1)
 
@@ -440,6 +450,25 @@ class IsmpcSineAction(McRtcActionBase):
     base's generic datastore-output machinery -- replaces the old file's
     manual ControllerIoBinding readback."""
     return self.datastore_scalar_output(GET_WANTS_STOP).unsqueeze(-1)
+
+  @property
+  def rl_phase_sincos_obs(self) -> torch.Tensor:
+    """(sin, cos) of the controller's integrated RlSine phase, (num_envs, 2). Phase of the reference the
+    controller is playing (ismpc_walking::get_rl_phase_sin/cos), collected by the generic datastore-output
+    machinery."""
+    return torch.stack(
+      [
+        self.datastore_scalar_output(GET_RL_PHASE_SIN),
+        self.datastore_scalar_output(GET_RL_PHASE_COS),
+      ],
+      dim=-1,
+    )
+
+  @property
+  def com_height_est_obs(self) -> torch.Tensor:
+    """Controller-estimated CoM height above the support foot (m), (num_envs, 1)
+    (ismpc_walking::get_com_height_est -> Walking_controller::estimatedComHeight)."""
+    return self.datastore_scalar_output(GET_COM_HEIGHT_EST).unsqueeze(-1)
 
   @property
   def filt_perturbation_obs(self) -> torch.Tensor:
@@ -512,6 +541,7 @@ class IsmpcSineAction(McRtcActionBase):
     self._physical_prev["offset"][rows] = self.cfg.offset_bias
     self._physical_curr["offset"][rows] = self.cfg.offset_bias
     self._period_t0[rows] = 0.0
+    self._period_phi[rows] = 0.0
 
     # Matches Walking_controller::reset()'s own T_Steps/policyWantsWalk
     # defaults -- every episode is independent, so the Python-side mirror
@@ -553,6 +583,14 @@ class IsmpcSineAction(McRtcActionBase):
     self._datastore_vector_input_feed[rows, vector_index] = self._twist_curr[rows].to(
       dtype=self._datastore_vector_input_feed.dtype
     )
+
+    # The base zeroes the collected datastore outputs of the reset rows, and they stay zero until the first fresh
+    # collect. For the phase/height observations zero is off-distribution (sin = cos = 0 is not on the unit circle;
+    # height 0 reads as -COM_HEIGHT_NOMINAL). Seed what the controller itself holds right after its reset: phase 0
+    # (Walking_controller/ISMPC_Solver reset it) and the nominal height.
+    self._datastore_scalar_outputs[GET_RL_PHASE_SIN][rows] = 0.0
+    self._datastore_scalar_outputs[GET_RL_PHASE_COS][rows] = 1.0
+    self._datastore_scalar_outputs[GET_COM_HEIGHT_EST][rows] = COM_HEIGHT_NOMINAL
 
   def apply_actions(self) -> None:
     """Advance the control period on its first substep, then write
@@ -614,6 +652,12 @@ class IsmpcSineAction(McRtcActionBase):
           due_for_sine_update, physical[k], self._physical_curr[k]
         )
       self._period_t0 = torch.where(due_for_sine_update, now, self._period_t0)
+      # Phase of the reference at the splice, from the latest collected controller phase.
+      phi_now = torch.atan2(
+        self.datastore_scalar_output(GET_RL_PHASE_SIN),
+        self.datastore_scalar_output(GET_RL_PHASE_COS),
+      )
+      self._period_phi = torch.where(due_for_sine_update, phi_now, self._period_phi)
 
       # Walk-gate and step-timing update on the SAME cadence as the sine
       # params, for consistent NN inference frequency across every channel
