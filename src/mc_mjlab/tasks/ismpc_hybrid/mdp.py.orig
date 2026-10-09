@@ -1006,18 +1006,14 @@ class stage_curriculum:
   Each stage is a dict:
     {"step": int,                      # env steps (env.common_step_counter) at which it starts
      "lin_vel_x": (lo, hi), "lin_vel_y": (lo, hi), "ang_vel_z": (lo, hi),
-     "push_scale": float}              # in [0, 1]: how far the push magnitude range is widened
+     "push_scale": float}              # multiplier on the base force ranges
   The active stage is the last one whose "step" <= common_step_counter,
   unless params["fixed_stage"] is not None, in which case that index is
   forced (used by play to pin a stage).
 
   Mutates live cfgs each call, like mjlab's reward_curriculum:
     * command ranges: env.command_manager.get_term(command_name).cfg.ranges
-    * push force: the event terms' params["force_range"]. The base range (lo, hi) of the cfg
-      gives magnitude bounds (r_min, r_max) = _DiskBodyImpulse._mag_bounds; push_scale k WIDENS
-      the ring instead of scaling it: force_range becomes (r_min, r_min + k * (r_max - r_min)).
-      k = 0 -> only magnitude r_min, k = 0.5 -> [r_min, mid], k = 1 -> the full [r_min, r_max].
-      For a legacy symmetric range such as (-60, 60), r_min = 0 and this is the old scaling.
+    * push force: the event terms' params["force_range"]
   ASSUMED, not verified: get_term(...).cfg.ranges is the live object the
   command sampler reads on resample (mjlab's own commands_vel presumably
   does this, but I haven't read its source), and that Ranges is mutable.
@@ -1060,8 +1056,7 @@ class stage_curriculum:
       r.lin_vel_y = s["lin_vel_y"]
       r.ang_vel_z = s["ang_vel_z"]
       k = float(s["push_scale"])
-      for c, base in zip(self._push_cfgs, self._base_force):
-        r_min, r_max = _DiskBodyImpulse._mag_bounds(base)
-        c.params["force_range"] = (r_min, r_min + k * (r_max - r_min))
+      for c, (lo, hi) in zip(self._push_cfgs, self._base_force):
+        c.params["force_range"] = (lo * k, hi * k)
       self._last = idx
     return {"stage": torch.tensor(float(idx))}

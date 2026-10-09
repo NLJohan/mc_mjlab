@@ -29,7 +29,7 @@ from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 700
+NUM_ENVS = 400
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 40.0
@@ -47,18 +47,22 @@ FRAMESKIP = 5  # physics substeps per controller dispatch: 5 ms -> 200 Hz
 # Physics substeps per ENV step = per policy inference = per PPO sample: 50 ms -> 20 Hz,
 # the same rate as the sine/walk/Ts/twist latch (IsmpcSineActionCfg.sine_param_frequency_hz).
 # Must be a multiple of FRAMESKIP; the controller is dispatched DECIMATION / FRAMESKIP times per env step.
-DECIMATION = 50
+DECIMATION = 5
 # rsl_rl env steps per iteration (= policy decisions per env per iteration, 32 * 50 ms = 1.6 s).
 NUM_STEPS_PER_ENV = 256
+# NUM_STEPS_PER_ENV = 32 # decimation 50
 
 # --- Push disturbances (mjlab.envs.mdp.events.apply_body_impulse). ---
 PUSH_SETTLE_TICKS = 25  # env steps (50 ms each)
-PUSH_FORCE_TORSO_N = (-60.0, 60.0)
-PUSH_FORCE_HAND_N = (-150.0, 150.0)
-PUSH_DURATION_S = (0.1, 0.3)
+PUSH_FORCE_TORSO_N = (50.0, 130.0)
+PUSH_FORCE_HAND_N = (100.0, 175.0)
+PUSH_DURATION_S = (0.1, 0.4)
 PUSH_COOLDOWN_TORSO_S = (2.0, 50.0)
 PUSH_COOLDOWN_HAND_S = (2.0, 50.0)
-# Cooldown law (gap between the end of a push and the start of the next): shifted
+# Poisson push arrivals: mean rate (Hz) per push point, memoryless (replaces the cooldown law below).
+HAND_POISSON_RATE = 0.06
+TORSO_POISSON_RATE = 0.06
+# Cooldown law (UNUSED since the Poisson law; kept for reference) (gap between the end of a push and the start of the next): shifted
 # exponential truncated to the ranges above, rate solved so that
 # P(cooldown < SPLIT) = P_BEFORE_SPLIT.
 PUSH_COOLDOWN_SPLIT_S = 10.0
@@ -85,12 +89,12 @@ TERRAIN_PATCH_SIZE_M = (8.0, 8.0)
 # Curriculum stages. "step" is env.common_step_counter, counted in ENV steps: iteration * NUM_STEPS_PER_ENV.
 CURRICULUM_STAGES = [
   {"step": 0,          "lin_vel_x": (-0.5, 0.5), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.2, 0.2), "push_scale": 0.2},
-  {"step": 300 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.2},
-  {"step": 600 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
-  {"step": 1000 * NUM_STEPS_PER_ENV, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.8},
+  {"step": 100 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.4},
+  {"step": 300 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.8},
+  {"step": 750 * NUM_STEPS_PER_ENV, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
   {"step": 1500 * NUM_STEPS_PER_ENV, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
 ]
-PLAY_CURRICULUM_STAGE = 4
+PLAY_CURRICULUM_STAGE = 0
 
 # Tutor reward (twist_tutor) weight decay. Boundaries match CURRICULUM_STAGES
 # (iterations); each factor multiplies the reward's base weight below.
@@ -387,9 +391,13 @@ def _make_env_cfg(
         "force_range": PUSH_FORCE_TORSO_N,
         "torque_range": (0.0, 0.0),
         "duration_s": PUSH_DURATION_S,
-        "cooldown_s": PUSH_COOLDOWN_TORSO_S,
-        "cooldown_split_s": PUSH_COOLDOWN_SPLIT_S,
-        "cooldown_p_before_split": PUSH_COOLDOWN_P_BEFORE_SPLIT,
+        # Cooldown law replaced by Poisson arrivals (rate_hz). cooldown_s is a dummy,
+        # only consumed by the stock apply_body_impulse __init__.
+        # "cooldown_s": PUSH_COOLDOWN_TORSO_S,
+        # "cooldown_split_s": PUSH_COOLDOWN_SPLIT_S,
+        # "cooldown_p_before_split": PUSH_COOLDOWN_P_BEFORE_SPLIT,
+        "cooldown_s": (1.0, 1.0),
+        "rate_hz": TORSO_POISSON_RATE,
         "settle_ticks": PUSH_SETTLE_TICKS,
       },
     ),
@@ -401,9 +409,13 @@ def _make_env_cfg(
         "force_range": PUSH_FORCE_HAND_N,
         "torque_range": (0.0, 0.0),
         "duration_s": PUSH_DURATION_S,
-        "cooldown_s": PUSH_COOLDOWN_HAND_S,
-        "cooldown_split_s": PUSH_COOLDOWN_SPLIT_S,
-        "cooldown_p_before_split": PUSH_COOLDOWN_P_BEFORE_SPLIT,
+        # Cooldown law replaced by Poisson arrivals (rate_hz). cooldown_s is a dummy,
+        # only consumed by the stock apply_body_impulse __init__.
+        # "cooldown_s": PUSH_COOLDOWN_HAND_S,
+        # "cooldown_split_s": PUSH_COOLDOWN_SPLIT_S,
+        # "cooldown_p_before_split": PUSH_COOLDOWN_P_BEFORE_SPLIT,
+        "cooldown_s": (1.0, 1.0),
+        "rate_hz": HAND_POISSON_RATE,
         "settle_ticks": PUSH_SETTLE_TICKS,
       },
     ),
@@ -415,9 +427,13 @@ def _make_env_cfg(
         "force_range": PUSH_FORCE_HAND_N,
         "torque_range": (0.0, 0.0),
         "duration_s": PUSH_DURATION_S,
-        "cooldown_s": PUSH_COOLDOWN_HAND_S,
-        "cooldown_split_s": PUSH_COOLDOWN_SPLIT_S,
-        "cooldown_p_before_split": PUSH_COOLDOWN_P_BEFORE_SPLIT,
+        # Cooldown law replaced by Poisson arrivals (rate_hz). cooldown_s is a dummy,
+        # only consumed by the stock apply_body_impulse __init__.
+        # "cooldown_s": PUSH_COOLDOWN_HAND_S,
+        # "cooldown_split_s": PUSH_COOLDOWN_SPLIT_S,
+        # "cooldown_p_before_split": PUSH_COOLDOWN_P_BEFORE_SPLIT,
+        "cooldown_s": (1.0, 1.0),
+        "rate_hz": HAND_POISSON_RATE,
         "settle_ticks": PUSH_SETTLE_TICKS,
       },
     ),
@@ -619,8 +635,10 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       num_mini_batches=4,
       learning_rate=1.0e-3,
       schedule="adaptive",
-      gamma=0.99,  
+      gamma=0.999,  
+      # gamma=0.99, # decimation 50  
       lam=0.95,
+      # lam=0.995,  # decimation 50
       desired_kl=0.01,
       max_grad_norm=1.0,
     ),
