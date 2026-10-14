@@ -23,11 +23,7 @@ def _scene(joint_ids):
   term._env = NS(device="cpu", num_envs=2)  # ty: ignore[invalid-assignment]
   term._bridge = NS(layout=NS(input=NS(joint_order=list(REF_ORDER))))  # ty: ignore[invalid-assignment]
   term._datastore_vectorx_outputs = {act.GET_JOINT_POS: q, act.GET_JOINT_VEL: 0.1 * q}
-  robot = NS(
-    name="robot",
-    joint_names=ENTITY_JOINTS,
-    data=NS(default_joint_pos=torch.tensor([[1.0, 2.0, 3.0]]).repeat(2, 1)),
-  )
+  robot = NS(name="robot", joint_names=ENTITY_JOINTS)
   env = NS(scene={"robot": robot}, action_manager=NS(get_term=lambda name: term))
   return env, NS(name="robot", joint_ids=joint_ids)
 
@@ -36,9 +32,8 @@ def test_selection_follows_the_observation_order_and_the_reference_columns() -> 
   env, cfg = _scene([2, 0])  # observed: c, then a -> reference columns 0 and 2
   pos = mdp.estimated_joint_pos(env, "ismpc_sine", cfg)  # ty: ignore[invalid-argument-type]
   vel = mdp.estimated_joint_vel(env, "ismpc_sine", cfg)  # ty: ignore[invalid-argument-type]
-  # position: controller value minus default_joint_pos of the observed joints (c: 3, a: 1)
-  torch.testing.assert_close(pos, torch.tensor([[7.0, 11.0], [17.0, 21.0]]))
-  # velocity: raw controller value, no offset
+  # position and velocity: raw controller values of the observed joints (c, then a), no offset
+  torch.testing.assert_close(pos, torch.tensor([[10.0, 12.0], [20.0, 22.0]]))
   torch.testing.assert_close(vel, torch.tensor([[1.0, 1.2], [2.0, 2.2]]))
 
 

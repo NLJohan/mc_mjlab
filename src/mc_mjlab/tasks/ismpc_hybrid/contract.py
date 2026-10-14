@@ -357,8 +357,6 @@ def _term_specs(parts: dict) -> list[dict]:
         raise ContractError(f"actor term '{name}' has dim {dim} but {len(names)} observed joints")
       spec["select"] = names
       spec["labels_key"] = KEY_PREFIX + JOINT_NAMES_KEY
-      if name == "joint_pos":
-        spec["offset"] = [float(v) for v in joints["default_pos"]]
     elif name == "target_twist":
       spec["clamp"] = [list(cmd[k]) for k in ("lin_vel_x", "lin_vel_y", "ang_vel_z")]
     specs.append(spec)

@@ -199,17 +199,17 @@ def _selected_joint_ids(robot, asset_cfg: SceneEntityCfg) -> list[int]:
 def estimated_joint_pos(
   env: ManagerBasedRlEnv, action_name: str, asset_cfg: SceneEntityCfg
 ) -> torch.Tensor:
-  """Joint positions (rad) as the CONTROLLER reads them, minus the default pose, (num_envs, n_joints).
+  """Joint positions (rad) as the CONTROLLER reads them, raw (no offset), (num_envs, n_joints).
 
   Datastore getter ismpc_walking::get_joint_pos (realRobot().encoderValues(), reference joint order), restricted
-  to the joints of asset_cfg in its order, then default_joint_pos subtracted: the exported contract describes
-  exactly this (select by joint name, offset = default positions). Actor only; the critic keeps MuJoCo truth
-  (envs_mdp.joint_pos_rel). asset_cfg must come through the term's params so the manager resolves it."""
+  to the joints of asset_cfg in its order: the exported contract describes exactly this (select by joint name,
+  no offset). Actor only; the critic keeps MuJoCo truth (envs_mdp.joint_pos_rel, relative to the default pose).
+  asset_cfg must come through the term's params so the manager resolves it."""
   action_term = env.action_manager.get_term(action_name)
   robot = env.scene[asset_cfg.name]
   ids = _selected_joint_ids(robot, asset_cfg)
   cols = action_term.ref_columns([robot.joint_names[i] for i in ids])
-  return action_term.joint_pos_est_obs[:, cols] - robot.data.default_joint_pos[:, ids]
+  return action_term.joint_pos_est_obs[:, cols]
 
 
 def estimated_joint_vel(
@@ -218,7 +218,7 @@ def estimated_joint_vel(
   """Joint velocities (rad/s) as the CONTROLLER reads them, (num_envs, n_joints), no offset.
 
   Datastore getter ismpc_walking::get_joint_vel (realRobot().encoderVelocities()), same joint selection as
-  estimated_joint_pos. The contract carries no offset for this term, so none is applied here."""
+  estimated_joint_pos. The contract carries no offset for this term either, so none is applied here."""
   action_term = env.action_manager.get_term(action_name)
   robot = env.scene[asset_cfg.name]
   ids = _selected_joint_ids(robot, asset_cfg)
