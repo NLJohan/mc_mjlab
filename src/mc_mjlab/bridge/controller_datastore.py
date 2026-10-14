@@ -62,3 +62,27 @@ def read_outputs(
     name: (block[:, start : start + width] if width == 3 else block[:, start]).to(dtype)
     for name, start in columns.items()
   }
+
+
+def vectorx_output_columns(
+  layout: native.IoLayout, names: Iterable[str]
+) -> dict[str, tuple[int, int]]:
+  """Resolve configured ``VectorXd`` getters to their ``(first column, size)``, once."""
+  callbacks = list(layout.output.datastore_vectorx)
+  dims = list(layout.output.datastore_vectorx_dims)
+  start = layout.output.datastore_vectorx_offset()
+  firsts = [start + sum(dims[:i]) for i in range(len(dims))]
+  return {
+    name: (firsts[callbacks.index(name)], dims[callbacks.index(name)]) for name in names
+  }
+
+
+def read_vectorx_outputs(
+  block: torch.Tensor, columns: dict[str, tuple[int, int]]
+) -> dict[str, torch.Tensor]:
+  """Slice the uploaded output block into one ``(num_envs, size)`` tensor per getter."""
+  dtype = torch.get_default_dtype()
+  return {
+    name: block[:, start : start + size].to(dtype)
+    for name, (start, size) in columns.items()
+  }

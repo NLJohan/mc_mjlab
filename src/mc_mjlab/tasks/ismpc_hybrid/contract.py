@@ -1,13 +1,17 @@
-"""Builds the `ismpc_contract` embedded in every exported `model_N.onnx`.
+"""Builds the `ismpc_contract` embedded in every exported `model_N.onnx` (contract version 3).
 
-The C++ `PolicyRunner` reads ONLY this contract (never this repo's Python), so
-everything the deployment side must reproduce is read here from the LIVE
-environment at save time -- nothing is hardcoded unless it cannot be read from
-the env (see TWIST_RATE_LIMITED).
+The C++ `PolicyRunner` reads ONLY this contract (never this repo's Python), so everything the deployment side
+must reproduce is read here from the LIVE environment at save time, except what cannot be read from the env:
+the controller datastore key of each observation term (OBS_BINDINGS) and the observation delay
+(PIPELINE_OBS_DELAY_TICKS).
 
-Raises ContractError when the actor observation uses anything the C++
-ObservationBuilder would silently disagree with (history, delay, noise, scale
-!= 1, clipping). The runner then skips the export and training continues.
+Two stages: `_collect_parts` reads the env into a plain dict (the layout contract version 1 used), `to_v3`
+turns that dict into the version 3 contract. `to_v3` is pure, so it also converts an old contract file
+(restamp tool) and is what the golden test exercises without an env.
+
+Raises ContractError when the actor observation uses anything the C++ side would silently disagree with
+(history, delay, noise, scale != 1, clipping), or when the env does not match what the tables below describe.
+The runner then skips the export and training continues.
 """
 
 from __future__ import annotations
@@ -24,24 +28,48 @@ import torch
 from mc_mjlab.actions import ismpc_sine_action as act
 from mc_mjlab.tasks.ismpc_hybrid import mdp
 
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 3
 ACTOR_GROUP = "actor"
 ACTION_NAME = "ismpc_sine"
 COMMAND_NAME = "twist"
 
-# Observation terms whose value is low-passed INSIDE the controller. When any is in the actor group the contract
-# carries a `filters` block with the cutoff period they were trained with.
-FILTERED_TERMS = ("filt_perturbation", "filt_zmp_error", "filt_dcm_bias")
+KEY_PREFIX = "ismpc_walking::"
 
-# IsmpcSineAction._advance_sine_period currently snaps the twist straight to
-# its mapped target (no rate limit), even though cfg.twist_max_delta exists.
-# That cannot be detected from the env, so it is recorded here by hand: if the
-# action term ever starts applying twist_max_delta, flip this to True.
-TWIST_RATE_LIMITED = False
+# Observation delay of the training pipeline, in controller ticks (the deployed runner reads a snapshot taken
+# this many end-of-step samples ago). Derived by hand from the async dispatch in mc_rtc_action_base
+# (plan F1); NOT measured yet: the P1 replay decides it.
+PIPELINE_OBS_DELAY_TICKS = 2
+
+# Actor term name -> (controller datastore getter without prefix, type, dim). dim None = taken from the env
+# (joint terms: the number of observed joints). Until observations are read generically through the datastore,
+# this table IS the link between a training term and a controller key.
+OBS_BINDINGS: dict[str, tuple[str, str, int | None]] = {
+  "com_lin_vel": ("get_com_lin_vel", "vec3", 3),
+  "base_ang_vel": ("get_base_ang_vel", "vec3", 3),
+  "projected_gravity": ("get_projected_gravity", "vec3", 3),
+  "joint_pos": ("get_joint_pos", "vecx", None),
+  "joint_vel": ("get_joint_vel", "vecx", None),
+  "last_sine_params": ("get_com_height_sine_params", "vecx", 4),
+  "rl_phase_sincos": ("get_rl_phase_sincos", "vecx", 2),
+  "com_height": ("get_com_height_est", "double", 1),
+  "last_walk_action": ("get_policy_wants_walk", "double", 1),
+  "last_step_timing_action": ("get_ts_target", "double", 1),
+  "last_twist_action": ("get_rl_ref_vel", "vec3", 3),
+  "ismpc_wants_stop": ("wants_stop_d", "double", 1),
+  "filt_perturbation": ("get_filt_perturbation", "double", 1),
+  "filt_zmp_error": ("get_filt_zmp_error", "double", 1),
+  "filt_dcm_bias": ("get_filt_dcm_bias", "double", 1),
+  "target_twist": ("get_user_ref_vel", "vec3", 3),
+}
+JOINT_NAMES_KEY = "get_joint_names"
+
+# Raw action layout the output table below assumes (IsmpcSineAction).
+EXPECTED_ACTION_DIM = 9
+EXPECTED_LAYOUT = {"sine": [0, 4], "walk_gate": 4, "ts": 5, "twist": [6, 9]}
 
 
 class ContractError(RuntimeError):
-  """The env cannot be described faithfully by contract version 1."""
+  """The env cannot be described faithfully by contract version 3."""
 
 
 def _plain(x: Any) -> Any:
@@ -170,11 +198,6 @@ def _action_section(env: Any, term: Any) -> dict:
       "ts_default": act.TS_DEFAULT,
       "twist_scale": list(cfg.twist_scale),
       "twist_raw_clamp": [-1.0, 1.0],
-      # None = the trained action snaps to its target every latch.
-      "twist_max_delta_per_latch": (
-        list(cfg.twist_max_delta) if TWIST_RATE_LIMITED else None
-      ),
-      "twist_max_delta_cfg_unused": list(cfg.twist_max_delta),
     },
     "reset_defaults": {
       "offset": cfg.offset_bias,
@@ -243,19 +266,17 @@ def _command_section(env: Any) -> dict:
   return {"names": list(env.command_manager.active_terms), "ranges": ranges}
 
 
-def _filters_section(term: Any, obs: dict) -> dict | None:
+def _filters_section(term: Any) -> dict:
   """Cutoff period (s) of the controller-side observation filters, read from the LIVE controllers.
 
-  None when no filtered term is observed. Envs that were just reset read 0 until their first collect, so only
-  the positive entries count; they must all agree (the cutoff is a controller constant, one YAML key)."""
-  if not any(t["name"] in FILTERED_TERMS for t in obs["terms"]):
-    return None
+  Always required by contract v3 (the controller swaps its filter cutoff at attach). Envs that were just reset
+  read 0 until their first collect, so only the positive entries count; they must all agree (the cutoff is a
+  controller constant, one YAML key)."""
   vals = term.datastore_scalar_output(act.GET_OBS_FILTER_CUTOFF_T).detach().cpu().flatten()
   pos = vals[vals > 0]
   if pos.numel() == 0:
     raise ContractError(
-      "filtered observation terms are present but no controller reports its obs_filter_cutoff_T yet "
-      "(all readouts are 0); the next save will retry"
+      "no controller reports its obs_filter_cutoff_T yet (all readouts are 0); the next save will retry"
     )
   if not torch.allclose(pos, pos[0].expand_as(pos)):
     raise ContractError(f"controllers disagree on obs_filter_cutoff_T: {sorted(set(pos.tolist()))}")
@@ -279,41 +300,144 @@ def _git_info() -> dict:
   return {"hash": run("rev-parse", "HEAD"), "dirty": bool(status) if status is not None else None}
 
 
-def build_contract(
-  env: Any, policy: Any, *, checkpoint_path: str, iteration: int
-) -> dict:
-  """`env` is the unwrapped ManagerBasedRlEnv, `policy` is alg.get_policy()."""
+def _collect_parts(env: Any, policy: Any, *, checkpoint_path: str, iteration: int) -> dict:
+  """Reads the live env into the plain dict `to_v3` consumes (the contract version 1 layout, without the
+  latch block)."""
   term = env.action_manager.get_term(ACTION_NAME)
   obs = _obs_section(env)
   action = _action_section(env, term)
-  controller_dt, latch_ticks = _timing_section(env, term)
-  filters = _filters_section(term, obs)
+  controller_dt, period_ticks = _timing_section(env, term)
   norm = _normalizer_section(policy)
   if norm is not None and "mean" in norm:
     obs["normalizer"] = norm
   elif norm is not None:
     obs["normalizer_error"] = norm
-
   return {
-    "contract_version": CONTRACT_VERSION,
     "checkpoint": {
       "stem": Path(checkpoint_path).stem,
       "iteration": int(iteration),
       "git": _git_info(),
     },
     "controller_dt": controller_dt,
-    "latch_ticks": latch_ticks,
-    # Mirrors IsmpcSineAction: counter seeded to 1 at reset; each controller
-    # step checks `counter == 0` FIRST, then counter = (counter + 1) % ticks.
-    # So the first latch is the ticks-th step after reset.
-    "latch": {
-      "counter_seed": 1,
-      "due_when": "counter == 0, checked before the increment",
-      "actions_used": "only the action computed on a latch step",
-    },
+    "latch_ticks": period_ticks,
     "obs": obs,
-    **({"filters": filters} if filters is not None else {}),
+    "filters": _filters_section(term),
     "action": action,
     "joints": _joints_section(env),
     "command": _command_section(env),
   }
+
+
+def _need(d: dict, *path: str) -> Any:
+  cur: Any = d
+  for i, k in enumerate(path):
+    if not isinstance(cur, dict) or k not in cur:
+      raise ContractError(f"missing '{'.'.join(path[: i + 1])}' in the contract parts")
+    cur = cur[k]
+  return cur
+
+
+def _term_specs(parts: dict) -> list[dict]:
+  joints = _need(parts, "joints")
+  cmd = _need(parts, "command", "ranges")
+  specs: list[dict] = []
+  for t in _need(parts, "obs", "terms"):
+    name, dim = t["name"], int(t["dim"])
+    if name not in OBS_BINDINGS:
+      raise ContractError(
+        f"actor term '{name}' has no controller datastore key: add it to OBS_BINDINGS (or remove the term)"
+      )
+    getter, typ, fixed = OBS_BINDINGS[name]
+    if fixed is not None and dim != fixed:
+      raise ContractError(f"actor term '{name}' has dim {dim}, the controller getter {getter} gives {fixed}")
+    spec: dict = {"name": name, "key": KEY_PREFIX + getter, "type": typ, "dim": dim}
+    if name in ("joint_pos", "joint_vel"):
+      names = list(joints["names"])
+      if len(names) != dim:
+        raise ContractError(f"actor term '{name}' has dim {dim} but {len(names)} observed joints")
+      spec["select"] = names
+      spec["labels_key"] = KEY_PREFIX + JOINT_NAMES_KEY
+      if name == "joint_pos":
+        spec["offset"] = [float(v) for v in joints["default_pos"]]
+    elif name == "target_twist":
+      spec["clamp"] = [list(cmd[k]) for k in ("lin_vel_x", "lin_vel_y", "ang_vel_z")]
+    specs.append(spec)
+  return specs
+
+
+def _output_specs(action: dict) -> list[dict]:
+  """One entry per raw network output: y = clamp(fn(scale * raw + bias), range), written to the setter `key`."""
+  if int(action["dim"]) != EXPECTED_ACTION_DIM or action["layout"] != EXPECTED_LAYOUT:
+    raise ContractError(
+      f"action layout {action['layout']} (dim {action['dim']}) differs from the one the output table "
+      f"assumes: {EXPECTED_LAYOUT} (dim {EXPECTED_ACTION_DIM})"
+    )
+  c, d = action["constants"], action["reset_defaults"]
+  clamp = c["twist_raw_clamp"]
+
+  def out(name: str, raw: int, setter: str, fn: str, scale: float, bias: float, rng: list | None, init: float) -> dict:
+    o: dict = {"name": name, "raw": raw, "key": KEY_PREFIX + setter, "fn": fn, "scale": scale, "bias": bias}
+    if rng is not None:
+      o["range"] = rng
+    o["init"] = init
+    return o
+
+  outs = [
+    out("com_height_offset", 0, "set_com_height_sine_offset", "id",
+        c["offset_scale"], c["offset_bias"], [c["offset_min"], c["offset_max"]], d["offset"]),
+    out("com_height_frequency", 1, "set_com_height_sine_frequency", "exp",
+        c["frequency_scale"], c["frequency_bias"], [c["frequency_min"], c["frequency_max"]], d["frequency"]),
+    out("com_height_sin_amp", 2, "set_com_height_sine_sin_amp", "id", c["amplitude_scale"], 0.0, None, d["sin_amp"]),
+    out("com_height_cos_amp", 3, "set_com_height_sine_cos_amp", "id", c["amplitude_scale"], 0.0, None, d["cos_amp"]),
+    # The walk decode is `raw > walk_gate_bias`, i.e. step(1 * raw + bias) with bias = -gate.
+    out("walk", 4, "set_policy_wants_walk", "step", 1.0, -c["walk_gate_bias"], None, float(d["walk"])),
+    out("step_timing", 5, "set_ts", "id", c["ts_scale"], c["ts_bias"], [c["ts_min"], c["ts_max"]], d["ts"]),
+  ]
+  for i, (axis, setter) in enumerate((("twist_x", "set_rl_ref_vel_x"), ("twist_y", "set_rl_ref_vel_y"),
+                                      ("twist_yaw", "set_rl_ref_vel_z"))):
+    s = c["twist_scale"][i]
+    # clamp(raw, -1, 1) * s == clamp(s * raw, s * -1, s * 1) for s > 0
+    if not s > 0:
+      raise ContractError(f"twist_scale[{i}] must be > 0 (got {s})")
+    outs.append(out(axis, 6 + i, setter, "id", s, 0.0, [s * clamp[0], s * clamp[1]], d["twist"][i]))
+  return outs
+
+
+def to_v3(parts: dict) -> dict:
+  """Pure: the dict `_collect_parts` builds (or an old contract version 1 file) -> contract version 3."""
+  terms = _term_specs(parts)
+  outputs = _output_specs(_need(parts, "action"))
+  c = parts["action"]["constants"]
+  period_ticks = int(_need(parts, "latch_ticks"))
+  if period_ticks < PIPELINE_OBS_DELAY_TICKS + 1:
+    raise ContractError(f"period_ticks {period_ticks} must exceed obs_delay_ticks {PIPELINE_OBS_DELAY_TICKS}")
+
+  obs: dict = {"terms": terms}
+  norm = parts["obs"].get("normalizer")
+  if norm is not None:
+    obs_dim = sum(t["dim"] for t in terms)
+    if len(norm["mean"]) == obs_dim and len(norm["std"]) == obs_dim:
+      obs["normalizer"] = {"mean": norm["mean"], "std": norm["std"], "eps": norm["eps"]}
+    # else: diagnostics only, the ONNX has the real normalizer; leave it out rather than block the export
+
+  return {
+    "contract_version": CONTRACT_VERSION,
+    "checkpoint": parts["checkpoint"],
+    "controller_dt": _need(parts, "controller_dt"),
+    "period_ticks": period_ticks,
+    "obs_delay_ticks": PIPELINE_OBS_DELAY_TICKS,
+    "controller": {
+      "obs_filter_cutoff_T": _need(parts, "filters", "obs_filter_cutoff_T"),
+      "com_height_range": [c["offset_min"], c["offset_max"]],
+    },
+    "obs": obs,
+    "action": {"outputs": outputs},
+  }
+
+
+def build_contract(
+  env: Any, policy: Any, *, checkpoint_path: str, iteration: int
+) -> dict:
+  """`env` is the unwrapped ManagerBasedRlEnv, `policy` is alg.get_policy()."""
+  parts = _collect_parts(env, policy, checkpoint_path=checkpoint_path, iteration=iteration)
+  return to_v3(parts)

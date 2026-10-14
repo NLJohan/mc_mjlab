@@ -43,6 +43,7 @@ from dataclasses import dataclass
 import torch
 
 from mc_mjlab.actions.mc_rtc_action_base import McRtcActionBase, McRtcActionCfg
+from mc_mjlab.robots import robot_module as robots
 
 # --- Physical ranges, ported verbatim from the Cython-bridge action. ---
 OFFSET_MIN, OFFSET_MAX = 0.4, 1.05  # m
@@ -82,14 +83,14 @@ GET_FILT_ZMP_ERROR = "ismpc_walking::get_filt_zmp_error"
 GET_FILT_DCM_BIAS = "ismpc_walking::get_filt_dcm_bias"
 GET_OBS_FILTER_CUTOFF_T = "ismpc_walking::get_obs_filter_cutoff_T"
 # Phase of the RlSine CoM-height reference being played (sin/cos of the controller's integrated phase, see
-# MoveCoM's m_rl_phase_applied_) and the controller-estimated CoM height above the support foot (m).
+# MoveCoM's m_rl_phase_applied_) and the controller-estimated CoM height above the support foot (m, raw, ~0.93).
 GET_RL_PHASE_SIN = "ismpc_walking::get_rl_phase_sin"
 GET_RL_PHASE_COS = "ismpc_walking::get_rl_phase_cos"
 GET_COM_HEIGHT_EST = "ismpc_walking::get_com_height_est"
-# Nominal CoM height (m) the height observation is expressed relative to: Walking_controller's stab_config.comHeight /
-# ISMPC_Solver CoM_height_avg (0.95 in the controller as of this change -- keep in sync). Also the value the height
-# output is seeded with at reset (see reset()).
-COM_HEIGHT_NOMINAL = 0.95
+# Joint encoder positions / velocities of the controller's realRobot(), one value per reference joint in the robot's
+# reference joint order (VectorXd). These are the keys the deployed policy reads for joint_pos / joint_vel.
+GET_JOINT_POS = "ismpc_walking::get_joint_pos"
+GET_JOINT_VEL = "ismpc_walking::get_joint_vel"
 
 
 @dataclass(kw_only=True)
@@ -219,6 +220,14 @@ class IsmpcSineAction(McRtcActionBase):
     )
     cfg.datastore_vectors_outputs = tuple(
       dict.fromkeys((*cfg.datastore_vectors_outputs, GET_COM_LIN_VEL))
+    )
+    # VectorXd getters: (name, size) pairs. The size is the number of reference joints; the native layer checks it
+    # against the controller's getter when it initializes.
+    n_ref_joints = len(robots.get_ref_joint_order(cfg.mc_rtc_robot_name))
+    cfg.datastore_vectorx_outputs = tuple(
+      dict.fromkeys(
+        (*cfg.datastore_vectorx_outputs, (GET_JOINT_POS, n_ref_joints), (GET_JOINT_VEL, n_ref_joints))
+      )
     )
 
     # `BaseAction.__init__` (via McRtcActionBase's own super().__init__())
@@ -471,6 +480,32 @@ class IsmpcSineAction(McRtcActionBase):
     return self.datastore_scalar_output(GET_COM_HEIGHT_EST).unsqueeze(-1)
 
   @property
+  def joint_pos_est_obs(self) -> torch.Tensor:
+    """Controller joint positions (rad), (num_envs, n_reference_joints), in the robot's reference joint order
+    (ismpc_walking::get_joint_pos: realRobot().encoderValues()). Select joints with ref_columns."""
+    return self.datastore_vectorx_output(GET_JOINT_POS)
+
+  @property
+  def joint_vel_est_obs(self) -> torch.Tensor:
+    """Controller joint velocities (rad/s), (num_envs, n_reference_joints), reference joint order
+    (ismpc_walking::get_joint_vel: realRobot().encoderVelocities())."""
+    return self.datastore_vectorx_output(GET_JOINT_VEL)
+
+  def ref_columns(self, joint_names) -> torch.Tensor:
+    """Column of each named joint in the reference-order joint vectors above, as a long tensor (cached)."""
+    key = tuple(joint_names)
+    cache = self.__dict__.setdefault("_ref_columns_cache", {})
+    if key not in cache:
+      order = list(self._bridge.layout.input.joint_order)
+      missing = [name for name in key if name not in order]
+      if missing:
+        raise ValueError(f"joints {missing} are not in the controller's reference joint order")
+      cache[key] = torch.tensor(
+        [order.index(name) for name in key], dtype=torch.long, device=self.device
+      )
+    return cache[key]
+
+  @property
   def filt_perturbation_obs(self) -> torch.Tensor:
     """Low-passed ISMPC perturbation |w_.xy| (m), (num_envs, 1). Filtered inside the controller (cutoff period
     walking_controller.obs_filter_cutoff_T), read through the generic datastore-output machinery."""
@@ -585,12 +620,11 @@ class IsmpcSineAction(McRtcActionBase):
     )
 
     # The base zeroes the collected datastore outputs of the reset rows, and they stay zero until the first fresh
-    # collect. For the phase/height observations zero is off-distribution (sin = cos = 0 is not on the unit circle;
-    # height 0 reads as -COM_HEIGHT_NOMINAL). Seed what the controller itself holds right after its reset: phase 0
-    # (Walking_controller/ISMPC_Solver reset it) and the nominal height.
+    # collect. For the phase zero is off-distribution (sin = cos = 0 is not on the unit circle): seed what the
+    # controller itself holds right after its reset (phase 0). The measured CoM height is NOT seeded: there is no
+    # honest constant for it, so it reads 0 until the first collect (to be replaced by a real reset read).
     self._datastore_scalar_outputs[GET_RL_PHASE_SIN][rows] = 0.0
     self._datastore_scalar_outputs[GET_RL_PHASE_COS][rows] = 1.0
-    self._datastore_scalar_outputs[GET_COM_HEIGHT_EST][rows] = COM_HEIGHT_NOMINAL
 
   def apply_actions(self) -> None:
     """Advance the control period on its first substep, then write

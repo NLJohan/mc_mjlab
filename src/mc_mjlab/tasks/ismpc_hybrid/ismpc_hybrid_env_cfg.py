@@ -29,7 +29,7 @@ from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 700
+NUM_ENVS = 400
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 40.0
@@ -173,17 +173,21 @@ def _make_env_cfg(
     ),
     "base_ang_vel": ObservationTermCfg(func=envs_mdp.base_ang_vel),
     "projected_gravity": ObservationTermCfg(func=envs_mdp.projected_gravity),
+    # Joint encoders as the CONTROLLER reads them (ismpc_walking::get_joint_pos / get_joint_vel), the same keys the
+    # deployed policy reads. The critic overrides both with MuJoCo truth below.
     "joint_pos": ObservationTermCfg(
-      func=envs_mdp.joint_pos_rel, params={"asset_cfg": ismpc_mdp.observed_joint_cfg()}
+      func=ismpc_mdp.estimated_joint_pos,
+      params={"action_name": "ismpc_sine", "asset_cfg": ismpc_mdp.observed_joint_cfg()},
     ),
     "joint_vel": ObservationTermCfg(
-      func=envs_mdp.joint_vel_rel, params={"asset_cfg": ismpc_mdp.observed_joint_cfg()}
+      func=ismpc_mdp.estimated_joint_vel,
+      params={"action_name": "ismpc_sine", "asset_cfg": ismpc_mdp.observed_joint_cfg()},
     ),
     "last_sine_params": ObservationTermCfg(
       func=ismpc_mdp.last_sine_params, params={"action_name": "ismpc_sine"}
     ),
     # Phase of the CoM-height reference the controller is playing (sin, cos; integrated in the controller, reset
-    # with the episode) and the controller-estimated CoM height relative to the nominal height. With last_sine_params
+    # with the episode) and the controller-estimated CoM height (raw, no offset). With last_sine_params
     # these let the policy compute the active reference height. Critic inherits both (critic_terms copies actor_terms).
     "rl_phase_sincos": ObservationTermCfg(
       func=ismpc_mdp.rl_phase_sincos, params={"action_name": "ismpc_sine"}
@@ -220,6 +224,13 @@ def _make_env_cfg(
 
   # Critic = actor obs + privileged push state (1 expected-impulse value per push event, 3 total).
   critic_terms = dict(actor_terms)
+  # Privileged: the critic keeps MuJoCo's true joint state (same names and order, so its input layout is unchanged).
+  critic_terms["joint_pos"] = ObservationTermCfg(
+    func=envs_mdp.joint_pos_rel, params={"asset_cfg": ismpc_mdp.observed_joint_cfg()}
+  )
+  critic_terms["joint_vel"] = ObservationTermCfg(
+    func=envs_mdp.joint_vel_rel, params={"asset_cfg": ismpc_mdp.observed_joint_cfg()}
+  )
   for _name in ("push_torso", "push_right_hand", "push_left_hand"):
     critic_terms[f"{_name}_state"] = ObservationTermCfg(
       func=ismpc_mdp.push_state,

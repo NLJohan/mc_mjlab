@@ -82,9 +82,10 @@ class IsmpcHybridOnPolicyRunner(MjlabOnPolicyRunner):
     finally:
       self._restore_policy_state(policy, device, was_training)
 
+    obs_dim, act_dim = self._contract_dims(contract)
     print(
-      f"{TAG} {onnx_path.name}: obs_dim={contract['obs']['dim']} "
-      f"action_dim={contract['action']['dim']} latch_ticks={contract['latch_ticks']} "
+      f"{TAG} {onnx_path.name}: obs_dim={obs_dim} action_dim={act_dim} "
+      f"period_ticks={contract['period_ticks']} obs_delay_ticks={contract['obs_delay_ticks']} "
       f"controller_dt={contract['controller_dt']} (self-check ok)"
     )
 
@@ -111,6 +112,15 @@ class IsmpcHybridOnPolicyRunner(MjlabOnPolicyRunner):
       policy.train(was_training)
 
   @staticmethod
+  def _contract_dims(contract: dict) -> tuple[int, int]:
+    """Contract v3 carries no dim fields: the observation size is the sum of the term dims, the action size is
+    the number of outputs (the same two numbers the C++ loader derives)."""
+    return (
+      sum(int(t["dim"]) for t in contract["obs"]["terms"]),
+      len(contract["action"]["outputs"]),
+    )
+
+  @staticmethod
   def _check_io_shapes(onnx_path: Path, contract: dict) -> None:
     import onnx
 
@@ -120,7 +130,7 @@ class IsmpcHybridOnPolicyRunner(MjlabOnPolicyRunner):
       return [d.dim_value for d in v.type.tensor_type.shape.dim]
 
     in_dims, out_dims = dims(graph.input[0]), dims(graph.output[0])
-    obs_dim, act_dim = contract["obs"]["dim"], contract["action"]["dim"]
+    obs_dim, act_dim = IsmpcHybridOnPolicyRunner._contract_dims(contract)
     if in_dims != [1, obs_dim]:
       raise RuntimeError(f"ONNX input shape {in_dims} != [1, {obs_dim}] from the obs terms")
     if out_dims != [1, act_dim]:

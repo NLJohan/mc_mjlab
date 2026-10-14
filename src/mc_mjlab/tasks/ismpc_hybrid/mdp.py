@@ -33,7 +33,6 @@ import torch
 from mjlab.envs.mdp.events import apply_body_impulse
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
-from mc_mjlab.actions.ismpc_sine_action import COM_HEIGHT_NOMINAL
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -183,12 +182,48 @@ def rl_phase_sincos(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
 
 
 def estimated_com_height(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
-  """Controller-estimated CoM height relative to COM_HEIGHT_NOMINAL (m), (num_envs, 1).
+  """Controller-estimated CoM height above the support foot (m, raw, no offset), (num_envs, 1).
 
   Datastore getter ismpc_walking::get_com_height_est (realRobot CoM z minus the support-foot z), not MuJoCo
   ground truth, so training and deployment read the same signal."""
   action_term = env.action_manager.get_term(action_name)
-  return action_term.com_height_est_obs - COM_HEIGHT_NOMINAL
+  return action_term.com_height_est_obs
+
+
+def _selected_joint_ids(robot, asset_cfg: SceneEntityCfg) -> list[int]:
+  """Robot joint indices an asset_cfg selects, in observation order (slice(None) = every joint)."""
+  sel = asset_cfg.joint_ids
+  return list(range(len(robot.joint_names))) if isinstance(sel, slice) else [int(i) for i in sel]
+
+
+def estimated_joint_pos(
+  env: ManagerBasedRlEnv, action_name: str, asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+  """Joint positions (rad) as the CONTROLLER reads them, minus the default pose, (num_envs, n_joints).
+
+  Datastore getter ismpc_walking::get_joint_pos (realRobot().encoderValues(), reference joint order), restricted
+  to the joints of asset_cfg in its order, then default_joint_pos subtracted: the exported contract describes
+  exactly this (select by joint name, offset = default positions). Actor only; the critic keeps MuJoCo truth
+  (envs_mdp.joint_pos_rel). asset_cfg must come through the term's params so the manager resolves it."""
+  action_term = env.action_manager.get_term(action_name)
+  robot = env.scene[asset_cfg.name]
+  ids = _selected_joint_ids(robot, asset_cfg)
+  cols = action_term.ref_columns([robot.joint_names[i] for i in ids])
+  return action_term.joint_pos_est_obs[:, cols] - robot.data.default_joint_pos[:, ids]
+
+
+def estimated_joint_vel(
+  env: ManagerBasedRlEnv, action_name: str, asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+  """Joint velocities (rad/s) as the CONTROLLER reads them, (num_envs, n_joints), no offset.
+
+  Datastore getter ismpc_walking::get_joint_vel (realRobot().encoderVelocities()), same joint selection as
+  estimated_joint_pos. The contract carries no offset for this term, so none is applied here."""
+  action_term = env.action_manager.get_term(action_name)
+  robot = env.scene[asset_cfg.name]
+  ids = _selected_joint_ids(robot, asset_cfg)
+  cols = action_term.ref_columns([robot.joint_names[i] for i in ids])
+  return action_term.joint_vel_est_obs[:, cols]
 
 
 class target_vel_window:

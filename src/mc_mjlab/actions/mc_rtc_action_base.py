@@ -30,6 +30,8 @@ from mc_mjlab.bridge.controller_datastore import (
   input_columns,
   output_columns,
   read_outputs,
+  read_vectorx_outputs,
+  vectorx_output_columns,
   write_inputs,
 )
 from mc_mjlab.bridge.shared_memory import ShmHandle, create_shm, row_window
@@ -73,6 +75,10 @@ class McRtcActionCfg(BaseActionCfg):
 
   datastore_vectors_outputs: tuple[str, ...] = ()
   """Native Vector3d getters collected each period, without interpolation."""
+
+  datastore_vectorx_outputs: tuple[tuple[str, int], ...] = ()
+  """Native ``Eigen::VectorXd`` getters as ``(name, size)`` pairs, collected each period. The size is
+  checked against the controller's getter when it initializes."""
 
   controller_timeout_ms: int = 120000
   """Native collection timeout, in milliseconds."""
@@ -148,7 +154,11 @@ class McRtcActionBase(BaseAction):
     self._seed_interpolation(rows)
     self._has_staged_control[rows] = False
 
-    for readouts in (self._datastore_vector_outputs, self._datastore_scalar_outputs):
+    for readouts in (
+      self._datastore_vector_outputs,
+      self._datastore_vectorx_outputs,
+      self._datastore_scalar_outputs,
+    ):
       for values in readouts.values():
         values[rows] = 0.0
     self._datastore_output_fresh[rows] = False
@@ -200,6 +210,17 @@ class McRtcActionBase(BaseAction):
         f"datastore vector output {getter!r} is not collected; add it to the "
         f"action term's `datastore_vectors_outputs` "
         f"(have: {sorted(self._datastore_vector_outputs)})"
+      ) from None
+
+  def datastore_vectorx_output(self, getter: str) -> torch.Tensor:
+    """Latest ``(num_envs, size)`` value of one collected ``VectorXd`` datastore getter."""
+    try:
+      return self._datastore_vectorx_outputs[getter]
+    except KeyError:
+      raise KeyError(
+        f"datastore vectorx output {getter!r} is not collected; add it to the "
+        f"action term's `datastore_vectorx_outputs` "
+        f"(have: {sorted(self._datastore_vectorx_outputs)})"
       ) from None
 
   def datastore_scalar_input(self, setter: str) -> torch.Tensor:
@@ -387,6 +408,16 @@ class McRtcActionBase(BaseAction):
       dict.fromkeys(cfg.datastore_vectors_outputs)
     )
 
+    vectorx: dict[str, int] = {}
+    for name, size in cfg.datastore_vectorx_outputs:
+      if size <= 0 or vectorx.setdefault(name, int(size)) != int(size):
+        raise ValueError(
+          f"datastore vectorx output {name!r}: size {size} is not positive or "
+          f"conflicts with an earlier declaration ({vectorx.get(name)})"
+        )
+    self._bridge.layout.output.datastore_vectorx = list(vectorx)
+    self._bridge.layout.output.datastore_vectorx_dims = list(vectorx.values())
+
     # Declared before the command pairs, which append their setters after these.
     self._bridge.layout.input.datastore_scalar = list(
       dict.fromkeys(cfg.datastore_scalar_inputs)
@@ -471,6 +502,9 @@ class McRtcActionBase(BaseAction):
     self._datastore_scalar_output_columns = output_columns(
       self._bridge.layout, cfg.datastore_scalar_outputs, "scalar"
     )
+    self._datastore_vectorx_output_columns = vectorx_output_columns(
+      self._bridge.layout, (name for name, _ in cfg.datastore_vectorx_outputs)
+    )
 
     # Whole-controller vectors: latched as collected, no ramp (see the cfg).
     self._datastore_vector_outputs = {
@@ -480,6 +514,10 @@ class McRtcActionBase(BaseAction):
     self._datastore_scalar_outputs = {
       getter: torch.zeros(self.num_envs, device=self.device)
       for getter in self._datastore_scalar_output_columns
+    }
+    self._datastore_vectorx_outputs = {
+      getter: torch.zeros(self.num_envs, size, device=self.device)
+      for getter, (_, size) in self._datastore_vectorx_output_columns.items()
     }
     # Read by a term feeding a setter relative to its getter: a reset zeroes the
     # readouts, so the value only means something once this says so.
@@ -552,6 +590,12 @@ class McRtcActionBase(BaseAction):
       mask = ok.unsqueeze(-1) if kind == "vector3" else ok
       for name, value in read_outputs(block, columns, kind).items():
         destination[name].copy_(torch.where(mask, value, destination[name]))
+
+    for name, value in read_vectorx_outputs(
+      block, self._datastore_vectorx_output_columns
+    ).items():
+      destination = self._datastore_vectorx_outputs[name]
+      destination.copy_(torch.where(ok.unsqueeze(-1), value, destination))
 
   def _datastore_input_index(
     self, columns: dict[str, int], setter: str, kind: str

@@ -22,6 +22,7 @@ from mc_mjlab.actions.residual_mpc_joint_torque_action import (
   ResidualMpcJointTorqueAction,
   ResidualMpcJointTorqueActionCfg,
 )
+from mc_mjlab.actions.mc_rtc_action_base import McRtcActionBase
 from mc_mjlab.actions.walking_reference_action import (
   WALKING_REF_VEL_SETTER,
 )
@@ -141,6 +142,64 @@ def test_layout() -> None:
   verify_layout()
 
 
+class _VectorxProbe(McRtcActionBase):
+  """The base alone: only the datastore readout plumbing is exercised."""
+
+  output_channels = ("q",)
+
+  def _seed_interpolation(self, env_ids: torch.Tensor) -> None:
+    pass
+
+  def _apply_control(self, interpolated_control: dict[str, torch.Tensor]) -> None:
+    pass
+
+
+def test_vectorx_outputs() -> None:
+  """VectorXd getters get contiguous columns after the vector3 block and latch like the others."""
+  layout = native.IoLayout()
+  layout.set_joint_order(["a", "b"])
+  layout.output.datastore_scalar = ["s"]
+  layout.output.datastore_vector3 = ["v"]
+  layout.output.datastore_vectorx = ["x", "y"]
+  layout.output.datastore_vectorx_dims = [4, 2]
+
+  out = layout.output
+  assert out.datastore_scalar_offset() == 6
+  assert out.datastore_vectorx_offset() == 10  # 6 + 1 scalar + 3 for the vector3
+  assert out.datastore_vectorx_size() == 6
+  assert out.status_offset() == 16
+  assert out.size() == 17
+
+  cfg = NS(
+    datastore_scalar_outputs=("s",),
+    datastore_vectors_outputs=("v",),
+    datastore_vectorx_outputs=(("y", 2), ("x", 4)),
+  )
+  action = object.__new__(_VectorxProbe)
+  action._env = NS(num_envs=2, device="cpu")  # ty: ignore[invalid-assignment]
+  action._bridge = NS(layout=layout)  # ty: ignore[invalid-assignment]
+  action._setup_datastore_outputs(cfg)  # ty: ignore[invalid-argument-type]
+  assert action._datastore_vectorx_output_columns == {"y": (14, 2), "x": (10, 4)}
+
+  block = torch.arange(2.0 * out.size(), dtype=torch.float64).reshape(2, -1)
+  action._latch_datastore_outputs(block, torch.tensor([True, False]))
+  torch.testing.assert_close(
+    action.datastore_vectorx_output("x")[0], torch.tensor([10.0, 11.0, 12.0, 13.0])
+  )
+  torch.testing.assert_close(action.datastore_vectorx_output("y")[0], torch.tensor([14.0, 15.0]))
+  # a row without fresh output keeps what it had
+  assert not action.datastore_vectorx_output("x")[1].any()
+
+  action.datastore_vectorx_output("x")[:] = 7.0
+  assert action._datastore_vectorx_outputs["x"].shape == (2, 4)
+  try:
+    action.datastore_vectorx_output("missing")
+  except KeyError as error:
+    assert "datastore_vectorx_outputs" in str(error), error
+  else:
+    raise AssertionError("an unconfigured getter must not resolve")
+
+
 def test_walking_reference_feed() -> None:
   """Absolute reference values feed directly without a getter baseline."""
   action = object.__new__(ResidualMpcJointTorqueAction)
@@ -230,6 +289,7 @@ def test_pipeline() -> None:
   action.cfg = NS(  # ty: ignore[invalid-assignment]
     frameskip=2,
     datastore_vectors_outputs=(),
+    datastore_vectorx_outputs=(),
     datastore_scalar_outputs=(),
     datastore_vectors_inputs=(),
     datastore_scalar_inputs=(),

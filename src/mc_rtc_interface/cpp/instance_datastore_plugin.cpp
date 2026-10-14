@@ -103,7 +103,8 @@ namespace instance_datastore_plugin
              {&layout.input.datastore_scalar,
               &layout.input.datastore_vector3,
               &layout.output.datastore_scalar,
-              &layout.output.datastore_vector3})
+              &layout.output.datastore_vector3,
+              &layout.output.datastore_vectorx})
         {
             names.insert(list->begin(), list->end());
         }

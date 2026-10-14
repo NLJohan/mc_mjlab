@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,7 @@
  *  nj      tau
  *  nds     datastore scalars
  *  3 * ndv datastore vectors
+ *  sum(dims) datastore dynamic vectors (VectorXd getters, dims[i] values each, in declaration order)
  *  1       status
  * */
 
@@ -103,6 +105,10 @@ struct OutputLayout
 
         std::vector<std::string> datastore_scalar;
         std::vector<std::string> datastore_vector3;
+        // Eigen::VectorXd getters; datastore_vectorx_dims[i] is the exact size of datastore_vectorx[i] (checked at
+        // controller initialization). Both lists must have the same length.
+        std::vector<std::string> datastore_vectorx;
+        std::vector<std::size_t> datastore_vectorx_dims;
 
         enum ControllerStatus
         {
@@ -136,9 +142,19 @@ struct OutputLayout
             return datastore_scalar_offset() + datastore_scalar.size();
         }
 
-        std::size_t status_offset() const
+        std::size_t datastore_vectorx_offset() const
         {
             return datastore_vector3_offset() + 3 * datastore_vector3.size();
+        }
+
+        std::size_t datastore_vectorx_size() const
+        {
+            return std::accumulate(datastore_vectorx_dims.begin(), datastore_vectorx_dims.end(), std::size_t{0});
+        }
+
+        std::size_t status_offset() const
+        {
+            return datastore_vectorx_offset() + datastore_vectorx_size();
         }
 
         std::size_t size() const

@@ -14,6 +14,9 @@ void ControllerInstance::initialize(IoInput input, IoOutput output)
 {
     if (m_initialized) throw std::logic_error("controller is already initialized");
 
+    if (m_layout.output.datastore_vectorx.size() != m_layout.output.datastore_vectorx_dims.size())
+        throw std::invalid_argument("datastore_vectorx and datastore_vectorx_dims must have the same length");
+
     m_q.assign(m_layout.input.joint_order.size(), 0.0);
     m_qd.assign(m_q.size(), 0.0);
     m_tau.assign(m_q.size(), 0.0);
@@ -116,6 +119,7 @@ void ControllerInstance::finish_reset(IoInput input, const sva::PTransformd &pos
     utils::datastore::validate<Eigen::Vector3d>(controller.datastore(), m_layout.input.datastore_vector3, true);
     utils::datastore::validate<double>(controller.datastore(), m_layout.output.datastore_scalar, false);
     utils::datastore::validate<Eigen::Vector3d>(controller.datastore(), m_layout.output.datastore_vector3, false);
+    utils::datastore::validate<Eigen::VectorXd>(controller.datastore(), m_layout.output.datastore_vectorx, false);
 
     m_controller->running = true;
 }
@@ -222,6 +226,20 @@ void ControllerInstance::apply_output(IoOutput output)
     {
         Eigen::Map<Eigen::Vector3d> target(output.data() + m_layout.output.datastore_vector3_offset() + 3 * i);
         target = utils::datastore::read<Eigen::Vector3d>(datastore, m_layout.output.datastore_vector3[i]);
+    }
+
+    auto vectorx_offset = m_layout.output.datastore_vectorx_offset();
+    for (std::size_t i = 0; i < m_layout.output.datastore_vectorx.size(); ++i)
+    {
+        const auto &name  = m_layout.output.datastore_vectorx[i];
+        const auto  dim   = m_layout.output.datastore_vectorx_dims[i];
+        const auto  value = utils::datastore::read<Eigen::VectorXd>(datastore, name);
+        if (static_cast<std::size_t>(value.size()) != dim)
+            throw std::runtime_error(
+                "datastore getter " + name + " returned " + std::to_string(value.size()) +
+                " values, but the layout declares " + std::to_string(dim));
+        Eigen::Map<Eigen::VectorXd>(output.data() + vectorx_offset, dim) = value;
+        vectorx_offset += dim;
     }
 }
 
