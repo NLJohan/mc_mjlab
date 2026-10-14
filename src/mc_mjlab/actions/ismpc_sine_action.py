@@ -80,7 +80,7 @@ GET_COM_LIN_VEL = "ismpc_walking::get_com_lin_vel"
 # controller's last run(), and the cutoff period (s) of that filter, which the exporter records in the contract.
 GET_FILT_PERTURBATION = "ismpc_walking::get_filt_perturbation"
 GET_FILT_ZMP_ERROR = "ismpc_walking::get_filt_zmp_error"
-GET_FILT_DCM_BIAS = "ismpc_walking::get_filt_dcm_bias"
+GET_FILT_DCM_MEAS_PRED_ERROR = "ismpc_walking::get_filt_dcm_meas_pred_error"
 GET_OBS_FILTER_CUTOFF_T = "ismpc_walking::get_obs_filter_cutoff_T"
 # Phase of the RlSine CoM-height reference being played (sin/cos of the controller's integrated phase, see
 # MoveCoM's m_rl_phase_applied_) and the controller-estimated CoM height above the support foot (m, raw, ~0.93).
@@ -208,7 +208,7 @@ class IsmpcSineAction(McRtcActionBase):
     cfg.datastore_scalar_outputs = tuple(
       dict.fromkeys(
         (*cfg.datastore_scalar_outputs, GET_WANTS_STOP, GET_ROBOT_WALKING,
-         GET_FILT_PERTURBATION, GET_FILT_ZMP_ERROR, GET_FILT_DCM_BIAS, GET_OBS_FILTER_CUTOFF_T,
+         GET_FILT_PERTURBATION, GET_FILT_ZMP_ERROR, GET_FILT_DCM_MEAS_PRED_ERROR, GET_OBS_FILTER_CUTOFF_T,
          GET_RL_PHASE_SIN, GET_RL_PHASE_COS, GET_COM_HEIGHT_EST)
       )
     )
@@ -517,9 +517,9 @@ class IsmpcSineAction(McRtcActionBase):
     return self.datastore_scalar_output(GET_FILT_ZMP_ERROR).unsqueeze(-1)
 
   @property
-  def filt_dcm_bias_obs(self) -> torch.Tensor:
+  def filt_dcm_meas_pred_error_obs(self) -> torch.Tensor:
     """Low-passed |DCM bias| (m), (num_envs, 1). See filt_perturbation_obs."""
-    return self.datastore_scalar_output(GET_FILT_DCM_BIAS).unsqueeze(-1)
+    return self.datastore_scalar_output(GET_FILT_DCM_MEAS_PRED_ERROR).unsqueeze(-1)
 
   @property
   def is_walking_obs(self) -> torch.Tensor:

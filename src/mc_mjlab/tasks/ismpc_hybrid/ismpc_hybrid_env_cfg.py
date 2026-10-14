@@ -29,7 +29,7 @@ from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 400
+NUM_ENVS = 20
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 40.0
@@ -214,8 +214,8 @@ def _make_env_cfg(
     "filt_zmp_error": ObservationTermCfg(
       func=ismpc_mdp.filt_zmp_error, params={"action_name": "ismpc_sine"}
     ),
-    "filt_dcm_bias": ObservationTermCfg(
-      func=ismpc_mdp.filt_dcm_bias, params={"action_name": "ismpc_sine"}
+    "filt_dcm_meas_pred_error": ObservationTermCfg(
+      func=ismpc_mdp.filt_dcm_meas_pred_error, params={"action_name": "ismpc_sine"}
     ),
     "target_twist": ObservationTermCfg(
       func=ismpc_mdp.target_twist, params={"command_name": "twist"}

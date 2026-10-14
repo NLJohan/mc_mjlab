@@ -480,11 +480,11 @@ def filt_zmp_error(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   return action_term.filt_zmp_error_obs
 
 
-def filt_dcm_bias(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+def filt_dcm_meas_pred_error(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   """|DCM bias| (m), low-passed inside the controller, (num_envs, 1).
-  Datastore getter ismpc_walking::get_filt_dcm_bias. See filt_perturbation."""
+  Datastore getter ismpc_walking::get_filt_dcm_meas_pred_error. See filt_perturbation."""
   action_term = env.action_manager.get_term(action_name)
-  return action_term.filt_dcm_bias_obs
+  return action_term.filt_dcm_meas_pred_error_obs
 
 
 def controller_failed(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:

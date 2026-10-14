@@ -58,7 +58,7 @@ OBS_BINDINGS: dict[str, tuple[str, str, int | None]] = {
   "ismpc_wants_stop": ("wants_stop_d", "double", 1),
   "filt_perturbation": ("get_filt_perturbation", "double", 1),
   "filt_zmp_error": ("get_filt_zmp_error", "double", 1),
-  "filt_dcm_bias": ("get_filt_dcm_bias", "double", 1),
+  "filt_dcm_meas_pred_error": ("get_filt_dcm_meas_pred_error", "double", 1),
   "target_twist": ("get_user_ref_vel", "vec3", 3),
 }
 JOINT_NAMES_KEY = "get_joint_names"
