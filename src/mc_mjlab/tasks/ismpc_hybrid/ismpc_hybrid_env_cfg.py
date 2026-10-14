@@ -29,7 +29,7 @@ from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 400
+NUM_ENVS = 700
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 40.0
@@ -40,22 +40,22 @@ EPISODE_LENGTH_S = 40.0
 TUTOR_DEADZONE = (0.04, 0.1, 0.1)
 # # Fraction of envs whose sampled twist command is forced to zero (mjlab UniformVelocityCommandCfg.rel_standing_envs).
 # # Gives the policy episodes where standing still is the right answer, so the stop decision can be learned.
-STANDING_ENVS_FRAC = 0.1
+STANDING_ENVS_FRAC = 0.25
 
 
 FRAMESKIP = 5  # physics substeps per controller dispatch: 5 ms -> 200 Hz
 # Physics substeps per ENV step = per policy inference = per PPO sample: 50 ms -> 20 Hz,
 # the same rate as the sine/walk/Ts/twist latch (IsmpcSineActionCfg.sine_param_frequency_hz).
 # Must be a multiple of FRAMESKIP; the controller is dispatched DECIMATION / FRAMESKIP times per env step.
-DECIMATION = 5
+DECIMATION = 50
 # rsl_rl env steps per iteration (= policy decisions per env per iteration, 32 * 50 ms = 1.6 s).
-NUM_STEPS_PER_ENV = 256
-# NUM_STEPS_PER_ENV = 32 # decimation 50
+# NUM_STEPS_PER_ENV = 256
+NUM_STEPS_PER_ENV = 48 # decimation 50
 
 # --- Push disturbances (mjlab.envs.mdp.events.apply_body_impulse). ---
 PUSH_SETTLE_TICKS = 25  # env steps (50 ms each)
 PUSH_FORCE_TORSO_N = (50.0, 130.0)
-PUSH_FORCE_HAND_N = (100.0, 175.0)
+PUSH_FORCE_HAND_N = (130.0, 200.0)
 PUSH_DURATION_S = (0.1, 0.4)
 PUSH_COOLDOWN_TORSO_S = (2.0, 50.0)
 PUSH_COOLDOWN_HAND_S = (2.0, 50.0)
@@ -241,12 +241,12 @@ def _make_env_cfg(
       weight=3.0),
     "not_walking_penalty": RewardTermCfg(
       func=ismpc_mdp.not_walking_penalty, 
-      weight=-0.5, # Now tutor velocity rewards are gated on walking status.
+      weight=-2.0, # Now tutor velocity rewards are gated on walking status.
       params={"action_name": "ismpc_sine", "command_name": "twist", "deadzone": TUTOR_DEADZONE},
     ),
     "joint_torque": RewardTermCfg(
       func=ismpc_mdp.joint_torque_reward, 
-      weight=2.0,
+      weight=1.0,
       params={"sigma": 300},
     ),
     "target_vel_x": RewardTermCfg(
@@ -619,8 +619,8 @@ def ismpc_hybrid_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
   return RslRlOnPolicyRunnerCfg(
     actor=RslRlModelCfg(
-      hidden_dims=(512, 256, 128),
-      # hidden_dims=(1024, 512, 256),
+      # hidden_dims=(512, 256, 128),
+      hidden_dims=(1024, 512, 256),
       activation="elu",
       obs_normalization=True,
       distribution_cfg={
@@ -644,10 +644,10 @@ def ismpc_hybrid_ppo_cfg(max_iterations: int = 500) -> RslRlOnPolicyRunnerCfg:
       num_mini_batches=4,
       learning_rate=1.0e-3,
       schedule="adaptive",
-      gamma=0.99,  
-      # gamma=0.999, # decimation 50  
-      lam=0.95,
-      # lam=0.995,  # decimation 50
+      # gamma=0.998,  
+      gamma=0.975, # decimation 50  
+      # lam=0.9995,
+      lam=0.995,  # decimation 50
       desired_kl=0.01,
       max_grad_norm=1.0,
     ),
