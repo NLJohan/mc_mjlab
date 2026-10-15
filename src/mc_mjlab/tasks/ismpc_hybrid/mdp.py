@@ -854,7 +854,14 @@ def debug_est_com_vel_y(env: ManagerBasedRlEnv, action_name: str) -> torch.Tenso
 
 class _DiskBodyImpulse(apply_body_impulse):
   """apply_body_impulse with horizontal forces uniform over a DISK or ANNULUS, Poisson arrivals
-  (rate_hz per body, memoryless) and a two-exponential force profile.
+  (memoryless) and a two-exponential force profile.
+
+  Arrival rate (domain randomization): ``rate_hz`` is either a float (same rate for every env) or
+  a pair (lo, hi) in Hz (lo > 0): each env then gets its own rate, log-uniform on [lo, hi], redrawn
+  at every episode (env reset). The underlying uniform draw u in [0, 1) lives on the env
+  (``env._push_rate_u``) and is SHARED by all push terms: the first term built owns it and is the
+  only one redrawing it on reset, the others read it live. Terms given the same (lo, hi) therefore
+  have the same rate in a given env and episode: a "safe" episode is safe for the torso and both hands.
 
   Force profile of one push (t = time since the push started, F0 = sampled magnitude):
     * ramp-up, 0 <= t < T:   f(t) = F0 * (1 - exp(-t / tau_up))
@@ -889,9 +896,14 @@ class _DiskBodyImpulse(apply_body_impulse):
       raise ValueError("_DiskBodyImpulse ignores body_point_offset; remove it")
     if any(abs(float(t)) > 0.0 for t in p.get("torque_range", (0.0, 0.0))):
       raise ValueError("_DiskBodyImpulse ignores torque_range; it must be (0, 0)")
-    self._rate_hz = float(p["rate_hz"])
-    if self._rate_hz < 0.0:
-      raise ValueError("rate_hz must be >= 0")
+    rate = p["rate_hz"]
+    self._rate_lo, self._rate_hi = (
+      (float(rate), float(rate)) if isinstance(rate, (int, float)) else (float(x) for x in rate)
+    )
+    if not 0.0 <= self._rate_lo <= self._rate_hi:
+      raise ValueError("rate_hz must be a float >= 0 or a pair with 0 <= lo <= hi")
+    if self._rate_lo < self._rate_hi and self._rate_lo <= 0.0:
+      raise ValueError("rate_hz range needs lo > 0 (log-uniform); use a float for rate 0")
     self._delay_lo, self._delay_hi = (float(x) for x in p["delay_s"])
     if not 0.0 < self._delay_lo <= self._delay_hi:
       raise ValueError("delay_s must satisfy 0 < lo <= hi")
@@ -908,6 +920,11 @@ class _DiskBodyImpulse(apply_body_impulse):
       raise ValueError("_DiskBodyImpulse supports exactly one body per event term")
     n, dev = self._num_envs, self._device
     self._suppress = torch.zeros(n, dtype=torch.bool, device=dev)  # set by the settle gate
+    # Shared per-env uniform draw behind the Poisson rate; the first term built owns (redraws) it.
+    self._rate_host = env
+    self._owns_rate_u = getattr(env, "_push_rate_u", None) is None
+    if self._owns_rate_u:
+      env._push_rate_u = torch.rand(n, device=dev)
     # Per-push marks and clock (meaningful only where self._active).
     self._mag = torch.zeros(n, device=dev)  # F0, N
     self._dir = torch.zeros(n, 2, device=dev)  # unit vector in the horizontal plane
@@ -916,6 +933,16 @@ class _DiskBodyImpulse(apply_body_impulse):
     self._delay = torch.ones(n, device=dev)  # T, s
     self._t_end = torch.zeros(n, device=dev)  # s since push start
     self._t = torch.zeros(n, device=dev)  # s since push start, at the start of the next step
+
+  @property
+  def _rate_env(self) -> torch.Tensor:
+    """(N,) Poisson rate (Hz) of each env right now: u mapped log-uniformly on [rate_lo, rate_hi]
+    (constant if lo == hi). Read live so every push term sees the owner's latest redraw."""
+    u = self._rate_host._push_rate_u
+    if self._rate_lo == self._rate_hi:
+      return torch.full_like(u, self._rate_lo)
+    log_lo, log_hi = math.log(self._rate_lo), math.log(self._rate_hi)
+    return torch.exp(log_lo + u * (log_hi - log_lo))
 
   def _sample_cooldown(self, n: int) -> torch.Tensor:
     # Only here because the base __init__ calls it; unused (we override __call__).
@@ -936,7 +963,7 @@ class _DiskBodyImpulse(apply_body_impulse):
     self._r_min, self._r_max = self._mag_bounds(force_range)
 
     # 1. New pushes: draw marks, start the clock. They are written in step 2 on this same tick.
-    p_arrive = -math.expm1(-self._rate_hz * dt)
+    p_arrive = -torch.expm1(-self._rate_env * dt)  # (N,)
     arrive = (
       (torch.rand(self._num_envs, device=dev) < p_arrive)
       & ~self._active
@@ -985,17 +1012,20 @@ class _DiskBodyImpulse(apply_body_impulse):
     self._time_remaining[env_ids] = 0.0
     self._mag[env_ids] = 0.0
     self._t[env_ids] = 0.0
+    if self._owns_rate_u:  # new episode, new rate (one redraw, shared by the three push terms)
+      u = self._rate_host._push_rate_u
+      u[env_ids] = torch.rand(u[env_ids].shape[0], device=self._device)
 
   def push_state(self, force_scale: float, window_s: float) -> torch.Tensor:
     """(N, 1) expected impulse (N*s) of pushes, divided by force_scale.
 
-    * New push: P(arrival in window_s) * E[F0] * unit impulse, memoryless as before. The unit
+    * New push: P(arrival in window_s | this env's rate) * E[F0] * unit impulse, memoryless. The unit
       impulse of one push (F0 = 1) is  T - tau_up (1 - rho) (1 - exp(-T / tau_up)), evaluated at
       the MEAN T and MEAN tau_up (not averaged over their laws).
     * Active push: its whole remaining impulse (closed form, exact for the sampled marks). The
       window is NOT applied to it (a push is over in <= ~1.4 s with the default marks).
     """
-    p = -math.expm1(-self._rate_hz * window_s)
+    p = -torch.expm1(-self._rate_env * window_s)  # (N,), per-env
     r_lo, r_hi = self._r_min, self._r_max
     # Mean of a magnitude uniform by area on [r_lo, r_hi]; (2/3) R for the full disk (r_lo = 0).
     e_mag = (
@@ -1004,7 +1034,7 @@ class _DiskBodyImpulse(apply_body_impulse):
     e_T = 0.5 * (self._delay_lo + self._delay_hi)
     tau = self._tau_mean
     e_unit = e_T - tau * (1.0 - self._rho) * (-math.expm1(-e_T / tau))
-    impulse = torch.full((self._num_envs,), p * e_mag * e_unit, device=self._device)
+    impulse = p * (e_mag * e_unit)
 
     t, T, tau_u, tau_d, f0 = self._t, self._delay, self._tau_up, self._tau_dn, self._mag
     t_up = torch.minimum(t, T)  # time spent in the ramp so far
@@ -1039,6 +1069,25 @@ def push_state(
     return zeros
   fn = getattr(term, "push_state", None)
   return zeros if fn is None else fn(force_scale, window_s)
+
+
+def push_rate(
+  env: ManagerBasedRlEnv,
+  event_name: str,
+) -> torch.Tensor:
+  """CRITIC-ONLY privileged observation (1 value): the Poisson push rate (Hz) of the current
+  episode of each env. All push events share the same per-episode rate, so any
+  one of them can be named. Zeros if the event isn't registered yet."""
+  zeros = torch.zeros(env.num_envs, 1, device=env.device)
+  em = getattr(env, "event_manager", None)
+  if em is None:
+    return zeros
+  try:
+    term = em.get_term_cfg(event_name).func
+  except ValueError:
+    return zeros
+  fn = getattr(term, "push_rate", None)
+  return zeros if fn is None else fn().unsqueeze(-1)
 
 
 class settle_gated_apply_body_impulse:
@@ -1110,6 +1159,10 @@ class settle_gated_apply_body_impulse:
 
   def push_state(self, force_scale: float, window_s: float) -> torch.Tensor:
     return self._inner.push_state(force_scale, window_s)
+
+  def push_rate(self) -> torch.Tensor:
+    """(N,) current Poisson rate (Hz) of each env."""
+    return self._inner._rate_env
 
   def debug_vis(self, visualizer) -> None:
     if hasattr(self._inner, "debug_vis"):

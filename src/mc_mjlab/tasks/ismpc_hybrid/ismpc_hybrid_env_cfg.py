@@ -64,10 +64,12 @@ PUSH_FORCE_HAND_N = (130.0, 200.0)
 PUSH_TAU_UP_MEAN_S = 0.15
 PUSH_TAU_UP_STD_S = 0.02
 PUSH_RELEASE_RATIO = 0.5
-PUSH_DELAY_S = (0.3, 0.5)
+PUSH_DELAY_S = (0.2, 0.7)
 # Poisson push arrivals: mean rate (Hz) per push point, memoryless (replaces the cooldown law below).
-HAND_POISSON_RATE = 0.06
-TORSO_POISSON_RATE = 0.06
+# ONE rate per env and per episode (redrawn at every reset, log-uniform on this interval, Hz), shared by
+# the torso and both hand events: low end = "safe" episode, high end = "excited" one. PLACEHOLDER
+# (geometric mean ~0.055 Hz). A float instead of a pair gives the old behaviour (same rate everywhere).
+PUSH_POISSON_RATE_RANGE = (0.03, 0.3)
 # Critic-only push_state observation: 1 value per push event = expected impulse (N*s) in the next
 # PUSH_STATE_WINDOW_S seconds, P(push in window | time since last push) * E[magnitude] * E[duration],
 # divided by PUSH_STATE_FORCE_SCALE_N (N*s per 1 s); E[duration] is now the unit impulse of the two-exponential profile. Rule of thumb for the window: the value horizon,
@@ -93,7 +95,7 @@ CURRICULUM_STAGES = [
   {"step": 100 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.8},
   {"step": 300 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
   {"step": 750 * NUM_STEPS_PER_ENV, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
-  {"step": 1500 * NUM_STEPS_PER_ENV, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 2.0},
+  {"step": 1500 * NUM_STEPS_PER_ENV, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
 ]
 PLAY_CURRICULUM_STAGE = 4
 
@@ -210,7 +212,7 @@ def _make_env_cfg(
     ),
   }
 
-  # Critic = actor obs + privileged push state (1 expected-impulse value per push event, 3 total).
+  # Critic = actor obs + privileged Poisson push rate of the current episode (1 value, shared by all push events).
   critic_terms = dict(actor_terms)
   # Privileged: the critic keeps MuJoCo's true joint state (same names and order, so its input layout is unchanged).
   critic_terms["joint_pos"] = ObservationTermCfg(
@@ -219,15 +221,10 @@ def _make_env_cfg(
   critic_terms["joint_vel"] = ObservationTermCfg(
     func=envs_mdp.joint_vel_rel, params={"asset_cfg": ismpc_mdp.observed_joint_cfg()}
   )
-  for _name in ("push_torso", "push_right_hand", "push_left_hand"):
-    critic_terms[f"{_name}_state"] = ObservationTermCfg(
-      func=ismpc_mdp.push_state,
-      params={
-        "event_name": _name,
-        "force_scale": PUSH_STATE_FORCE_SCALE_N,
-        "window_s": PUSH_STATE_WINDOW_S,
-      },
-    )
+  critic_terms["push_rate"] = ObservationTermCfg(
+    func=ismpc_mdp.push_rate,
+    params={"event_name": "push_torso"},
+  )
 
   observations = {
     "actor": ObservationGroupCfg(terms=dict(actor_terms), concatenate_terms=True),
@@ -281,12 +278,12 @@ def _make_env_cfg(
     "sine_position_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_position_continuity,
       weight=1.0,
-      params={"action_name": "ismpc_sine", "sigma" : 0.02},
+      params={"action_name": "ismpc_sine", "sigma" : 0.003},
     ),
     "sine_velocity_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_velocity_continuity,
-      weight=0.0,
-      params={"action_name": "ismpc_sine"},
+      weight=0.5,
+      params={"action_name": "ismpc_sine", "sigma" : 0.03},
     ),
     # --- Plotting-only, weight=0.0
     "debug_target_height": RewardTermCfg(
@@ -403,7 +400,7 @@ def _make_env_cfg(
         "tau_up_std_s": PUSH_TAU_UP_STD_S,
         "release_ratio": PUSH_RELEASE_RATIO,
         "cooldown_s": (1.0, 1.0), # placeholder
-        "rate_hz": TORSO_POISSON_RATE,
+        "rate_hz": PUSH_POISSON_RATE_RANGE,
         "settle_ticks": PUSH_SETTLE_TICKS,
       },
     ),
@@ -419,7 +416,7 @@ def _make_env_cfg(
         "tau_up_std_s": PUSH_TAU_UP_STD_S,
         "release_ratio": PUSH_RELEASE_RATIO,
         "cooldown_s": (1.0, 1.0), #placeholder
-        "rate_hz": HAND_POISSON_RATE,
+        "rate_hz": PUSH_POISSON_RATE_RANGE,
         "settle_ticks": PUSH_SETTLE_TICKS,
       },
     ),
@@ -435,7 +432,7 @@ def _make_env_cfg(
         "tau_up_std_s": PUSH_TAU_UP_STD_S,
         "release_ratio": PUSH_RELEASE_RATIO,
         "cooldown_s": (1.0, 1.0), # placeholder
-        "rate_hz": HAND_POISSON_RATE,
+        "rate_hz": PUSH_POISSON_RATE_RANGE,
         "settle_ticks": PUSH_SETTLE_TICKS,
       },
     ),
