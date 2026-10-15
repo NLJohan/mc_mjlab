@@ -82,15 +82,25 @@ GET_FILT_PERTURBATION = "ismpc_walking::get_filt_perturbation"
 GET_FILT_ZMP_ERROR = "ismpc_walking::get_filt_zmp_error"
 GET_FILT_DCM_MEAS_PRED_ERROR = "ismpc_walking::get_filt_dcm_meas_pred_error"
 GET_OBS_FILTER_CUTOFF_T = "ismpc_walking::get_obs_filter_cutoff_T"
-# Phase of the RlSine CoM-height reference being played (sin/cos of the controller's integrated phase, see
-# MoveCoM's m_rl_phase_applied_) and the controller-estimated CoM height above the support foot (m, raw, ~0.93).
-GET_RL_PHASE_SIN = "ismpc_walking::get_rl_phase_sin"
-GET_RL_PHASE_COS = "ismpc_walking::get_rl_phase_cos"
+# Controller-estimated CoM height above the support foot (m, raw, ~0.93).
 GET_COM_HEIGHT_EST = "ismpc_walking::get_com_height_est"
+# What the controller currently holds of the policy's own commands, and the phase of the RlSine CoM-height reference
+# it is playing (MoveCoM's m_rl_phase_applied_). These are the keys the deployed policy reads for last_sine_params,
+# rl_phase_sincos, last_walk_action, last_step_timing_action and last_twist_action.
+GET_COM_HEIGHT_SINE_PARAMS = "ismpc_walking::get_com_height_sine_params"  # VectorXd 4: offset, frequency, sin_amp, cos_amp (after the radius cap)
+GET_RL_PHASE_SINCOS = "ismpc_walking::get_rl_phase_sincos"  # VectorXd 2: sin, cos
+GET_POLICY_WANTS_WALK = "ismpc_walking::get_policy_wants_walk"  # double, 1.0 = walk
+GET_TS_TARGET = "ismpc_walking::get_ts_target"  # double, s
+GET_RL_REF_VEL = "ismpc_walking::get_rl_ref_vel"  # Vector3d, (vx, vy, omega)
 # Joint encoder positions / velocities of the controller's realRobot(), one value per reference joint in the robot's
 # reference joint order (VectorXd). These are the keys the deployed policy reads for joint_pos / joint_vel.
 GET_JOINT_POS = "ismpc_walking::get_joint_pos"
 GET_JOINT_VEL = "ismpc_walking::get_joint_vel"
+# Base angular velocity (rad/s) and gravity direction (unit vector, down = (0, 0, -1) when upright), both in the base
+# frame (Vector3d): the controller's own state estimate (E * realRobot().velW().angular(), E * (0, 0, -1)).
+# These are the keys the deployed policy reads for base_ang_vel / projected_gravity.
+GET_BASE_ANG_VEL = "ismpc_walking::get_base_ang_vel"
+GET_PROJECTED_GRAVITY = "ismpc_walking::get_projected_gravity"
 
 
 @dataclass(kw_only=True)
@@ -209,7 +219,7 @@ class IsmpcSineAction(McRtcActionBase):
       dict.fromkeys(
         (*cfg.datastore_scalar_outputs, GET_WANTS_STOP, GET_ROBOT_WALKING,
          GET_FILT_PERTURBATION, GET_FILT_ZMP_ERROR, GET_FILT_DCM_MEAS_PRED_ERROR, GET_OBS_FILTER_CUTOFF_T,
-         GET_RL_PHASE_SIN, GET_RL_PHASE_COS, GET_COM_HEIGHT_EST)
+         GET_COM_HEIGHT_EST, GET_POLICY_WANTS_WALK, GET_TS_TARGET)
       )
     )
     # Vector3d counterparts of the above, same declare-before-super() pattern
@@ -219,14 +229,18 @@ class IsmpcSineAction(McRtcActionBase):
       dict.fromkeys((*cfg.datastore_vectors_inputs, SET_RL_REF_VEL))
     )
     cfg.datastore_vectors_outputs = tuple(
-      dict.fromkeys((*cfg.datastore_vectors_outputs, GET_COM_LIN_VEL))
+      dict.fromkeys(
+        (*cfg.datastore_vectors_outputs, GET_COM_LIN_VEL, GET_BASE_ANG_VEL, GET_PROJECTED_GRAVITY,
+         GET_RL_REF_VEL)
+      )
     )
     # VectorXd getters: (name, size) pairs. The size is the number of reference joints; the native layer checks it
     # against the controller's getter when it initializes.
     n_ref_joints = len(robots.get_ref_joint_order(cfg.mc_rtc_robot_name))
     cfg.datastore_vectorx_outputs = tuple(
       dict.fromkeys(
-        (*cfg.datastore_vectorx_outputs, (GET_JOINT_POS, n_ref_joints), (GET_JOINT_VEL, n_ref_joints))
+        (*cfg.datastore_vectorx_outputs, (GET_JOINT_POS, n_ref_joints), (GET_JOINT_VEL, n_ref_joints),
+         (GET_COM_HEIGHT_SINE_PARAMS, 4), (GET_RL_PHASE_SINCOS, 2))
       )
     )
 
@@ -440,11 +454,23 @@ class IsmpcSineAction(McRtcActionBase):
     return self.datastore_vector_output(GET_COM_LIN_VEL)
 
   @property
+  def base_ang_vel_est_obs(self) -> torch.Tensor:
+    """Controller-estimated base angular velocity (rad/s), (num_envs, 3), base frame
+    (ismpc_walking::get_base_ang_vel)."""
+    return self.datastore_vector_output(GET_BASE_ANG_VEL)
+
+  @property
+  def projected_gravity_est_obs(self) -> torch.Tensor:
+    """Controller-estimated gravity direction in the base frame, (num_envs, 3)
+    (ismpc_walking::get_projected_gravity)."""
+    return self.datastore_vector_output(GET_PROJECTED_GRAVITY)
+
+  @property
   def target_height_obs(self) -> torch.Tensor:
     """Live CoM-height reference (m), evaluated now, as a (num_envs, 1)
     tensor. Debugging/visualization only -- not the C++-side ground truth."""
-    sin_phase = self.datastore_scalar_output(GET_RL_PHASE_SIN)
-    cos_phase = self.datastore_scalar_output(GET_RL_PHASE_COS)
+    phase = self.datastore_vectorx_output(GET_RL_PHASE_SINCOS)
+    sin_phase, cos_phase = phase[:, 0], phase[:, 1]
     h = (
       self._physical_curr["offset"]
       + self._physical_curr["sin_amp"] * sin_phase
@@ -463,15 +489,34 @@ class IsmpcSineAction(McRtcActionBase):
   @property
   def rl_phase_sincos_obs(self) -> torch.Tensor:
     """(sin, cos) of the controller's integrated RlSine phase, (num_envs, 2). Phase of the reference the
-    controller is playing (ismpc_walking::get_rl_phase_sin/cos), collected by the generic datastore-output
+    controller is playing (ismpc_walking::get_rl_phase_sincos), collected by the generic datastore-output
     machinery."""
-    return torch.stack(
-      [
-        self.datastore_scalar_output(GET_RL_PHASE_SIN),
-        self.datastore_scalar_output(GET_RL_PHASE_COS),
-      ],
-      dim=-1,
-    )
+    return self.datastore_vectorx_output(GET_RL_PHASE_SINCOS)
+
+  @property
+  def sine_params_obs(self) -> torch.Tensor:
+    """(offset, frequency, sin_amp, cos_amp) the controller currently uses, (num_envs, 4)
+    (ismpc_walking::get_com_height_sine_params, after the controller's radius cap). The reward terms keep reading
+    the Python mirror `physical_params`."""
+    return self.datastore_vectorx_output(GET_COM_HEIGHT_SINE_PARAMS)
+
+  @property
+  def walk_command_obs(self) -> torch.Tensor:
+    """Walk/stop command the controller holds (1.0 = walk), (num_envs, 1) (ismpc_walking::get_policy_wants_walk).
+    The reward terms keep reading the Python mirror `last_walk_action`."""
+    return self.datastore_scalar_output(GET_POLICY_WANTS_WALK).unsqueeze(-1)
+
+  @property
+  def step_timing_obs(self) -> torch.Tensor:
+    """Step timing Ts (s) the controller holds, (num_envs, 1) (ismpc_walking::get_ts_target, after its own
+    ts_range clamp). The reward terms keep reading the Python mirror `last_step_timing_action`."""
+    return self.datastore_scalar_output(GET_TS_TARGET).unsqueeze(-1)
+
+  @property
+  def twist_command_obs(self) -> torch.Tensor:
+    """Reference twist (vx, vy, omega) the controller holds, (num_envs, 3) (ismpc_walking::get_rl_ref_vel). The
+    reward terms keep reading the Python mirror `last_twist_action`."""
+    return self.datastore_vector_output(GET_RL_REF_VEL)
 
   @property
   def com_height_est_obs(self) -> torch.Tensor:
@@ -621,10 +666,11 @@ class IsmpcSineAction(McRtcActionBase):
 
     # The base zeroes the collected datastore outputs of the reset rows, and they stay zero until the first fresh
     # collect. For the phase zero is off-distribution (sin = cos = 0 is not on the unit circle): seed what the
-    # controller itself holds right after its reset (phase 0). The measured CoM height is NOT seeded: there is no
-    # honest constant for it, so it reads 0 until the first collect (to be replaced by a real reset read).
-    self._datastore_scalar_outputs[GET_RL_PHASE_SIN][rows] = 0.0
-    self._datastore_scalar_outputs[GET_RL_PHASE_COS][rows] = 1.0
+    # controller itself holds right after its reset (phase 0). Every other collected value (CoM height, joints,
+    # base velocity, gravity, sine params, walk, Ts, twist) is NOT seeded and reads 0 until the first collect (to be
+    # replaced by a real reset read).
+    phase = self._datastore_vectorx_outputs[GET_RL_PHASE_SINCOS]
+    phase[rows] = torch.tensor([0.0, 1.0], device=phase.device, dtype=phase.dtype)
 
   def apply_actions(self) -> None:
     """Advance the control period on its first substep, then write
@@ -687,10 +733,8 @@ class IsmpcSineAction(McRtcActionBase):
         )
       self._period_t0 = torch.where(due_for_sine_update, now, self._period_t0)
       # Phase of the reference at the splice, from the latest collected controller phase.
-      phi_now = torch.atan2(
-        self.datastore_scalar_output(GET_RL_PHASE_SIN),
-        self.datastore_scalar_output(GET_RL_PHASE_COS),
-      )
+      phase = self.datastore_vectorx_output(GET_RL_PHASE_SINCOS)
+      phi_now = torch.atan2(phase[:, 0], phase[:, 1])
       self._period_phi = torch.where(due_for_sine_update, phi_now, self._period_phi)
 
       # Walk-gate and step-timing update on the SAME cadence as the sine

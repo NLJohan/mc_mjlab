@@ -106,8 +106,8 @@
         "dim": 1
       },
       {
-        "name": "filt_dcm_bias",
-        "key": "ismpc_walking::get_filt_dcm_bias",
+        "name": "filt_dcm_meas_pred_error",
+        "key": "ismpc_walking::get_filt_dcm_meas_pred_error",
         "type": "double",
         "dim": 1
       },

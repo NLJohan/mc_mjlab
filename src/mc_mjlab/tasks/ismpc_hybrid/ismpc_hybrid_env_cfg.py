@@ -91,7 +91,7 @@ TERRAIN_PATCH_SIZE_M = (8.0, 8.0)
 
 # Curriculum stages. "step" is env.common_step_counter, counted in ENV steps: iteration * NUM_STEPS_PER_ENV.
 CURRICULUM_STAGES = [
-  {"step": 0,          "lin_vel_x": (-0.5, 0.5), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.2, 0.2), "push_scale": 0.5},
+  {"step": 0,          "lin_vel_x": (-0.5, 0.5), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.2, 0.2), "push_scale": 0.2},
   {"step": 100 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.8},
   {"step": 300 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
   {"step": 750 * NUM_STEPS_PER_ENV, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
@@ -161,8 +161,14 @@ def _make_env_cfg(
     "com_lin_vel": ObservationTermCfg(
       func=ismpc_mdp.estimated_com_lin_vel, params={"action_name": "ismpc_sine"}
     ),
-    "base_ang_vel": ObservationTermCfg(func=envs_mdp.base_ang_vel),
-    "projected_gravity": ObservationTermCfg(func=envs_mdp.projected_gravity),
+    # Base angular velocity and gravity direction as the CONTROLLER estimates them (ismpc_walking::get_base_ang_vel /
+    # get_projected_gravity), the same keys the deployed policy reads. The critic overrides both with MuJoCo truth below.
+    "base_ang_vel": ObservationTermCfg(
+      func=ismpc_mdp.estimated_base_ang_vel, params={"action_name": "ismpc_sine"}
+    ),
+    "projected_gravity": ObservationTermCfg(
+      func=ismpc_mdp.estimated_projected_gravity, params={"action_name": "ismpc_sine"}
+    ),
     # Joint encoders as the CONTROLLER reads them (ismpc_walking::get_joint_pos / get_joint_vel), the same keys the
     # deployed policy reads. The critic overrides both with MuJoCo truth below.
     "joint_pos": ObservationTermCfg(
@@ -214,7 +220,10 @@ def _make_env_cfg(
 
   # Critic = actor obs + privileged Poisson push rate of the current episode (1 value, shared by all push events).
   critic_terms = dict(actor_terms)
-  # Privileged: the critic keeps MuJoCo's true joint state (same names and order, so its input layout is unchanged).
+  # Privileged: the critic keeps MuJoCo's true base velocity, gravity and joint state (same names and order, so its
+  # input layout is unchanged).
+  critic_terms["base_ang_vel"] = ObservationTermCfg(func=envs_mdp.base_ang_vel)
+  critic_terms["projected_gravity"] = ObservationTermCfg(func=envs_mdp.projected_gravity)
   critic_terms["joint_pos"] = ObservationTermCfg(
     func=envs_mdp.joint_pos_rel, params={"asset_cfg": ismpc_mdp.observed_joint_cfg()}
   )
@@ -278,16 +287,16 @@ def _make_env_cfg(
     "sine_position_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_position_continuity,
       weight=1.0,
-      params={"action_name": "ismpc_sine", "sigma" : 0.003},
+      params={"action_name": "ismpc_sine", "sigma" : 0.0075},
     ),
     "sine_offset_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_offset_continuity,
       weight=1.0,
-      params={"action_name": "ismpc_sine", "sigma": 0.002},
+      params={"action_name": "ismpc_sine", "sigma": 0.005},
     ),
     "sine_velocity_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_velocity_continuity,
-      weight=0.5,
+      weight=0.0,
       params={"action_name": "ismpc_sine", "sigma" : 0.03},
     ),
     # --- Plotting-only, weight=0.0

@@ -76,7 +76,7 @@
         "dim": 1
       },
       {
-        "name": "filt_dcm_bias",
+        "name": "filt_dcm_meas_pred_error",
         "dim": 1
       },
       {

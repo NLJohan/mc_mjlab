@@ -136,29 +136,26 @@ def collapsed(env: ManagerBasedRlEnv, min_root_height: float = 0.20) -> torch.Te
 
 
 def last_sine_params(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
-  """Current period's physical sine params (offset, frequency, sin_amp,
-  cos_amp), as an observation.
+  """Sine params (offset, frequency, sin_amp, cos_amp) the controller currently uses, (num_envs, 4), as an
+  observation.
 
-  Exposing this (rather than only the raw pre-mapping action mjlab's
-  built-in `last_action` observation would give) lets the policy condition
-  on physically meaningful quantities directly, and -- per the phase-
-  continuity discussion this design pass -- gives it the information it
-  needs to choose new sine params that continue smoothly from where the
-  previous period's sine left off, rather than having to reconstruct that
-  from raw, pre-clamp numbers.
+  Datastore getter ismpc_walking::get_com_height_sine_params (after the controller's radius cap), the same key the
+  deployed policy reads. Physically meaningful values (not the raw action), so the policy can choose new params
+  that continue smoothly from the previous period's sine. The continuity rewards keep reading the Python mirror
+  action_term.physical_params.
   """
   action_term = env.action_manager.get_term(action_name)
-  return action_term.physical_params
+  return action_term.sine_params_obs
 
 
 def last_twist_action(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
-  """The policy's current (vx, vy, omega) twist command, as an observation
-  -- mirrors last_sine_params'/last_step_timing_action's role, just for the
-  reference-velocity channel. This is the rate-limited value actually
-  written to ismpc_walking::set_rl_ref_vel this period (see
-  IsmpcSineAction.last_twist_action), not the raw pre-mapping action."""
+  """The (vx, vy, omega) reference twist the controller currently holds, (num_envs, 3), as an observation.
+
+  Datastore getter ismpc_walking::get_rl_ref_vel, the same key the deployed policy reads: the physical value the
+  policy last wrote, not the raw pre-mapping action. The tutor rewards keep reading the Python mirror
+  action_term.last_twist_action."""
   action_term = env.action_manager.get_term(action_name)
-  return action_term.last_twist_action
+  return action_term.twist_command_obs
 
 
 def estimated_com_lin_vel(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
@@ -170,10 +167,24 @@ def estimated_com_lin_vel(env: ManagerBasedRlEnv, action_name: str) -> torch.Ten
   return action_term.com_lin_vel_est_obs
 
 
+def estimated_base_ang_vel(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """Base angular velocity (rad/s) in the base frame, (num_envs, 3), as ESTIMATED by the controller
+  (ismpc_walking::get_base_ang_vel). Actor only; the critic keeps MuJoCo truth (envs_mdp.base_ang_vel)."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.base_ang_vel_est_obs
+
+
+def estimated_projected_gravity(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """Gravity direction in the base frame, (num_envs, 3), as ESTIMATED by the controller
+  (ismpc_walking::get_projected_gravity). Actor only; the critic keeps MuJoCo truth (envs_mdp.projected_gravity)."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.projected_gravity_est_obs
+
+
 def rl_phase_sincos(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
   """(sin, cos) of the controller's integrated CoM-height phase, (num_envs, 2).
 
-  Datastore getters ismpc_walking::get_rl_phase_sin/cos: phase of the RlSine reference the controller is playing.
+  Datastore getter ismpc_walking::get_rl_phase_sincos: phase of the RlSine reference the controller is playing.
   With the phase observed, the policy can compute the active reference height
   offset + a sin(phase) + b cos(phase) from last_sine_params, and a change of the frequency no longer moves it.
   The phase lives in the controller (reset to 0 with the episode), so training and deployment read the same signal."""
@@ -290,9 +301,9 @@ class target_vel_window:
 def _policy_wants_walk(action_term) -> torch.Tensor:
   """(num_envs,) bool: the policy's current walk/stop decision (True = walk).
 
-  Reads action_term.last_walk_action (1.0 = walk, 0.0 = stop), the same signal exposed to the policy as the
-  last_walk_action observation. This is the policy's own command, not the controller's ground-truth
-  is_walking_obs, so the reward follows the decision taken this step with no controller lag.
+  Reads the Python mirror action_term.last_walk_action (1.0 = walk, 0.0 = stop). This is the policy's own command,
+  not the controller's ground-truth is_walking_obs and not the controller readback the actor observes
+  (last_walk_action observation), so the reward follows the decision taken this step with no controller lag.
   """
   walk = action_term.last_walk_action
   return walk.reshape(walk.shape[0], -1)[:, 0] > 0.5
@@ -424,23 +435,26 @@ def debug_base_omega(
 
 
 def last_walk_action(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
-  """The policy's current walk/stop decision (1.0 = walk, 0.0 = stop), as
-  an observation -- mirrors last_sine_params' role for the sine params, so
-  the policy can condition on its own last decision directly.
+  """The walk/stop decision the controller currently holds (1.0 = walk, 0.0 = stop), (num_envs, 1), as an
+  observation, so the policy can condition on its own last decision.
+
+  Datastore getter ismpc_walking::get_policy_wants_walk, the same key the deployed policy reads. The not-walking
+  reward and the tutor gating keep reading the Python mirror action_term.last_walk_action, which follows the
+  decision of the current step with no controller lag.
   """
   action_term = env.action_manager.get_term(action_name)
-  return action_term.last_walk_action
+  return action_term.walk_command_obs
 
 
 def last_step_timing_action(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
-  """The policy's current step-timing (Ts, seconds between footsteps)
-  command, as an observation -- mirrors last_walk_action's/
-  last_sine_params' role: lets the policy condition on its own last Ts
-  decision directly, rather than having to infer it from downstream
-  effects (gait cadence, stability error) alone.
+  """The step timing (Ts, seconds between footsteps) the controller currently holds, (num_envs, 1), as an
+  observation: lets the policy condition on its own last Ts decision rather than infer it from gait cadence.
+
+  Datastore getter ismpc_walking::get_ts_target (after the controller's own ts_range clamp), the same key the
+  deployed policy reads. The debug terms keep reading the Python mirror action_term.last_step_timing_action.
   """
   action_term = env.action_manager.get_term(action_name)
-  return action_term.last_step_timing_action
+  return action_term.step_timing_obs
 
 
 def ismpc_wants_stop(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
