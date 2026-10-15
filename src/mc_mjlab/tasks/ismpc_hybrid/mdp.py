@@ -6,17 +6,6 @@ condition to be a sane RL problem). None of this is ISMPC-specific -- no
 CoM-height tracking error, no footstep/QP-quality term, nothing that uses
 the bridge's get_com_height_ref/qp_succeeded getters yet.
 
-Ported from the old Cython-bridge ismpc_hybrid/mdp.py onto the native
-`mc_rtc_interface`-backed `IsmpcSineAction` (mc_mjlab/actions/ismpc_sine_action.py).
-Every function here is unchanged except `ismpc_wants_stop` and
-`debug_is_walking`, which now read `action_term.ismpc_wants_stop_obs` /
-`action_term.is_walking_obs` -- both properties already exist on the new
-action term (backed by the generic datastore-output machinery inherited
-from `McRtcActionBase`) with the same names/shapes as before, so nothing
-else in this file changes. `sine_position_continuity`/`sine_velocity_continuity`
-keep reaching directly into `action_term._physical_prev`/`_physical_curr`/
-`_period_phi`, which exist on `IsmpcSineAction` with the same names.
-
 ASSUMED, NOT VERIFIED: the exact function signature mjlab's
 RewardTermCfg/TerminationTermCfg expect (`func(env, **params) -> Tensor`).
 Modeled on the pattern implied by residual_balance's usage, not confirmed
@@ -321,7 +310,7 @@ def twist_tutor(
   on one axis (0=vx, 1=vy, 2=omega).
 
   Reads action_term.last_twist_action -- the physical, rate-limited twist
-  actually written to ismpc_walking::set_rl_ref_vel -- so it rewards the
+  actually written to ismpc_walking::set_rl_ref_vel_x/y/z -- so it rewards the
   policy's own twist output (raw[6:9]) directly, with no gait lag and no
   gait ripple, unlike target_vel_window, which scores the ACHIEVED velocity
   averaged over a window. It is meant to carry a DECAYING weight (see the
@@ -731,7 +720,7 @@ def target_twist(env: ManagerBasedRlEnv, command_name: str = "twist") -> torch.T
   observation.
 
   The policy now has direct authority over velocity tracking via the twist
-  action (IsmpcSineAction._map_twist -> ismpc_walking::set_rl_ref_vel,
+  action (IsmpcSineAction._map_twist -> ismpc_walking::set_rl_ref_vel_x/y/z,
   effective only while the controller-side rlVelocityControl toggle is on
   -- see that action's module docstring). This observation remains useful
   independent of that: it is the *target* the target_linear_vel/
@@ -837,7 +826,7 @@ def debug_output_vel_x(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor
   component (m/s), after mapping to physical units. Reads
   action_term.last_twist_action (IsmpcSineAction._map_twist's output) --
   the same rate-limited, already-physical value actually written to
-  ismpc_walking::set_rl_ref_vel this period, NOT the raw pre-mapping
+  ismpc_walking::set_rl_ref_vel_x/y/z this period, NOT the raw pre-mapping
   action. Compare against debug_target_vel_x: if rlVelocityControl is on
   and the policy has learned to track the command, these two should
   converge; if they diverge, either the command isn't reaching the policy

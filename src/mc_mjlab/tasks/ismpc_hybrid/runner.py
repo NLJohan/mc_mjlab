@@ -85,7 +85,7 @@ class IsmpcHybridOnPolicyRunner(MjlabOnPolicyRunner):
     obs_dim, act_dim = self._contract_dims(contract)
     print(
       f"{TAG} {onnx_path.name}: obs_dim={obs_dim} action_dim={act_dim} "
-      f"period_ticks={contract['period_ticks']} obs_delay_ticks={contract['obs_delay_ticks']} "
+      f"obs_delay_ticks={contract['obs_delay_ticks']} "
       f"controller_dt={contract['controller_dt']} (self-check ok)"
     )
 
@@ -113,7 +113,7 @@ class IsmpcHybridOnPolicyRunner(MjlabOnPolicyRunner):
 
   @staticmethod
   def _contract_dims(contract: dict) -> tuple[int, int]:
-    """Contract v3 carries no dim fields: the observation size is the sum of the term dims, the action size is
+    """The contract carries no dim fields: the observation size is the sum of the term dims, the action size is
     the number of outputs (the same two numbers the C++ loader derives)."""
     return (
       sum(int(t["dim"]) for t in contract["obs"]["terms"]),

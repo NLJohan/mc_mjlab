@@ -1,13 +1,9 @@
-"""Builds the `ismpc_contract` embedded in every exported `model_N.onnx` (contract version 3).
+"""Builds the `ismpc_contract` embedded in every exported `model_N.onnx`.
 
 The C++ `PolicyRunner` reads ONLY this contract (never this repo's Python), so everything the deployment side
 must reproduce is read here from the LIVE environment at save time, except what cannot be read from the env:
 the controller datastore key of each observation term (OBS_BINDINGS) and the observation delay
 (PIPELINE_OBS_DELAY_TICKS).
-
-Two stages: `_collect_parts` reads the env into a plain dict (the layout contract version 1 used), `to_v3`
-turns that dict into the version 3 contract. `to_v3` is pure, so it also converts an old contract file
-(restamp tool) and is what the golden test exercises without an env.
 
 Raises ContractError when the actor observation uses anything the C++ side would silently disagree with
 (history, delay, noise, scale != 1, clipping), or when the env does not match what the tables below describe.
@@ -28,7 +24,6 @@ import torch
 from mc_mjlab.actions import ismpc_sine_action as act
 from mc_mjlab.tasks.ismpc_hybrid import mdp
 
-CONTRACT_VERSION = 3
 ACTOR_GROUP = "actor"
 ACTION_NAME = "ismpc_sine"
 COMMAND_NAME = "twist"
@@ -36,13 +31,13 @@ COMMAND_NAME = "twist"
 KEY_PREFIX = "ismpc_walking::"
 
 # Observation delay of the training pipeline, in controller ticks (the deployed runner reads a snapshot taken
-# this many end-of-step samples ago). Derived by hand from the async dispatch in mc_rtc_action_base
-# (plan F1); NOT measured yet: the P1 replay decides it.
+# this many end-of-step samples ago). Derived by hand from the async dispatch in mc_rtc_action_base; NOT measured
+# yet: an observation replay decides it.
 PIPELINE_OBS_DELAY_TICKS = 2
 
 # Actor term name -> (controller datastore getter without prefix, type, dim). dim None = taken from the env
-# (joint terms: the number of observed joints). Until observations are read generically through the datastore,
-# this table IS the link between a training term and a controller key.
+# (joint terms: the number of observed joints). This table is the link between a training term and a controller
+# key.
 OBS_BINDINGS: dict[str, tuple[str, str, int | None]] = {
   "com_lin_vel": ("get_com_lin_vel", "vec3", 3),
   "base_ang_vel": ("get_base_ang_vel", "vec3", 3),
@@ -69,7 +64,7 @@ EXPECTED_LAYOUT = {"sine": [0, 4], "walk_gate": 4, "ts": 5, "twist": [6, 9]}
 
 
 class ContractError(RuntimeError):
-  """The env cannot be described faithfully by contract version 3."""
+  """The env cannot be described faithfully by the contract."""
 
 
 def _plain(x: Any) -> Any:
@@ -211,15 +206,6 @@ def _action_section(env: Any, term: Any) -> dict:
   }
 
 
-def _timing_section(env: Any, term: Any) -> tuple[float, int]:
-  cfg = term.cfg
-  controller_dt = float(env.step_dt * cfg.frameskip / env.cfg.decimation)
-  latch = getattr(term, "_sine_param_period_ticks", None)
-  if latch is None:
-    latch = max(1, round(1.0 / controller_dt / cfg.sine_param_frequency_hz))
-  return controller_dt, int(latch)
-
-
 def _observed_joint_ids(env: Any) -> list[int]:
   """Robot joint indices of joint_pos / joint_vel, in observation order, read from the RESOLVED actor terms.
 
@@ -248,28 +234,10 @@ def _observed_joint_ids(env: Any) -> list[int]:
   return ids["joint_pos"]
 
 
-def _joints_section(env: Any) -> dict:
-  robot = env.scene["robot"]
-  ids = _observed_joint_ids(env)
-  default = robot.data.default_joint_pos[0].detach().cpu()
-  return {
-    "names": [robot.joint_names[i] for i in ids],
-    "default_pos": default[ids].tolist(),
-  }
-
-
-def _command_section(env: Any) -> dict:
-  ranges = {}
-  cmd_cfg = env.command_manager.get_term(COMMAND_NAME).cfg.ranges
-  for key in ("lin_vel_x", "lin_vel_y", "ang_vel_z"):
-    ranges[key] = list(getattr(cmd_cfg, key))
-  return {"names": list(env.command_manager.active_terms), "ranges": ranges}
-
-
 def _filters_section(term: Any) -> dict:
   """Cutoff period (s) of the controller-side observation filters, read from the LIVE controllers.
 
-  Always required by contract v3 (the controller swaps its filter cutoff at attach). Envs that were just reset
+  Always required (the controller swaps its filter cutoff at attach). Envs that were just reset
   read 0 until their first collect, so only the positive entries count; they must all agree (the cutoff is a
   controller constant, one YAML key)."""
   vals = term.datastore_scalar_output(act.GET_OBS_FILTER_CUTOFF_T).detach().cpu().flatten()
@@ -298,69 +266,6 @@ def _git_info() -> dict:
 
   status = run("status", "--porcelain")
   return {"hash": run("rev-parse", "HEAD"), "dirty": bool(status) if status is not None else None}
-
-
-def _collect_parts(env: Any, policy: Any, *, checkpoint_path: str, iteration: int) -> dict:
-  """Reads the live env into the plain dict `to_v3` consumes (the contract version 1 layout, without the
-  latch block)."""
-  term = env.action_manager.get_term(ACTION_NAME)
-  obs = _obs_section(env)
-  action = _action_section(env, term)
-  controller_dt, period_ticks = _timing_section(env, term)
-  norm = _normalizer_section(policy)
-  if norm is not None and "mean" in norm:
-    obs["normalizer"] = norm
-  elif norm is not None:
-    obs["normalizer_error"] = norm
-  return {
-    "checkpoint": {
-      "stem": Path(checkpoint_path).stem,
-      "iteration": int(iteration),
-      "git": _git_info(),
-    },
-    "controller_dt": controller_dt,
-    "latch_ticks": period_ticks,
-    "obs": obs,
-    "filters": _filters_section(term),
-    "action": action,
-    "joints": _joints_section(env),
-    "command": _command_section(env),
-  }
-
-
-def _need(d: dict, *path: str) -> Any:
-  cur: Any = d
-  for i, k in enumerate(path):
-    if not isinstance(cur, dict) or k not in cur:
-      raise ContractError(f"missing '{'.'.join(path[: i + 1])}' in the contract parts")
-    cur = cur[k]
-  return cur
-
-
-def _term_specs(parts: dict) -> list[dict]:
-  joints = _need(parts, "joints")
-  cmd = _need(parts, "command", "ranges")
-  specs: list[dict] = []
-  for t in _need(parts, "obs", "terms"):
-    name, dim = t["name"], int(t["dim"])
-    if name not in OBS_BINDINGS:
-      raise ContractError(
-        f"actor term '{name}' has no controller datastore key: add it to OBS_BINDINGS (or remove the term)"
-      )
-    getter, typ, fixed = OBS_BINDINGS[name]
-    if fixed is not None and dim != fixed:
-      raise ContractError(f"actor term '{name}' has dim {dim}, the controller getter {getter} gives {fixed}")
-    spec: dict = {"name": name, "key": KEY_PREFIX + getter, "type": typ, "dim": dim}
-    if name in ("joint_pos", "joint_vel"):
-      names = list(joints["names"])
-      if len(names) != dim:
-        raise ContractError(f"actor term '{name}' has dim {dim} but {len(names)} observed joints")
-      spec["select"] = names
-      spec["labels_key"] = KEY_PREFIX + JOINT_NAMES_KEY
-    elif name == "target_twist":
-      spec["clamp"] = [list(cmd[k]) for k in ("lin_vel_x", "lin_vel_y", "ang_vel_z")]
-    specs.append(spec)
-  return specs
 
 
 def _output_specs(action: dict) -> list[dict]:
@@ -401,41 +306,72 @@ def _output_specs(action: dict) -> list[dict]:
   return outs
 
 
-def to_v3(parts: dict) -> dict:
-  """Pure: the dict `_collect_parts` builds (or an old contract version 1 file) -> contract version 3."""
-  terms = _term_specs(parts)
-  outputs = _output_specs(_need(parts, "action"))
-  c = parts["action"]["constants"]
-  period_ticks = int(_need(parts, "latch_ticks"))
-  if period_ticks < PIPELINE_OBS_DELAY_TICKS + 1:
-    raise ContractError(f"period_ticks {period_ticks} must exceed obs_delay_ticks {PIPELINE_OBS_DELAY_TICKS}")
+def _observed_joint_names(env: Any) -> list[str]:
+  robot = env.scene["robot"]
+  return [robot.joint_names[i] for i in _observed_joint_ids(env)]
 
-  obs: dict = {"terms": terms}
-  norm = parts["obs"].get("normalizer")
-  if norm is not None:
-    obs_dim = sum(t["dim"] for t in terms)
-    if len(norm["mean"]) == obs_dim and len(norm["std"]) == obs_dim:
-      obs["normalizer"] = {"mean": norm["mean"], "std": norm["std"], "eps": norm["eps"]}
-    # else: diagnostics only, the ONNX has the real normalizer; leave it out rather than block the export
 
-  return {
-    "contract_version": CONTRACT_VERSION,
-    "checkpoint": parts["checkpoint"],
-    "controller_dt": _need(parts, "controller_dt"),
-    "period_ticks": period_ticks,
-    "obs_delay_ticks": PIPELINE_OBS_DELAY_TICKS,
-    "controller": {
-      "obs_filter_cutoff_T": _need(parts, "filters", "obs_filter_cutoff_T"),
-      "com_height_range": [c["offset_min"], c["offset_max"]],
-    },
-    "obs": obs,
-    "action": {"outputs": outputs},
-  }
+def _command_ranges(env: Any) -> dict[str, list[float]]:
+  cmd_cfg = env.command_manager.get_term(COMMAND_NAME).cfg.ranges
+  return {key: list(getattr(cmd_cfg, key)) for key in ("lin_vel_x", "lin_vel_y", "ang_vel_z")}
+
+
+def _term_specs(terms: list[dict], joint_names: list[str], ranges: dict[str, list[float]]) -> list[dict]:
+  specs: list[dict] = []
+  for t in terms:
+    name, dim = t["name"], int(t["dim"])
+    if name not in OBS_BINDINGS:
+      raise ContractError(
+        f"actor term '{name}' has no controller datastore key: add it to OBS_BINDINGS (or remove the term)"
+      )
+    getter, typ, fixed = OBS_BINDINGS[name]
+    if fixed is not None and dim != fixed:
+      raise ContractError(f"actor term '{name}' has dim {dim}, the controller getter {getter} gives {fixed}")
+    spec: dict = {"name": name, "key": KEY_PREFIX + getter, "type": typ, "dim": dim}
+    if name in ("joint_pos", "joint_vel"):
+      if len(joint_names) != dim:
+        raise ContractError(f"actor term '{name}' has dim {dim} but {len(joint_names)} observed joints")
+      spec["select"] = list(joint_names)
+      spec["labels_key"] = KEY_PREFIX + JOINT_NAMES_KEY
+    elif name == "target_twist":
+      spec["clamp"] = [list(ranges[k]) for k in ("lin_vel_x", "lin_vel_y", "ang_vel_z")]
+    specs.append(spec)
+  return specs
 
 
 def build_contract(
   env: Any, policy: Any, *, checkpoint_path: str, iteration: int
 ) -> dict:
   """`env` is the unwrapped ManagerBasedRlEnv, `policy` is alg.get_policy()."""
-  parts = _collect_parts(env, policy, checkpoint_path=checkpoint_path, iteration=iteration)
-  return to_v3(parts)
+  term = env.action_manager.get_term(ACTION_NAME)
+  controller_dt = float(env.step_dt * term.cfg.frameskip / env.cfg.decimation)
+
+  actor = _obs_section(env)
+  action = _action_section(env, term)
+  filters = _filters_section(term)
+  terms = _term_specs(actor["terms"], _observed_joint_names(env), _command_ranges(env))
+  outputs = _output_specs(action)
+  c = action["constants"]
+
+  obs: dict = {"terms": terms}
+  norm = _normalizer_section(policy)
+  obs_dim = sum(t["dim"] for t in terms)
+  if norm is not None and "mean" in norm and len(norm["mean"]) == obs_dim and len(norm["std"]) == obs_dim:
+    obs["normalizer"] = {"mean": norm["mean"], "std": norm["std"], "eps": norm["eps"]}
+  # else: diagnostics only, the ONNX has the real normalizer; leave it out rather than block the export
+
+  return {
+    "checkpoint": {
+      "stem": Path(checkpoint_path).stem,
+      "iteration": int(iteration),
+      "git": _git_info(),
+    },
+    "controller_dt": controller_dt,
+    "obs_delay_ticks": PIPELINE_OBS_DELAY_TICKS,
+    "controller": {
+      "obs_filter_cutoff_T": filters["obs_filter_cutoff_T"],
+      "com_height_range": [c["offset_min"], c["offset_max"]],
+    },
+    "obs": obs,
+    "action": {"outputs": outputs},
+  }

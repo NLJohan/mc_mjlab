@@ -159,45 +159,32 @@ class ConstantPolicy:
 
 
 def _check_contract(contract_path: Path, term, venv) -> dict | None:
-  """Abort on checkpoint/env mismatch. Warn when the contract is missing."""
+  """Abort on checkpoint/env mismatch. Warn when the contract is missing.
+
+  Checks what the contract records: the controller period, the actor observation terms (names and
+  order) and the number of action outputs. The actor network shapes are checked by the strict
+  checkpoint load that follows.
+  """
   if not contract_path.exists():
     print(f"[warn] no contract json at {contract_path}: skipping the consistency check")
     return None
   c = json.loads(contract_path.read_text())
   uw = venv.unwrapped
-  cfg = term.cfg
   problems = []
 
-  live_dt = uw.step_dt * cfg.frameskip / uw.cfg.decimation
+  live_dt = uw.step_dt * term.cfg.frameskip / uw.cfg.decimation
   if not math.isclose(c["controller_dt"], live_dt, rel_tol=1e-9):
     problems.append(f"controller_dt: contract {c['controller_dt']} vs live {live_dt}")
-  if c["latch_ticks"] != term._sine_param_period_ticks:
-    problems.append(
-      f"latch_ticks: contract {c['latch_ticks']} vs live {term._sine_param_period_ticks}"
-    )
   live_terms = list(uw.observation_manager.active_terms["actor"])
   contract_terms = [t["name"] for t in c["obs"]["terms"]]
   if live_terms != contract_terms:
     problems.append(f"actor obs terms differ:\n  contract {contract_terms}\n  live     {live_terms}")
-  live_dim = int(venv.get_observations()["actor"].shape[-1])
-  if c["obs"]["dim"] != live_dim:
-    problems.append(f"actor obs dim: contract {c['obs']['dim']} vs live {live_dim}")
-  const = c["action"]["constants"]
-  for k in (
-    "offset_scale", "offset_bias", "frequency_scale", "frequency_bias",
-    "amplitude_scale", "walk_gate_bias", "ts_scale", "ts_bias",
-  ):
-    if not math.isclose(const[k], float(getattr(cfg, k)), rel_tol=1e-6, abs_tol=1e-9):
-      problems.append(f"action.{k}: contract {const[k]} vs live {getattr(cfg, k)}")
-  if [float(x) for x in const["twist_scale"]] != [float(x) for x in cfg.twist_scale]:
-    problems.append(f"action.twist_scale: contract {const['twist_scale']} vs live {cfg.twist_scale}")
+  n_outputs = len(c["action"]["outputs"])
+  if n_outputs != term.action_dim:
+    problems.append(f"action outputs: contract {n_outputs} vs live {term.action_dim}")
   if problems:
     raise RuntimeError("checkpoint contract does not match the live env:\n- " + "\n- ".join(problems))
 
-  rng = c.get("command", {}).get("ranges", {})
-  for key, v in zip(("lin_vel_x", "lin_vel_y", "ang_vel_z"), TARGET_TWIST):
-    if key in rng and not (rng[key][0] <= v <= rng[key][1]):
-      print(f"[warn] target {key}={v} is outside the checkpoint's command range {rng[key]}")
   print(f"[ok] contract check passed ({contract_path.name})")
   return c
 

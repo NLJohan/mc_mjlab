@@ -1,8 +1,7 @@
 """Learned CoM-height sine parameter action for ISMPC.
 
-This is the native-`mc_rtc_interface` counterpart of the old Cython-bridge
-`ismpc_sine_action.py`. The RL policy's 9 raw actions are mapped into
-physical ISMPC parameters each slow sine-param tick:
+The RL policy's 9 raw actions are mapped into physical ISMPC parameters each
+slow sine-param tick:
 
   offset            = clip(offset_scale * raw[0] + offset_bias, OFFSET_MIN, OFFSET_MAX)   (m)
   frequency         = clip(exp(frequency_scale * raw[1] + frequency_bias), FREQUENCY_MIN, FREQUENCY_MAX)  (Hz)
@@ -10,24 +9,23 @@ physical ISMPC parameters each slow sine-param tick:
                        against offset so offset - amplitude >= 0 structurally
   walk_gate         = raw[4] > walk_gate_bias                               (bool)
   ts                = clip(ts_scale * raw[5] + ts_bias, TS_MIN, TS_MAX)     (s)
-  twist (vx,vy,w)   = rate_limit(clip(raw[6:9], -1, 1) * twist_scale)       (m/s, m/s, rad/s)
-                       -- see _map_twist/twist_max_delta for the per-axis rate limit
+  twist (vx,vy,w)   = clip(raw[6:9], -1, 1) * twist_scale                   (m/s, m/s, rad/s)
 
 The twist (vx, vy, omega) drives ismpc_walking's footstep reference velocity
-via a new datastore setter (SET_RL_REF_VEL), ONLY when the controller-side
+via the datastore setters (SET_RL_REF_VEL_X/Y/Z), ONLY when the controller-side
 rlVelocityControl toggle is on (YAML `walking_controller.rl_velocity_control`
 or the "RL Reference Velocity" GUI checkbox in Walking_controller -- this
 toggle is NOT exposed to or writable from Python; see
 Walking_controller.h/.cpp). When that toggle is off, this class's writes to
-SET_RL_REF_VEL are harmless but inert: the controller's own mux
+SET_RL_REF_VEL_X/Y/Z are harmless but inert: the controller's own mux
 (Walking_controller::updateReferenceVelocity()) ignores rl_reference_velocity
 and follows user_reference_velocity (GUI/joystick) instead. The controller
 exposes its estimated CoM velocity (base axes) via ismpc_walking::get_com_lin_vel,
 read as a datastore_vectors_outputs entry -- see com_lin_vel_est_obs -- which is
 the policy's "com_lin_vel" observation.
 
-Joint actuation itself is unchanged from the old file: mc_rtc's own q/alpha
-output drives the joints directly. There is no joint-space residual in this
+Joint actuation: mc_rtc's own q/alpha output drives the joints directly.
+There is no joint-space residual in this
 task -- RL only ever touches the ISMPC parameters, never joint commands.
 
 Subclasses `McRtcActionBase` (not `McRtcResidualActionBase`): this action has
@@ -45,7 +43,7 @@ import torch
 from mc_mjlab.actions.mc_rtc_action_base import McRtcActionBase, McRtcActionCfg
 from mc_mjlab.robots import robot_module as robots
 
-# --- Physical ranges, ported verbatim from the Cython-bridge action. ---
+# --- Physical ranges. ---
 OFFSET_MIN, OFFSET_MAX = 0.4, 1.05  # m
 
 FREQUENCY_MIN, FREQUENCY_MAX = 0.1, 8.0  # Hz
@@ -60,7 +58,7 @@ TS_DEFAULT = 1.1  # s -- must match Walking_controller::kDefaultTSteps
 
 # --- Datastore keys (docs/coupling.md "Datastore callbacks": a controller's
 # own getters/setters are named as constants in the task that uses them, not
-# in mc_mjlab/bridge/controller_datastore.py). See migration guidelines §1.3. ---
+# in mc_mjlab/bridge/controller_datastore.py). ---
 SET_OFFSET = "ismpc_walking::set_com_height_sine_offset"
 SET_FREQUENCY = "ismpc_walking::set_com_height_sine_frequency"
 SET_SIN_AMP = "ismpc_walking::set_com_height_sine_sin_amp"
@@ -69,12 +67,14 @@ SET_POLICY_WANTS_WALK = "ismpc_walking::set_policy_wants_walk"
 SET_TS = "ismpc_walking::set_ts"
 GET_WANTS_STOP = "ismpc_walking::wants_stop_d"
 GET_ROBOT_WALKING = "ismpc_walking::robot_walking_d"
-# Vector3d (datastore_vectors_inputs/outputs), unlike the scalars above.
-# set_rl_ref_vel writes Walking_controller::rl_reference_velocity only --
-# inert unless the controller-side rlVelocityControl toggle is on (see the
-# module docstring). get_com_lin_vel reads Walking_controller::
+# The policy's twist, one scalar setter per component (datastore_scalar_inputs), like the contract's twist outputs.
+# They write Walking_controller::rl_reference_velocity only -- inert unless the controller-side rlVelocityControl
+# toggle is on (see the module docstring).
+SET_RL_REF_VEL_X = "ismpc_walking::set_rl_ref_vel_x"
+SET_RL_REF_VEL_Y = "ismpc_walking::set_rl_ref_vel_y"
+SET_RL_REF_VEL_Z = "ismpc_walking::set_rl_ref_vel_z"
+# Vector3d (datastore_vectors_inputs/outputs), unlike the scalars above. get_com_lin_vel reads Walking_controller::
 # estimatedComLinVel() (realRobot CoM velocity rotated into base axes).
-SET_RL_REF_VEL = "ismpc_walking::set_rl_ref_vel"
 # The commanded target twist (vx, vy, wz): training writes the sampled command here every control period and the
 # actor reads it back through GET_USER_REF_VEL, the same key the deployed policy reads for target_twist. The
 # controller ignores it for motion while its rl_velocity_control mux is on (the policy's own twist drives then).
@@ -114,17 +114,15 @@ class IsmpcSineActionCfg(McRtcActionCfg):
 
   Subclasses `McRtcActionCfg`, not `McRtcResidualActionCfg`: no residual
   fields apply here -- this action controls no per-joint actuators via RL at
-  all (its action space is a fixed 6, unrelated to joint count). Joint
+  all (its action space is a fixed 9, unrelated to joint count). Joint
   actuation is still driven by mc_rtc's own q/alpha output, same as the
   residual actions, but that's internal wiring, not something the cfg needs
   residual-specific fields for.
 
   `actuator_names` (inherited from `BaseActionCfg`) selects which of the
   entity's joints mc_rtc drives via q/alpha -- NOT the RL action's own
-  targets (the 6 fixed sine/gate/timing params), matching the old Cython-
-  bridge file's `target_actuator_names` field, now folded into the inherited
-  field since this class routes through `BaseAction.__init__` (see
-  `IsmpcSineAction.__init__`). `scale`/`offset`/`clip` (also inherited) are
+  targets (the fixed sine/gate/timing/twist parameters). `scale`/`offset`/`clip`
+  (also inherited) are
   not used by this action -- leave them at `BaseActionCfg`'s defaults; the
   raw-to-physical mapping is entirely the explicit `_map_to_physical`/
   `_map_walk_gate`/`_map_step_timing` methods below, not an affine transform.
@@ -183,16 +181,6 @@ class IsmpcSineActionCfg(McRtcActionCfg):
   command range is currently (0, 0) there, so its limit only bounds what
   the policy may request."""
 
-  twist_max_delta: tuple[float, float, float] = (0.3, 0.1, 0.125)
-  """Per-axis rate limit on the commanded twist, in physical units per slow
-  tick (one tick = 1 / sine_param_frequency_hz s, 0.05 s at 20 Hz), so
-  the twist can move by at most this much every 0.05 s.
-
-  Too loose risks large QP breaks from abrupt reference-velocity changes
-  (see Walking_controller::reset()'s comments); too tight slows the
-  policy's response to a changing command. Unvalidated: tune against
-  controller_failed telemetry."""
-
   def build(self, env) -> "IsmpcSineAction":
     return IsmpcSineAction(self, env)
 
@@ -220,7 +208,7 @@ class IsmpcSineAction(McRtcActionBase):
     cfg.datastore_scalar_inputs = tuple(
       dict.fromkeys(
         (*cfg.datastore_scalar_inputs, SET_OFFSET, SET_FREQUENCY, SET_SIN_AMP,
-         SET_COS_AMP, SET_POLICY_WANTS_WALK, SET_TS)
+         SET_COS_AMP, SET_POLICY_WANTS_WALK, SET_TS, SET_RL_REF_VEL_X, SET_RL_REF_VEL_Y, SET_RL_REF_VEL_Z)
       )
     )
     cfg.datastore_scalar_outputs = tuple(
@@ -234,7 +222,7 @@ class IsmpcSineAction(McRtcActionBase):
     # and same (num_envs, 3)-shaped transport (set_datastore_vector_input /
     # datastore_vector_output -- see mc_rtc_action_base.py).
     cfg.datastore_vectors_inputs = tuple(
-      dict.fromkeys((*cfg.datastore_vectors_inputs, SET_RL_REF_VEL, SET_USER_REF_VEL))
+      dict.fromkeys((*cfg.datastore_vectors_inputs, SET_USER_REF_VEL))
     )
     cfg.datastore_vectors_outputs = tuple(
       dict.fromkeys(
@@ -255,8 +243,7 @@ class IsmpcSineAction(McRtcActionBase):
     # `BaseAction.__init__` (via McRtcActionBase's own super().__init__())
     # resolves `_entity`/`_target_ids`/`_target_names` from `cfg.actuator_names`
     # the same way it does for the residual actions -- no explicit resolution
-    # needed here, since this class subclasses McRtcActionBase -> BaseAction,
-    # unlike the old Cython-bridge file which subclassed ActionTerm directly.
+    # needed here, since this class subclasses McRtcActionBase -> BaseAction.
     #
     # One mismatch this creates: BaseAction.__init__ also sizes _action_dim,
     # _raw_actions, _processed_actions, _scale, _offset, _clip off the
@@ -272,8 +259,6 @@ class IsmpcSineAction(McRtcActionBase):
     # below).
     super().__init__(cfg, env)
 
-    # Action dim 6 -> 9: +3 for the twist (vx, vy, omega). Old 6-dim
-    # checkpoints will not load against this -- accepted, per-plan.
     self._action_dim = 9
     self._raw_actions = torch.zeros(self.num_envs, 9, device=self.device)
     self._processed_actions = torch.zeros_like(self._raw_actions)
@@ -346,15 +331,14 @@ class IsmpcSineAction(McRtcActionBase):
   def process_actions(self, actions: torch.Tensor) -> None:
     """Store this period's raw policy output; no scale/offset/clip here --
     the seven physical mappings (sine x4, walk gate, Ts, twist) happen in
-    apply_actions/the slow-cadence block, same split the old Cython-bridge
-    file used."""
+    the slow-cadence block of _advance_sine_period."""
     self._raw_actions[:] = actions
     self._processed_actions[:] = actions
 
   # ---- Raw action -> physical units. ----
 
   def _map_to_physical(self, raw: torch.Tensor) -> dict[str, torch.Tensor]:
-    """First 4 of the 6-wide raw action -> {offset, frequency, sin_amp,
+    """First 4 of the 9-wide raw action -> {offset, frequency, sin_amp,
     cos_amp}, all structurally within their safe/valid ranges."""
     raw_offset, raw_frequency, raw_sin_amp, raw_cos_amp = raw[..., :4].unbind(dim=-1)
 
@@ -490,8 +474,7 @@ class IsmpcSineAction(McRtcActionBase):
   def ismpc_wants_stop_obs(self) -> torch.Tensor:
     """ISMPC's own advisory safety opinion from the most recent MPC solve,
     (num_envs, 1) float (1.0 = ISMPC would have stopped). Read through the
-    base's generic datastore-output machinery -- replaces the old file's
-    manual ControllerIoBinding readback."""
+    base's generic datastore-output machinery."""
     return self.datastore_scalar_output(GET_WANTS_STOP).unsqueeze(-1)
 
   @property
@@ -668,28 +651,23 @@ class IsmpcSineAction(McRtcActionBase):
       (SET_COS_AMP, self._physical_curr["cos_amp"]),
       (SET_POLICY_WANTS_WALK, self._walk_enabled.to(dtype=scalar_feed.dtype)),
       (SET_TS, self._ts_curr),
+      (SET_RL_REF_VEL_X, self._twist_curr[:, 0]),
+      (SET_RL_REF_VEL_Y, self._twist_curr[:, 1]),
+      (SET_RL_REF_VEL_Z, self._twist_curr[:, 2]),
     ):
       index = self._datastore_input_index(scalar_cols, setter, "scalar")
       scalar_feed[rows, index] = values[rows].to(dtype=scalar_feed.dtype)
-    vector_index = self._datastore_input_index(
-      self._datastore_vector_input_columns, SET_RL_REF_VEL, "vectors"
-    )
-    self._datastore_vector_input_feed[rows, vector_index] = self._twist_curr[rows].to(
-      dtype=self._datastore_vector_input_feed.dtype
-    )
 
     # The base zeroes the collected datastore outputs of the reset rows, and they stay zero until the first fresh
     # collect. For the phase zero is off-distribution (sin = cos = 0 is not on the unit circle): seed what the
     # controller itself holds right after its reset (phase 0). Every other collected value (CoM height, joints,
-    # base velocity, gravity, sine params, walk, Ts, twist) is NOT seeded and reads 0 until the first collect (to be
-    # replaced by a real reset read).
+    # base velocity, gravity, sine params, walk, Ts, twist) is NOT seeded and reads 0 until the first collect.
     phase = self._datastore_vectorx_outputs[GET_RL_PHASE_SINCOS]
     phase[rows] = torch.tensor([0.0, 1.0], device=phase.device, dtype=phase.dtype)
 
   def apply_actions(self) -> None:
     """Advance the control period on its first substep, then write
-    interpolated q/alpha targets. Ported directly from
-    McRtcResidualJointPositionAction-style structure, minus the residual."""
+    interpolated q/alpha targets."""
     substep_in_period = self._substep % self.cfg.frameskip
     self._substep += 1
     if substep_in_period == 0:
@@ -717,11 +695,6 @@ class IsmpcSineAction(McRtcActionBase):
   def _advance_sine_period(self) -> None:
     """This class's analogue of `_advance_control_period`: run the generic
     dispatch/collect first, then do the sine-specific slow-cadence work.
-
-    Does NOT port the old file's manual `_reset_generation`/
-    `_dispatch_generation` staleness guard -- `McRtcActionBase`'s
-    `_pending_reset`/`_dispatch_resets` + WORKER_FAILED handling already
-    solves the same problem generically.
     """
     # The sampled command goes into the feed BEFORE the dispatch, so even the first dispatch of an episode (the one
     # carrying the native reset flag) already carries the command of the new episode. The worker writes the
@@ -786,8 +759,8 @@ class IsmpcSineAction(McRtcActionBase):
     # Written every control period regardless of which envs were due this
     # tick, using self._physical_curr's current values -- matches
     # datastore_scalar_inputs' own "unconditional every-period write"
-    # contract (docs/coupling.md) and the old file's own "write current
-    # value every dispatch tick, update only on the slow clock" convention.
+    # contract (docs/coupling.md): the current value is written every dispatch
+    # tick and updated only on the slow clock.
     self.set_datastore_scalar_input(SET_OFFSET, self._physical_curr["offset"])
     self.set_datastore_scalar_input(SET_FREQUENCY, self._physical_curr["frequency"])
     self.set_datastore_scalar_input(SET_SIN_AMP, self._physical_curr["sin_amp"])
@@ -797,8 +770,8 @@ class IsmpcSineAction(McRtcActionBase):
       self._walk_enabled.to(dtype=torch.get_default_dtype()),
     )
     self.set_datastore_scalar_input(SET_TS, self._ts_curr)
-    # Vector3d counterpart of the scalar writes above -- same unconditional
-    # every-period contract (datastore_vectors_inputs, not just
-    # datastore_scalar_inputs). Inert on the controller side whenever
-    # rlVelocityControl is off; see the module docstring.
-    self.set_datastore_vector_input(SET_RL_REF_VEL, self._twist_curr)
+    # The twist, one scalar per component, same unconditional every-period contract. Inert on the controller side
+    # whenever rlVelocityControl is off; see the module docstring.
+    self.set_datastore_scalar_input(SET_RL_REF_VEL_X, self._twist_curr[:, 0])
+    self.set_datastore_scalar_input(SET_RL_REF_VEL_Y, self._twist_curr[:, 1])
+    self.set_datastore_scalar_input(SET_RL_REF_VEL_Z, self._twist_curr[:, 2])

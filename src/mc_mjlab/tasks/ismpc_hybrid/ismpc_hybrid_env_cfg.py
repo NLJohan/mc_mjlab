@@ -29,16 +29,16 @@ from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 400
+NUM_ENVS = 20
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 40.0
-TWIST_RESAMPLING_TIME_RANGE = (1.0, 30.0)
+TWIST_RESAMPLING_TIME_RANGE = (1.0, 25.0)
 
 # Tutor rewards are zeroed while the policy commands "stop", unless the whole sampled command is inside this
 # deadzone (the not_walking_penalty is also disabled inside it, standing is never penalized there): |vx| < DZ[0] (m/s), |vy| < DZ[1] (m/s), |wz| < DZ[2] (rad/s), all three at once. Inside it, stopping
 # is a legitimate answer, so the tutor is not gated. (0, 0, 0) = no deadzone (pure walk gate).
-TUTOR_DEADZONE = (0.04, 0.04, 0.1)
+TUTOR_DEADZONE = (0.04, 0.04, 0.05)
 # # Fraction of envs whose sampled twist command is forced to zero (mjlab UniformVelocityCommandCfg.rel_standing_envs).
 # # Gives the policy episodes where standing still is the right answer, so the stop decision can be learned.
 STANDING_ENVS_FRAC = 0.25
@@ -64,7 +64,7 @@ PUSH_FORCE_HAND_N = (130.0, 200.0)
 PUSH_TAU_UP_MEAN_S = 0.15
 PUSH_TAU_UP_STD_S = 0.02
 PUSH_RELEASE_RATIO = 0.5
-PUSH_DELAY_S = (0.2, 0.7)
+PUSH_DELAY_S = (0.2, 0.5)
 # Poisson push arrivals: mean rate (Hz) per push point, memoryless (replaces the cooldown law below).
 # ONE rate per env and per episode (redrawn at every reset, log-uniform on this interval, Hz), shared by
 # the torso and both hand events: low end = "safe" episode, high end = "excited" one. PLACEHOLDER
@@ -92,8 +92,8 @@ TERRAIN_PATCH_SIZE_M = (8.0, 8.0)
 # Curriculum stages. "step" is env.common_step_counter, counted in ENV steps: iteration * NUM_STEPS_PER_ENV.
 CURRICULUM_STAGES = [
   {"step": 0,          "lin_vel_x": (-0.5, 0.5), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.2, 0.2), "push_scale": 0.2},
-  {"step": 100 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.8},
-  {"step": 300 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
+  {"step": 100 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.5},
+  {"step": 300 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.8},
   {"step": 750 * NUM_STEPS_PER_ENV, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
   {"step": 1500 * NUM_STEPS_PER_ENV, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
 ]
