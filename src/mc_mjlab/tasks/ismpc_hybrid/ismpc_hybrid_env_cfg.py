@@ -214,7 +214,7 @@ def _make_env_cfg(
       func=ismpc_mdp.filt_dcm_meas_pred_error, params={"action_name": "ismpc_sine"}
     ),
     "target_twist": ObservationTermCfg(
-      func=ismpc_mdp.target_twist, params={"command_name": "twist"}
+      func=ismpc_mdp.controller_target_twist, params={"action_name": "ismpc_sine"}
     ),
   }
 
@@ -224,6 +224,9 @@ def _make_env_cfg(
   # input layout is unchanged).
   critic_terms["base_ang_vel"] = ObservationTermCfg(func=envs_mdp.base_ang_vel)
   critic_terms["projected_gravity"] = ObservationTermCfg(func=envs_mdp.projected_gravity)
+  critic_terms["target_twist"] = ObservationTermCfg(
+    func=ismpc_mdp.target_twist, params={"command_name": "twist"}
+  )
   critic_terms["joint_pos"] = ObservationTermCfg(
     func=envs_mdp.joint_pos_rel, params={"asset_cfg": ismpc_mdp.observed_joint_cfg()}
   )

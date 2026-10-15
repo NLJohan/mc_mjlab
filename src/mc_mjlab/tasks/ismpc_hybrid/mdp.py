@@ -746,6 +746,17 @@ def target_twist(env: ManagerBasedRlEnv, command_name: str = "twist") -> torch.T
   return env.command_manager.get_command(command_name)
 
 
+def controller_target_twist(env: ManagerBasedRlEnv, action_name: str) -> torch.Tensor:
+  """Target walking velocity (vx, vy, wz) the controller holds, (num_envs, 3), as an observation.
+
+  Datastore getter ismpc_walking::get_user_ref_vel, the same key the deployed policy reads. Training feeds the
+  sampled command into the matching setter every control period (IsmpcSineAction.cfg.command_name), so it equals
+  target_twist() up to the controller's one-to-two-tick readback lag. The critic and the tracking rewards keep
+  reading the command manager."""
+  action_term = env.action_manager.get_term(action_name)
+  return action_term.user_ref_vel_obs
+
+
 # --- Debug-only "reward" shims, weight=0.0 in ismpc_hybrid_env_cfg.py. ---
 #
 # NativeMujocoViewer's native in-viewer plot panel (mjlab/viewer/native.py,

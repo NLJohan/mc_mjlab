@@ -75,6 +75,11 @@ GET_ROBOT_WALKING = "ismpc_walking::robot_walking_d"
 # module docstring). get_com_lin_vel reads Walking_controller::
 # estimatedComLinVel() (realRobot CoM velocity rotated into base axes).
 SET_RL_REF_VEL = "ismpc_walking::set_rl_ref_vel"
+# The commanded target twist (vx, vy, wz): training writes the sampled command here every control period and the
+# actor reads it back through GET_USER_REF_VEL, the same key the deployed policy reads for target_twist. The
+# controller ignores it for motion while its rl_velocity_control mux is on (the policy's own twist drives then).
+SET_USER_REF_VEL = "ismpc_walking::set_user_ref_vel"
+GET_USER_REF_VEL = "ismpc_walking::get_user_ref_vel"
 GET_COM_LIN_VEL = "ismpc_walking::get_com_lin_vel"
 # Scalar getters (datastore_scalar_outputs): the three low-passed ISMPC signals (norms, metres) as left by the
 # controller's last run(), and the cutoff period (s) of that filter, which the exporter records in the contract.
@@ -139,6 +144,9 @@ class IsmpcSineActionCfg(McRtcActionCfg):
   continuity-penalty bookkeeping tied to it) happens on this slower cadence.
   Conflating the two starves the controller's own internal state if
   frameskip is set slow enough to match the MPC period."""
+
+  command_name: str = "twist"
+  """Name of the velocity command (vx, vy, wz) that is fed to the controller's user reference velocity."""
 
   offset_scale: float = 0.075
   offset_bias: float = 0.9
@@ -226,12 +234,12 @@ class IsmpcSineAction(McRtcActionBase):
     # and same (num_envs, 3)-shaped transport (set_datastore_vector_input /
     # datastore_vector_output -- see mc_rtc_action_base.py).
     cfg.datastore_vectors_inputs = tuple(
-      dict.fromkeys((*cfg.datastore_vectors_inputs, SET_RL_REF_VEL))
+      dict.fromkeys((*cfg.datastore_vectors_inputs, SET_RL_REF_VEL, SET_USER_REF_VEL))
     )
     cfg.datastore_vectors_outputs = tuple(
       dict.fromkeys(
         (*cfg.datastore_vectors_outputs, GET_COM_LIN_VEL, GET_BASE_ANG_VEL, GET_PROJECTED_GRAVITY,
-         GET_RL_REF_VEL)
+         GET_RL_REF_VEL, GET_USER_REF_VEL)
       )
     )
     # VectorXd getters: (name, size) pairs. The size is the number of reference joints; the native layer checks it
@@ -519,6 +527,12 @@ class IsmpcSineAction(McRtcActionBase):
     return self.datastore_vector_output(GET_RL_REF_VEL)
 
   @property
+  def user_ref_vel_obs(self) -> torch.Tensor:
+    """Target twist (vx, vy, wz) the controller holds, (num_envs, 3) (ismpc_walking::get_user_ref_vel). Training
+    feeds it from the sampled command every control period."""
+    return self.datastore_vector_output(GET_USER_REF_VEL)
+
+  @property
   def com_height_est_obs(self) -> torch.Tensor:
     """Controller-estimated CoM height above the support foot (m), (num_envs, 1)
     (ismpc_walking::get_com_height_est -> Walking_controller::estimatedComHeight)."""
@@ -709,6 +723,12 @@ class IsmpcSineAction(McRtcActionBase):
     `_pending_reset`/`_dispatch_resets` + WORKER_FAILED handling already
     solves the same problem generically.
     """
+    # The sampled command goes into the feed BEFORE the dispatch, so even the first dispatch of an episode (the one
+    # carrying the native reset flag) already carries the command of the new episode. The worker writes the
+    # datastore inputs after its reset, so the controller's own zeroing of the user velocity cannot overwrite it.
+    self.set_datastore_vector_input(
+      SET_USER_REF_VEL, self._env.command_manager.get_command(self.cfg.command_name)
+    )
     super()._advance_control_period()
 
     # episode_length_buf is incremented after the physics loop, so it is 0
