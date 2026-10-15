@@ -280,6 +280,11 @@ def _make_env_cfg(
       weight=1.0,
       params={"action_name": "ismpc_sine", "sigma" : 0.003},
     ),
+    "sine_offset_continuity": RewardTermCfg(
+      func=ismpc_mdp.sine_offset_continuity,
+      weight=1.0,
+      params={"action_name": "ismpc_sine", "sigma": 0.002},
+    ),
     "sine_velocity_continuity": RewardTermCfg(
       func=ismpc_mdp.sine_velocity_continuity,
       weight=0.5,

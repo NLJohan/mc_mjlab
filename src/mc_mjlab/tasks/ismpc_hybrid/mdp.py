@@ -15,7 +15,7 @@ action term (backed by the generic datastore-output machinery inherited
 from `McRtcActionBase`) with the same names/shapes as before, so nothing
 else in this file changes. `sine_position_continuity`/`sine_velocity_continuity`
 keep reaching directly into `action_term._physical_prev`/`_physical_curr`/
-`_period_t0`, which exist on `IsmpcSineAction` with the same names.
+`_period_phi`, which exist on `IsmpcSineAction` with the same names.
 
 ASSUMED, NOT VERIFIED: the exact function signature mjlab's
 RewardTermCfg/TerminationTermCfg expect (`func(env, **params) -> Tensor`).
@@ -568,6 +568,23 @@ def sine_velocity_continuity(
   v_prev = _target_height_vel(action_term._physical_prev, action_term._period_phi)
   v_curr = _target_height_vel(action_term._physical_curr, action_term._period_phi)
   return torch.exp(-(v_curr - v_prev) ** 2 / (2.0 * sigma**2))
+
+
+def sine_offset_continuity(
+  env: ManagerBasedRlEnv, action_name: str, sigma: float = 0.002
+) -> torch.Tensor:
+  """Gaussian-kernel reward on the jump of the CoM-height sine OFFSET alone across the period
+  splice: exp(-(offset_curr - offset_prev)^2 / (2*sigma^2)).
+
+  sine_position_continuity only sees the total jump offset + a sin(phi) + b cos(phi), so the
+  policy can change the offset freely as long as the amplitudes compensate at the splice phase, or
+  pay a small price for a small total jump. This term prices the offset change itself, so moving the
+  CoM height is cheaper through the sine amplitudes (which oscillate around the offset) than through
+  steps of the offset. Same latch cadence as the other continuity terms: with one latch per env step
+  it is evaluated on a fresh splice every step. sigma is annealed by a reward_curriculum."""
+  action_term = env.action_manager.get_term(action_name)
+  d = action_term._physical_curr["offset"] - action_term._physical_prev["offset"]
+  return torch.exp(-(d**2) / (2.0 * sigma**2))
 
 
 # Lower body only: both legs + waist, per the robot's own _ref_joint_order
