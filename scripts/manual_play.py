@@ -24,11 +24,20 @@ ACTION_NAME = "ismpc_sine"
 # OUTPUT of the mapping, not raw policy actions.
 WALK = True                 # walk gate
 TS = 1.1                    # step timing, s        (action term clamps to [0.4, 2.0])
-VX, VY, OMEGA = 0.1, 0.0, 0.0   # twist target, m/s, m/s, rad/s (rate-limited by twist_max_delta)
+VX, VY, OMEGA = 0.2, 0.0, 0.0   # twist target, m/s, m/s, rad/s (rate-limited by twist_max_delta)
 COM_OFFSET = 0.9            # CoM height sine offset, m   (clamped 0.4..1.05)
 COM_FREQ = 1.0              # sine frequency, Hz          (clamped 0.1..8.0)
 COM_SIN_AMP = 0.0           # m
 COM_COS_AMP = 0.0           # m
+
+# --- Push test (PUSH_EVENT = None disables all pushes) ---
+PUSH_EVENT = ["push_right_hand", "push_left_hand", "push_torso"]  # "push_torso" | "push_right_hand" | "push_left_hand" | None
+PUSH_FORCE_RANGE_N = (160.0, 160.0)  # F0 (asymptote of the ramp), N, uniform by area; (F, F) pins it
+PUSH_TAU_UP_MEAN_S = 0.15       # ramp-up time constant ~ N(mean, std), s; std = 0 pins it
+PUSH_TAU_UP_STD_S = 0.02
+PUSH_DELAY_S = (0.3, 0.5)       # ramp start -> release start ~ U(lo, hi), s; (D, D) pins it
+PUSH_RELEASE_RATIO = 0.5        # tau_down / tau_up
+PUSH_RATE_HZ = 0.2              # Poisson arrival rate, 1/s (mean 5 s between pushes)
 # ===============================================================================
 
 
@@ -96,6 +105,17 @@ def main():
     cmd.ranges.lin_vel_x = (VX, VX)
     cmd.ranges.lin_vel_y = (VY, VY)
     cmd.ranges.ang_vel_z = (OMEGA, OMEGA)
+    # Push marks sampled per push as in training (arrival, direction, F0, tau_up, delay).
+    for name in ("push_torso", "push_right_hand", "push_left_hand"):
+        p = env_cfg.events[name].params
+        p["rate_hz"] = PUSH_RATE_HZ if name in PUSH_EVENT else 0.0
+        # NB: the fixed play stage still applies push_scale k, so the effective force range is
+        # (r_min, r_min + k*(r_max - r_min)).
+        p["force_range"] = PUSH_FORCE_RANGE_N
+        p["tau_up_mean_s"] = PUSH_TAU_UP_MEAN_S
+        p["tau_up_std_s"] = PUSH_TAU_UP_STD_S
+        p["delay_s"] = PUSH_DELAY_S
+        p["release_ratio"] = PUSH_RELEASE_RATIO
     agent_cfg = load_rl_cfg(TASK_ID)
     env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode=None)
     _patch_mappings(env.action_manager.get_term(ACTION_NAME))

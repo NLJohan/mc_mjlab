@@ -29,15 +29,16 @@ from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 20
+NUM_ENVS = 400
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 40.0
+TWIST_RESAMPLING_TIME_RANGE = (1.0, 30.0)
 
 # Tutor rewards are zeroed while the policy commands "stop", unless the whole sampled command is inside this
 # deadzone (the not_walking_penalty is also disabled inside it, standing is never penalized there): |vx| < DZ[0] (m/s), |vy| < DZ[1] (m/s), |wz| < DZ[2] (rad/s), all three at once. Inside it, stopping
 # is a legitimate answer, so the tutor is not gated. (0, 0, 0) = no deadzone (pure walk gate).
-TUTOR_DEADZONE = (0.04, 0.1, 0.1)
+TUTOR_DEADZONE = (0.04, 0.04, 0.1)
 # # Fraction of envs whose sampled twist command is forced to zero (mjlab UniformVelocityCommandCfg.rel_standing_envs).
 # # Gives the policy episodes where standing still is the right answer, so the stop decision can be learned.
 STANDING_ENVS_FRAC = 0.25
@@ -50,26 +51,26 @@ FRAMESKIP = 5  # physics substeps per controller dispatch: 5 ms -> 200 Hz
 DECIMATION = 50
 # rsl_rl env steps per iteration (= policy decisions per env per iteration, 32 * 50 ms = 1.6 s).
 # NUM_STEPS_PER_ENV = 256
-NUM_STEPS_PER_ENV = 48 # decimation 50
+NUM_STEPS_PER_ENV = 64 # decimation 50
 
 # --- Push disturbances (mjlab.envs.mdp.events.apply_body_impulse). ---
 PUSH_SETTLE_TICKS = 25  # env steps (50 ms each)
 PUSH_FORCE_TORSO_N = (50.0, 130.0)
 PUSH_FORCE_HAND_N = (130.0, 200.0)
-PUSH_DURATION_S = (0.1, 0.4)
-PUSH_COOLDOWN_TORSO_S = (2.0, 50.0)
-PUSH_COOLDOWN_HAND_S = (2.0, 50.0)
+# Push force profile (see ismpc_mdp._DiskBodyImpulse): ramp up as F0*(1-exp(-t/tau_up)) for
+# PUSH_DELAY_S seconds, then release as exp(-t/tau_down), tau_down = PUSH_RELEASE_RATIO * tau_up.
+# tau_up is sampled per push ~ N(MEAN, STD). The delay (ramp start -> release start) is U(PUSH_DELAY_S).
+# PLACEHOLDER interval: 0.3 s = 2 tau_up (peak 86 % of F0), 1.0 s ~ 6.7 tau_up (plateau at F0).
+PUSH_TAU_UP_MEAN_S = 0.15
+PUSH_TAU_UP_STD_S = 0.02
+PUSH_RELEASE_RATIO = 0.5
+PUSH_DELAY_S = (0.3, 0.5)
 # Poisson push arrivals: mean rate (Hz) per push point, memoryless (replaces the cooldown law below).
 HAND_POISSON_RATE = 0.06
 TORSO_POISSON_RATE = 0.06
-# Cooldown law (UNUSED since the Poisson law; kept for reference) (gap between the end of a push and the start of the next): shifted
-# exponential truncated to the ranges above, rate solved so that
-# P(cooldown < SPLIT) = P_BEFORE_SPLIT.
-PUSH_COOLDOWN_SPLIT_S = 10.0
-PUSH_COOLDOWN_P_BEFORE_SPLIT = 0.30
 # Critic-only push_state observation: 1 value per push event = expected impulse (N*s) in the next
 # PUSH_STATE_WINDOW_S seconds, P(push in window | time since last push) * E[magnitude] * E[duration],
-# divided by PUSH_STATE_FORCE_SCALE_N (N*s per 1 s). Rule of thumb for the window: the value horizon,
+# divided by PUSH_STATE_FORCE_SCALE_N (N*s per 1 s); E[duration] is now the unit impulse of the two-exponential profile. Rule of thumb for the window: the value horizon,
 # step_dt / (1 - gamma) = 2.5 s at gamma 0.98.
 PUSH_STATE_FORCE_SCALE_N = 100.0
 PUSH_STATE_WINDOW_S = 2.0
@@ -88,26 +89,13 @@ TERRAIN_PATCH_SIZE_M = (8.0, 8.0)
 
 # Curriculum stages. "step" is env.common_step_counter, counted in ENV steps: iteration * NUM_STEPS_PER_ENV.
 CURRICULUM_STAGES = [
-  {"step": 0,          "lin_vel_x": (-0.5, 0.5), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.2, 0.2), "push_scale": 0.2},
-  {"step": 100 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.4},
-  {"step": 300 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.8},
+  {"step": 0,          "lin_vel_x": (-0.5, 0.5), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.2, 0.2), "push_scale": 0.5},
+  {"step": 100 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 0.8},
+  {"step": 300 * NUM_STEPS_PER_ENV,  "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
   {"step": 750 * NUM_STEPS_PER_ENV, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
-  {"step": 1500 * NUM_STEPS_PER_ENV, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 1.0},
+  {"step": 1500 * NUM_STEPS_PER_ENV, "lin_vel_x": (-0.5, 0.5),   "lin_vel_y": (-0.1, 0.1),   "ang_vel_z": (-0.2, 0.2),   "push_scale": 2.0},
 ]
-PLAY_CURRICULUM_STAGE = 0
-
-# Tutor reward (twist_tutor) weight decay. Boundaries match CURRICULUM_STAGES
-# (iterations); each factor multiplies the reward's base weight below.
-TUTOR_STAGE_ITERS = (0, 200, 400, 600, 800)
-TUTOR_WEIGHT_FACTORS = (1.0, 0.75, 0.5, 0.25, 0.1)
-
-
-def _tutor_weight_stages(base: float) -> list[dict]:
-  """reward_curriculum stages, in env steps (TUTOR_STEPS_PER_ITER per listed iteration)."""
-  return [
-    {"step": it * NUM_STEPS_PER_ENV, "weight": base * f}
-    for it, f in zip(TUTOR_STAGE_ITERS, TUTOR_WEIGHT_FACTORS)
-  ]
+PLAY_CURRICULUM_STAGE = 4
 
 def _make_terrain_cfg() -> TerrainEntityCfg:
   """Build the scene's TerrainEntityCfg, gated on ENABLE_UNEVEN_TERRAIN.
@@ -282,7 +270,7 @@ def _make_env_cfg(
     ),
     "tutor_vel_y": RewardTermCfg(
       func=ismpc_mdp.twist_tutor,
-      weight=0.1,
+      weight=0.3,
       params={"action_name": "ismpc_sine", "command_name": "twist", "axis": 1, "std": 0.02, "deadzone": TUTOR_DEADZONE},
     ),
     "tutor_omega": RewardTermCfg(
@@ -398,8 +386,8 @@ def _make_env_cfg(
       func=envs_mdp.reset_joints_by_offset,
       mode="reset",
       params={
-        "position_range": (-0.01, 0.01),  # rad
-        "velocity_range": (-0.005, 0.005),  # rad/s
+        "position_range": (-0.02, 0.02),  # rad
+        "velocity_range": (-0.01, 0.01),  # rad/s
         "asset_cfg": SceneEntityCfg("robot"),
       },
     ),
@@ -410,13 +398,11 @@ def _make_env_cfg(
         "asset_cfg": SceneEntityCfg("robot", body_names=["Body"]),
         "force_range": PUSH_FORCE_TORSO_N,
         "torque_range": (0.0, 0.0),
-        "duration_s": PUSH_DURATION_S,
-        # Cooldown law replaced by Poisson arrivals (rate_hz). cooldown_s is a dummy,
-        # only consumed by the stock apply_body_impulse __init__.
-        # "cooldown_s": PUSH_COOLDOWN_TORSO_S,
-        # "cooldown_split_s": PUSH_COOLDOWN_SPLIT_S,
-        # "cooldown_p_before_split": PUSH_COOLDOWN_P_BEFORE_SPLIT,
-        "cooldown_s": (1.0, 1.0),
+        "delay_s": PUSH_DELAY_S,
+        "tau_up_mean_s": PUSH_TAU_UP_MEAN_S,
+        "tau_up_std_s": PUSH_TAU_UP_STD_S,
+        "release_ratio": PUSH_RELEASE_RATIO,
+        "cooldown_s": (1.0, 1.0), # placeholder
         "rate_hz": TORSO_POISSON_RATE,
         "settle_ticks": PUSH_SETTLE_TICKS,
       },
@@ -428,13 +414,11 @@ def _make_env_cfg(
         "asset_cfg": SceneEntityCfg("robot", body_names=["Rhand_Link0_Plan2"]),
         "force_range": PUSH_FORCE_HAND_N,
         "torque_range": (0.0, 0.0),
-        "duration_s": PUSH_DURATION_S,
-        # Cooldown law replaced by Poisson arrivals (rate_hz). cooldown_s is a dummy,
-        # only consumed by the stock apply_body_impulse __init__.
-        # "cooldown_s": PUSH_COOLDOWN_HAND_S,
-        # "cooldown_split_s": PUSH_COOLDOWN_SPLIT_S,
-        # "cooldown_p_before_split": PUSH_COOLDOWN_P_BEFORE_SPLIT,
-        "cooldown_s": (1.0, 1.0),
+        "delay_s": PUSH_DELAY_S,
+        "tau_up_mean_s": PUSH_TAU_UP_MEAN_S,
+        "tau_up_std_s": PUSH_TAU_UP_STD_S,
+        "release_ratio": PUSH_RELEASE_RATIO,
+        "cooldown_s": (1.0, 1.0), #placeholder
         "rate_hz": HAND_POISSON_RATE,
         "settle_ticks": PUSH_SETTLE_TICKS,
       },
@@ -446,13 +430,11 @@ def _make_env_cfg(
         "asset_cfg": SceneEntityCfg("robot", body_names=["Lhand_Link0_Plan2"]),
         "force_range": PUSH_FORCE_HAND_N,
         "torque_range": (0.0, 0.0),
-        "duration_s": PUSH_DURATION_S,
-        # Cooldown law replaced by Poisson arrivals (rate_hz). cooldown_s is a dummy,
-        # only consumed by the stock apply_body_impulse __init__.
-        # "cooldown_s": PUSH_COOLDOWN_HAND_S,
-        # "cooldown_split_s": PUSH_COOLDOWN_SPLIT_S,
-        # "cooldown_p_before_split": PUSH_COOLDOWN_P_BEFORE_SPLIT,
-        "cooldown_s": (1.0, 1.0),
+        "delay_s": PUSH_DELAY_S,
+        "tau_up_mean_s": PUSH_TAU_UP_MEAN_S,
+        "tau_up_std_s": PUSH_TAU_UP_STD_S,
+        "release_ratio": PUSH_RELEASE_RATIO,
+        "cooldown_s": (1.0, 1.0), # placeholder
         "rate_hz": HAND_POISSON_RATE,
         "settle_ticks": PUSH_SETTLE_TICKS,
       },
@@ -484,7 +466,7 @@ def _make_env_cfg(
   commands = {
     "twist": UniformVelocityCommandCfg(
       entity_name="robot",
-      resampling_time_range=(1.0, 30.0),
+      resampling_time_range=TWIST_RESAMPLING_TIME_RANGE,
       rel_standing_envs=STANDING_ENVS_FRAC,
       ranges=UniformVelocityCommandCfg.Ranges(
         lin_vel_x=(-0.5, 0.5),

@@ -853,8 +853,19 @@ def debug_est_com_vel_y(env: ManagerBasedRlEnv, action_name: str) -> torch.Tenso
 
 
 class _DiskBodyImpulse(apply_body_impulse):
-  """apply_body_impulse with horizontal forces uniform over a DISK or ANNULUS and Poisson
-  arrivals (rate_hz per body, memoryless). Marks (disk sample, duration) are drawn at fire time.
+  """apply_body_impulse with horizontal forces uniform over a DISK or ANNULUS, Poisson arrivals
+  (rate_hz per body, memoryless) and a two-exponential force profile.
+
+  Force profile of one push (t = time since the push started, F0 = sampled magnitude):
+    * ramp-up, 0 <= t < T:   f(t) = F0 * (1 - exp(-t / tau_up))
+    * release, t >= T:       f(t) = f(T) * exp(-(t - T) / tau_down),  tau_down = release_ratio * tau_up
+  The push is over (force written to 0, event idle) when the release has decayed to
+  _RELEASE_CUTOFF * f(T). F0 is the ASYMPTOTE of the ramp; the peak actually reached is
+  F0 * (1 - exp(-T / tau_up)), i.e. ~86 % of F0 for T = 2 tau_up, ~99.9 % for T = 7 tau_up.
+
+  Marks drawn at fire time, per push: direction/magnitude (below), tau_up ~ N(tau_up_mean_s,
+  tau_up_std_s) (floored at 0.25 * mean), T ~ U(delay_s). The force is re-written every env step,
+  sampled at the MIDDLE of the step it applies to (the sim holds it constant for the step).
 
   Force magnitude law, from ``force_range`` = (lo, hi) read at EVERY call (so the push_scale
   curriculum, which rewrites params["force_range"], still works):
@@ -864,6 +875,8 @@ class _DiskBodyImpulse(apply_body_impulse):
     * Direction uniform, magnitude uniform by AREA on [r_min, R]: sqrt(r_min^2 + u (R^2 - r_min^2)),
       fz = 0.
   """
+
+  _RELEASE_CUTOFF = 0.01  # push ends once the release decayed to 1 % of the force at release time
 
   @staticmethod
   def _mag_bounds(force_range) -> tuple[float, float]:
@@ -879,60 +892,90 @@ class _DiskBodyImpulse(apply_body_impulse):
     self._rate_hz = float(p["rate_hz"])
     if self._rate_hz < 0.0:
       raise ValueError("rate_hz must be >= 0")
-    self._dur_lo, self._dur_hi = (float(x) for x in p["duration_s"])
+    self._delay_lo, self._delay_hi = (float(x) for x in p["delay_s"])
+    if not 0.0 < self._delay_lo <= self._delay_hi:
+      raise ValueError("delay_s must satisfy 0 < lo <= hi")
+    self._tau_mean = float(p["tau_up_mean_s"])
+    self._tau_std = float(p["tau_up_std_s"])
+    if self._tau_mean <= 0.0 or self._tau_std < 0.0:
+      raise ValueError("tau_up_mean_s must be > 0 and tau_up_std_s >= 0")
+    self._rho = float(p["release_ratio"])
+    if self._rho <= 0.0:
+      raise ValueError("release_ratio must be > 0")
     self._r_min, self._r_max = self._mag_bounds(p["force_range"])
     super().__init__(cfg, env)
     if self._num_bodies != 1:
       raise ValueError("_DiskBodyImpulse supports exactly one body per event term")
     n, dev = self._num_envs, self._device
-    self._cur_mag = torch.zeros(n, device=dev)  # N, 0 while idle
     self._suppress = torch.zeros(n, dtype=torch.bool, device=dev)  # set by the settle gate
+    # Per-push marks and clock (meaningful only where self._active).
+    self._mag = torch.zeros(n, device=dev)  # F0, N
+    self._dir = torch.zeros(n, 2, device=dev)  # unit vector in the horizontal plane
+    self._tau_up = torch.ones(n, device=dev)  # s
+    self._tau_dn = torch.ones(n, device=dev)  # s
+    self._delay = torch.ones(n, device=dev)  # T, s
+    self._t_end = torch.zeros(n, device=dev)  # s since push start
+    self._t = torch.zeros(n, device=dev)  # s since push start, at the start of the next step
 
   def _sample_cooldown(self, n: int) -> torch.Tensor:
     # Only here because the base __init__ calls it; unused (we override __call__).
     return torch.full((n,), 1e9, device=self._device)
 
+  def _force_at(self, ids: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """Force magnitude (N) of the pushes ``ids`` at times ``t`` since their start."""
+    tau, tau_d, T, f0 = self._tau_up[ids], self._tau_dn[ids], self._delay[ids], self._mag[ids]
+    rise = f0 * (-torch.expm1(-t / tau))
+    f_rel = f0 * (-torch.expm1(-T / tau))
+    fall = f_rel * torch.exp(-(t - T).clamp(min=0.0) / tau_d)
+    return torch.where(t < T, rise, fall)
+
   def __call__(self, env, env_ids, force_range, **_unused) -> None:
     del env, env_ids
     dt = self._step_dt
+    dev = self._device
     self._r_min, self._r_max = self._mag_bounds(force_range)
-    self._time_remaining[self._active] -= dt
 
-    expired = self._active & (self._time_remaining <= 0)
-    if expired.any():
-      ids = expired.nonzero(as_tuple=False).squeeze(-1)
-      zeros = torch.zeros((len(ids), 1, 3), device=self._device)
-      self._asset.write_external_wrench_to_sim(
-        zeros, zeros, env_ids=ids, body_ids=self._body_ids
-      )
-      self._active[ids] = False
-      self._time_remaining[ids] = 0.0
-      self._cur_mag[ids] = 0.0
-
+    # 1. New pushes: draw marks, start the clock. They are written in step 2 on this same tick.
     p_arrive = -math.expm1(-self._rate_hz * dt)
     arrive = (
-      (torch.rand(self._num_envs, device=self._device) < p_arrive)
+      (torch.rand(self._num_envs, device=dev) < p_arrive)
       & ~self._active
       & ~self._suppress
     )
-    if not arrive.any():
+    if arrive.any():
+      ids = arrive.nonzero(as_tuple=False).squeeze(-1)
+      n = len(ids)
+      r2_min, r2_max = self._r_min**2, self._r_max**2
+      ang = 2.0 * math.pi * torch.rand(n, device=dev)
+      tau = (self._tau_mean + self._tau_std * torch.randn(n, device=dev)).clamp(
+        min=0.25 * self._tau_mean
+      )
+      delay = torch.rand(n, device=dev) * (self._delay_hi - self._delay_lo) + self._delay_lo
+      self._mag[ids] = torch.sqrt(r2_min + torch.rand(n, device=dev) * (r2_max - r2_min))
+      self._dir[ids] = torch.stack((torch.cos(ang), torch.sin(ang)), dim=-1)
+      self._tau_up[ids] = tau
+      self._tau_dn[ids] = self._rho * tau
+      self._delay[ids] = delay
+      self._t_end[ids] = delay + self._rho * tau * math.log(1.0 / self._RELEASE_CUTOFF)
+      self._t[ids] = 0.0
+      self._active[ids] = True
+
+    # 2. Every active push: write this step's force (zero on the step it ends).
+    act = self._active.nonzero(as_tuple=False).squeeze(-1)
+    if len(act) == 0:
       return
-    ids = arrive.nonzero(as_tuple=False).squeeze(-1)
-    n = len(ids)
-    dev = self._device
-    r2_min, r2_max = self._r_min**2, self._r_max**2
-    mag = torch.sqrt(r2_min + torch.rand(n, device=dev) * (r2_max - r2_min))
-    ang = 2.0 * math.pi * torch.rand(n, device=dev)
-    dur = torch.rand(n, device=dev) * (self._dur_hi - self._dur_lo) + self._dur_lo
-    forces = torch.zeros((n, 1, 3), device=dev)
-    forces[:, 0, 0] = mag * torch.cos(ang)
-    forces[:, 0, 1] = mag * torch.sin(ang)
+    t_mid = self._t[act] + 0.5 * dt
+    done = t_mid >= self._t_end[act]
+    f = torch.where(done, torch.zeros_like(t_mid), self._force_at(act, t_mid))
+    forces = torch.zeros((len(act), 1, 3), device=dev)
+    forces[:, 0, :2] = f.unsqueeze(-1) * self._dir[act]
     self._asset.write_external_wrench_to_sim(
-      forces, torch.zeros_like(forces), env_ids=ids, body_ids=self._body_ids
+      forces, torch.zeros_like(forces), env_ids=act, body_ids=self._body_ids
     )
-    self._time_remaining[ids] = dur
-    self._active[ids] = True
-    self._cur_mag[ids] = mag
+    self._t[act] += dt
+    fin = act[done]
+    self._active[fin] = False
+    self._mag[fin] = 0.0
 
   def reset(self, env_ids=None) -> None:
     if env_ids is None:
@@ -940,24 +983,38 @@ class _DiskBodyImpulse(apply_body_impulse):
     super().reset(env_ids)  # zeroes the wrench of active envs
     self._active[env_ids] = False
     self._time_remaining[env_ids] = 0.0
-    self._cur_mag[env_ids] = 0.0
+    self._mag[env_ids] = 0.0
+    self._t[env_ids] = 0.0
 
   def push_state(self, force_scale: float, window_s: float) -> torch.Tensor:
-    """(N, 1) expected impulse in the next window_s, divided by force_scale. Memoryless:
-    P(new push in window) = 1 - exp(-rate*window), independent of history, plus the
-    active push's remaining impulse."""
+    """(N, 1) expected impulse (N*s) of pushes, divided by force_scale.
+
+    * New push: P(arrival in window_s) * E[F0] * unit impulse, memoryless as before. The unit
+      impulse of one push (F0 = 1) is  T - tau_up (1 - rho) (1 - exp(-T / tau_up)), evaluated at
+      the MEAN T and MEAN tau_up (not averaged over their laws).
+    * Active push: its whole remaining impulse (closed form, exact for the sampled marks). The
+      window is NOT applied to it (a push is over in <= ~1.4 s with the default marks).
+    """
     p = -math.expm1(-self._rate_hz * window_s)
     r_lo, r_hi = self._r_min, self._r_max
     # Mean of a magnitude uniform by area on [r_lo, r_hi]; (2/3) R for the full disk (r_lo = 0).
     e_mag = (
       (2.0 / 3.0) * (r_hi**3 - r_lo**3) / (r_hi**2 - r_lo**2) if r_hi > r_lo else r_hi
     )
-    e_dur = 0.5 * (self._dur_lo + self._dur_hi)
-    impulse = torch.full((self._num_envs,), p * e_mag * e_dur, device=self._device)
-    remaining = self._time_remaining.clamp(max=window_s)
-    impulse = impulse + torch.where(
-      self._active, self._cur_mag * remaining, torch.zeros_like(impulse)
+    e_T = 0.5 * (self._delay_lo + self._delay_hi)
+    tau = self._tau_mean
+    e_unit = e_T - tau * (1.0 - self._rho) * (-math.expm1(-e_T / tau))
+    impulse = torch.full((self._num_envs,), p * e_mag * e_unit, device=self._device)
+
+    t, T, tau_u, tau_d, f0 = self._t, self._delay, self._tau_up, self._tau_dn, self._mag
+    t_up = torch.minimum(t, T)  # time spent in the ramp so far
+    t_dn = (t - T).clamp(min=0.0)  # time spent in the release so far
+    f_rel = f0 * (-torch.expm1(-T / tau_u))
+    remaining = (
+      f0 * ((T - t_up) - tau_u * (torch.exp(-t_up / tau_u) - torch.exp(-T / tau_u)))
+      + f_rel * tau_d * torch.exp(-t_dn / tau_d)
     )
+    impulse = impulse + torch.where(self._active, remaining, torch.zeros_like(impulse))
     return (impulse / force_scale).unsqueeze(-1)
 
 
@@ -1014,9 +1071,11 @@ class settle_gated_apply_body_impulse:
   ever computed or written for a settling env in the first place.
 
   The inner term is _DiskBodyImpulse (disk-uniform pushes, Poisson arrivals,
-  expected-impulse push_state getter for the critic).
+  two-exponential force profile, expected-impulse push_state getter for the critic).
   cfg.params must include asset_cfg, force_range, torque_range (must be
-  (0, 0)), duration_s, rate_hz, cooldown_s (dummy, only consumed by the stock
+  (0, 0)), rate_hz, delay_s (lo, hi: time between the start of the ramp-up and
+  the start of the release), tau_up_mean_s, tau_up_std_s, release_ratio
+  (tau_down / tau_up), cooldown_s (dummy, only consumed by the stock
   apply_body_impulse __init__; the Poisson law ignores it), PLUS settle_ticks
   (int, number of env steps after reset during which pushes are suppressed
   for that env).
@@ -1029,6 +1088,9 @@ class settle_gated_apply_body_impulse:
     # apply_body_impulse.__call__ has no such kwarg and would raise on an
     # unexpected argument.
     inner_params = {k: v for k, v in cfg.params.items() if k != "settle_ticks"}
+    # Defensive: the stock __init__ may still read duration_s (replaced here by delay_s and the
+    # two time constants, so unused by our __call__).
+    inner_params.setdefault("duration_s", (0.1, 0.1))
 
     class _InnerCfg:
       params = inner_params
