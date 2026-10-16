@@ -64,12 +64,22 @@ PUSH_FORCE_HAND_N = (130.0, 200.0)
 PUSH_TAU_UP_MEAN_S = 0.15
 PUSH_TAU_UP_STD_S = 0.02
 PUSH_RELEASE_RATIO = 0.5
-PUSH_DELAY_S = (0.2, 0.5)
-# Poisson push arrivals: mean rate (Hz) per push point, memoryless (replaces the cooldown law below).
-# ONE rate per env and per episode (redrawn at every reset, log-uniform on this interval, Hz), shared by
-# the torso and both hand events: low end = "safe" episode, high end = "excited" one. PLACEHOLDER
-# (geometric mean ~0.055 Hz). A float instead of a pair gives the old behaviour (same rate everywhere).
-PUSH_POISSON_RATE_RANGE = (0.03, 0.3)
+PUSH_DELAY_S = (0.4, 0.5)
+# Poisson push arrivals, memoryless (replaces the cooldown law below). ONE draw per env and per episode
+# (redrawn at every reset), shared by the torso and both hand events:
+#   * with probability PUSH_NO_PUSH_FRACTION the episode is pushless (rate 0 for all three events);
+#   * otherwise the TOTAL push rate (all three points together) is log-uniform on the interval below,
+#     i.e. the mean time between pushes is log-uniform between PUSH_MEAN_INTERVAL_S[1] (easy) and
+#     PUSH_MEAN_INTERVAL_S[0] (hard). Nominal: a point is idle while its push is active (~0.7 s), so
+#     the real rate is a few % lower at the hard end.
+# The mdp term wants the rate PER push point, hence the division by the number of points.
+PUSH_NUM_POINTS = 3 # only to compute push_poisson_rate, with event name hard-coded later
+PUSH_NO_PUSH_FRACTION = 0.2
+PUSH_MEAN_INTERVAL_S = (3.0, 15.0)  # (hard, easy), seconds between two pushes, all points combined
+PUSH_POISSON_RATE_RANGE = (
+  1.0 / (PUSH_NUM_POINTS * PUSH_MEAN_INTERVAL_S[1]),
+  1.0 / (PUSH_NUM_POINTS * PUSH_MEAN_INTERVAL_S[0]),
+)  # Hz per push point = (0.022, 0.111)
 # Critic-only push_state observation: 1 value per push event = expected impulse (N*s) in the next
 # PUSH_STATE_WINDOW_S seconds, P(push in window | time since last push) * E[magnitude] * E[duration],
 # divided by PUSH_STATE_FORCE_SCALE_N (N*s per 1 s); E[duration] is now the unit impulse of the two-exponential profile. Rule of thumb for the window: the value horizon,
@@ -418,6 +428,7 @@ def _make_env_cfg(
         "release_ratio": PUSH_RELEASE_RATIO,
         "cooldown_s": (1.0, 1.0), # placeholder
         "rate_hz": PUSH_POISSON_RATE_RANGE,
+        "no_push_fraction": PUSH_NO_PUSH_FRACTION,
         "settle_ticks": PUSH_SETTLE_TICKS,
       },
     ),
@@ -434,6 +445,7 @@ def _make_env_cfg(
         "release_ratio": PUSH_RELEASE_RATIO,
         "cooldown_s": (1.0, 1.0), #placeholder
         "rate_hz": PUSH_POISSON_RATE_RANGE,
+        "no_push_fraction": PUSH_NO_PUSH_FRACTION,
         "settle_ticks": PUSH_SETTLE_TICKS,
       },
     ),
@@ -450,6 +462,7 @@ def _make_env_cfg(
         "release_ratio": PUSH_RELEASE_RATIO,
         "cooldown_s": (1.0, 1.0), # placeholder
         "rate_hz": PUSH_POISSON_RATE_RANGE,
+        "no_push_fraction": PUSH_NO_PUSH_FRACTION,
         "settle_ticks": PUSH_SETTLE_TICKS,
       },
     ),

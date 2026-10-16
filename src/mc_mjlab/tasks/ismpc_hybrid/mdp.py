@@ -889,7 +889,9 @@ class _DiskBodyImpulse(apply_body_impulse):
 
   Arrival rate (domain randomization): ``rate_hz`` is either a float (same rate for every env) or
   a pair (lo, hi) in Hz (lo > 0): each env then gets its own rate, log-uniform on [lo, hi], redrawn
-  at every episode (env reset). The underlying uniform draw u in [0, 1) lives on the env
+  at every episode (env reset). Optionally ``no_push_fraction`` = f in [0, 1) makes a fraction f of
+  the episodes pushless (rate 0): u < f gives rate 0, the other u are rescaled to [0, 1) and mapped
+  log-uniformly on [lo, hi]. All push terms must be given the same f (they share u). The underlying uniform draw u in [0, 1) lives on the env
   (``env._push_rate_u``) and is SHARED by all push terms: the first term built owns it and is the
   only one redrawing it on reset, the others read it live. Terms given the same (lo, hi) therefore
   have the same rate in a given env and episode: a "safe" episode is safe for the torso and both hands.
@@ -935,6 +937,9 @@ class _DiskBodyImpulse(apply_body_impulse):
       raise ValueError("rate_hz must be a float >= 0 or a pair with 0 <= lo <= hi")
     if self._rate_lo < self._rate_hi and self._rate_lo <= 0.0:
       raise ValueError("rate_hz range needs lo > 0 (log-uniform); use a float for rate 0")
+    self._no_push_frac = float(p.get("no_push_fraction", 0.0))
+    if not 0.0 <= self._no_push_frac < 1.0:
+      raise ValueError("no_push_fraction must be in [0, 1)")
     self._delay_lo, self._delay_hi = (float(x) for x in p["delay_s"])
     if not 0.0 < self._delay_lo <= self._delay_hi:
       raise ValueError("delay_s must satisfy 0 < lo <= hi")
@@ -967,13 +972,18 @@ class _DiskBodyImpulse(apply_body_impulse):
 
   @property
   def _rate_env(self) -> torch.Tensor:
-    """(N,) Poisson rate (Hz) of each env right now: u mapped log-uniformly on [rate_lo, rate_hi]
-    (constant if lo == hi). Read live so every push term sees the owner's latest redraw."""
+    """(N,) Poisson rate (Hz) of each env right now: 0 where u < no_push_fraction, else the rescaled u
+    mapped log-uniformly on [rate_lo, rate_hi] (constant if lo == hi). Read live so every push term
+    sees the owner's latest redraw."""
     u = self._rate_host._push_rate_u
+    f = self._no_push_frac
     if self._rate_lo == self._rate_hi:
-      return torch.full_like(u, self._rate_lo)
-    log_lo, log_hi = math.log(self._rate_lo), math.log(self._rate_hi)
-    return torch.exp(log_lo + u * (log_hi - log_lo))
+      rate = torch.full_like(u, self._rate_lo)
+    else:
+      v = ((u - f) / (1.0 - f)).clamp(0.0, 1.0)
+      log_lo, log_hi = math.log(self._rate_lo), math.log(self._rate_hi)
+      rate = torch.exp(log_lo + v * (log_hi - log_lo))
+    return torch.where(u < f, torch.zeros_like(rate), rate)
 
   def _sample_cooldown(self, n: int) -> torch.Tensor:
     # Only here because the base __init__ calls it; unused (we override __call__).
