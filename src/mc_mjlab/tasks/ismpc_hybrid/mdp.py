@@ -72,9 +72,12 @@ def not_walking_penalty(
   state; this term only needs to claw back the difference when not
   walking. Placeholder magnitudes per the user, both explicitly FOO.
 
-  DEADZONE: the indicator is forced to 0 when the whole sampled command lies inside the deadzone, i.e.
-  |cmd_x| < deadzone[0] and |cmd_y| < deadzone[1] and |cmd_omega| < deadzone[2] (all three at once, strict),
-  the same test as twist_tutor. There standing is a legitimate answer and must not be penalized. The default
+  DEADZONE: when the whole sampled command lies inside the deadzone, i.e. |cmd_x| < deadzone[0] and
+  |cmd_y| < deadzone[1] and |cmd_omega| < deadzone[2] (all three at once, strict, the same test as twist_tutor),
+  the sign of the indicator is FLIPPED: it returns -1 when not walking and 0 when walking. With a negative weight
+  (cfg: -2.0) standing inside the deadzone is therefore REWARDED (+|weight| per step) and walking inside it
+  earns nothing, which is the intended behaviour: when the command is "stand", standing is the right answer.
+  Outside the deadzone it is the plain penalty (+1 when not walking, so -|weight| per step). The default
   (0, 0, 0) is an empty deadzone, i.e. the penalty applies to every command (previous behaviour).
   """
   action_term = env.action_manager.get_term(action_name)
@@ -713,6 +716,71 @@ def debug_joint_torque_raw(
   _resolve_lower_body_joint_ids(env, asset_cfg)
   asset = env.scene[asset_cfg.name]
   return torch.sum(asset.data.qfrc_actuator[:, asset_cfg.joint_ids] ** 2, dim=-1)
+
+
+def _lower_body_tau_omega(
+  env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """(tau, omega), each (num_envs, n_lower_body_joints): the actuator torque (Nm, qfrc_actuator, same source as
+  joint_torque_reward) and the simulated joint velocity (rad/s) of the lower-body joints, in LOWER_BODY_JOINT_NAMES
+  order. Fails loudly if qfrc_actuator is not indexed like the robot's joints (for instance if it also carries the 6
+  floating-base DOFs, which would make `joint_ids` pick the wrong columns, here AND in joint_torque_reward)."""
+  _resolve_lower_body_joint_ids(env, asset_cfg)
+  robot = env.scene[asset_cfg.name]
+  qfrc = robot.data.qfrc_actuator
+  n_joints = len(robot.joint_names)
+  if qfrc.shape[-1] != n_joints:
+    raise RuntimeError(
+      f"qfrc_actuator has {qfrc.shape[-1]} columns but the robot has {n_joints} joints: it is not indexed by "
+      "joint_ids (floating base DOFs first?). joint_torque_reward reads the wrong joints in that case too."
+    )
+  return qfrc[:, asset_cfg.joint_ids], robot.data.joint_vel[:, asset_cfg.joint_ids]
+
+
+def debug_joint_power_abs_raw(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=LOWER_BODY_JOINT_NAMES),
+) -> torch.Tensor:
+  """PLOTTING-ONLY (weight 0.0): sum_i |tau_i * omega_i| over the lower-body joints (W). Counts braking work as
+  effort too, so a joint that goes back and forth keeps paying: this is the candidate quantity for an anti-emoting
+  power reward. (The signed sum is deliberately not provided: a CoM bob exchanges kinetic and potential energy, so
+  it averages out near zero and says nothing about effort.)"""
+  tau, omega = _lower_body_tau_omega(env, asset_cfg)
+  return torch.sum(torch.abs(tau * omega), dim=-1)
+
+
+def joint_power_reward(
+  env: ManagerBasedRlEnv,
+  command_name: str = "twist",
+  deadzone: tuple[float, float, float] = (0.0, 0.0, 0.0),
+  sigma: float = 50.0,
+  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=LOWER_BODY_JOINT_NAMES),
+) -> torch.Tensor:
+  """Anti-emoting PENALTY INDICATOR in [0, 1], meant for a NEGATIVE weight (same convention as not_walking_penalty):
+  1 - exp(-P^2 / (2*sigma^2)), with P = sum_i |tau_i * omega_i| over the lower-body joints (W, same quantity as
+  debug_joint_power_abs_raw), and 0 outside the deadzone.
+
+  GATE: only when the whole sampled command lies inside the deadzone (all three axes at once, strict, same test as
+  not_walking_penalty and twist_tutor) is the power charged. Outside it the term is exactly 0: walking (150-450 W
+  measured) is never charged, and the term cannot favour one behaviour over another there. The gate reads the command,
+  which the policy cannot influence, not is_walking_obs / wants_walk (those would let the policy dodge the cost by
+  declaring "walking" while still bobbing). A still robot inside the deadzone pays 0.
+
+  sigma=50 W (starting point from play measurements: emoting oscillates 0-~100 W): 25 W -> 0.12, 50 W -> 0.39,
+  100 W -> 0.86. The kernel is flat near P=0, so a small standing-still noise floor costs almost nothing. Check
+  debug_joint_power_abs_raw while standing still without emoting and keep sigma well above that floor.
+
+  CAVEAT: inside the deadzone this also taxes a recovery step after a push (power rises while stepping), on top of the
+  standing bonus not_walking_penalty gives there. Bounded by |weight| per step; if the robot refuses to step when
+  pushed, disable the term while a push is active.
+  """
+  command = env.command_manager.get_command(command_name)
+  eps = torch.as_tensor(deadzone, dtype=command.dtype, device=command.device)
+  in_deadzone = torch.all(command[:, :3].abs() < eps, dim=-1)
+  tau, omega = _lower_body_tau_omega(env, asset_cfg)
+  power = torch.sum(torch.abs(tau * omega), dim=-1)
+  reward = torch.exp(-(power**2) / (2.0 * sigma**2))
+  return torch.where(in_deadzone, reward, torch.zeros_like(reward))
 
 
 def target_twist(env: ManagerBasedRlEnv, command_name: str = "twist") -> torch.Tensor:

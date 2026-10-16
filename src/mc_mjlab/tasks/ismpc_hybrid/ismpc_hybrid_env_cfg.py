@@ -29,14 +29,14 @@ from mc_mjlab.robots.registry import get_main_robot_spec, prepare_cfg_for_mc_rtc
 from mc_mjlab.actions.ismpc_sine_action import IsmpcSineActionCfg
 from mc_mjlab.tasks.ismpc_hybrid import mdp as ismpc_mdp
 
-NUM_ENVS = 20
+NUM_ENVS = 700
 PLAY_NUM_ENVS = 1
 
 EPISODE_LENGTH_S = 40.0
 TWIST_RESAMPLING_TIME_RANGE = (1.0, 25.0)
 
 # Tutor rewards are zeroed while the policy commands "stop", unless the whole sampled command is inside this
-# deadzone (the not_walking_penalty is also disabled inside it, standing is never penalized there): |vx| < DZ[0] (m/s), |vy| < DZ[1] (m/s), |wz| < DZ[2] (rad/s), all three at once. Inside it, stopping
+# deadzone (inside it the not_walking_penalty flips sign: standing is rewarded there, walking is neutral): |vx| < DZ[0] (m/s), |vy| < DZ[1] (m/s), |wz| < DZ[2] (rad/s), all three at once. Inside it, stopping
 # is a legitimate answer, so the tutor is not gated. (0, 0, 0) = no deadzone (pure walk gate).
 TUTOR_DEADZONE = (0.04, 0.04, 0.05)
 # # Fraction of envs whose sampled twist command is forced to zero (mjlab UniformVelocityCommandCfg.rel_standing_envs).
@@ -55,8 +55,8 @@ NUM_STEPS_PER_ENV = 64 # decimation 50
 
 # --- Push disturbances (mjlab.envs.mdp.events.apply_body_impulse). ---
 PUSH_SETTLE_TICKS = 25  # env steps (50 ms each)
-PUSH_FORCE_TORSO_N = (50.0, 130.0)
-PUSH_FORCE_HAND_N = (130.0, 200.0)
+PUSH_FORCE_TORSO_N = (70.0, 140.0)
+PUSH_FORCE_HAND_N = (150.0, 220.0)
 # Push force profile (see ismpc_mdp._DiskBodyImpulse): ramp up as F0*(1-exp(-t/tau_up)) for
 # PUSH_DELAY_S seconds, then release as exp(-t/tau_down), tau_down = PUSH_RELEASE_RATIO * tau_up.
 # tau_up is sampled per push ~ N(MEAN, STD). The delay (ramp start -> release start) is U(PUSH_DELAY_S).
@@ -64,7 +64,7 @@ PUSH_FORCE_HAND_N = (130.0, 200.0)
 PUSH_TAU_UP_MEAN_S = 0.15
 PUSH_TAU_UP_STD_S = 0.02
 PUSH_RELEASE_RATIO = 0.5
-PUSH_DELAY_S = (0.4, 0.5)
+PUSH_DELAY_S = (0.2, 0.5)
 # Poisson push arrivals, memoryless (replaces the cooldown law below). ONE draw per env and per episode
 # (redrawn at every reset), shared by the torso and both hand events:
 #   * with probability PUSH_NO_PUSH_FRACTION the episode is pushless (rate 0 for all three events);
@@ -267,6 +267,11 @@ def _make_env_cfg(
       weight=1.0,
       params={"sigma": 300},
     ),
+    "joint_power_reward": RewardTermCfg(
+      func=ismpc_mdp.joint_power_reward,
+      weight=1.0,
+      params={"command_name": "twist", "deadzone": TUTOR_DEADZONE, "sigma": 50.0},
+    ),
     "target_vel_x": RewardTermCfg(
         func=ismpc_mdp.target_vel_window,
         weight=4.0,
@@ -334,6 +339,10 @@ def _make_env_cfg(
     ),
     "debug_joint_torque_raw": RewardTermCfg(
       func=ismpc_mdp.debug_joint_torque_raw,
+      weight=0.0,
+    ),
+    "debug_joint_power_abs_raw": RewardTermCfg(
+      func=ismpc_mdp.debug_joint_power_abs_raw,
       weight=0.0,
     ),
     "debug_target_vel_x": RewardTermCfg(
@@ -599,6 +608,7 @@ def _apply_play_overrides(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
     "debug_step_timing",
     # "debug_is_walking",
     "debug_joint_torque_raw",
+    "debug_joint_power_abs_raw",
     "debug_target_vel_x",
     "debug_output_vel_x",
     "debug_base_vel_x",
